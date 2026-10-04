@@ -132,13 +132,13 @@ class CloudWatchSource:
                 if marker not in self._warned:
                     self._warned.add(marker)
                     log.warning(
-                        "%s skipped, missing: %s",
+                        "%s missing %s, defaulting to 0.0",
                         iid,
                         "; ".join(f"{key} ({_HINTS[key]})" for key in missing),
                     )
-                continue
-            self._warned = {w for w in self._warned if w[0] != iid}
-            timestamp = got["cpu"][0]
+            
+            # Use 0.0 fallback for any missing metric, including cpu if it's somehow completely missing
+            timestamp = got["cpu"][0] if got["cpu"] else time.time()
             if timestamp <= self._last_ts.get(iid, 0.0):
                 continue
             self._last_ts[iid] = timestamp
@@ -146,10 +146,10 @@ class CloudWatchSource:
                 NodeSnapshot(
                     node_id=iid,
                     timestamp=timestamp,
-                    cpu_pct=round(got["cpu"][1], 3),
-                    memory_pct=round(got["mem"][1], 3),
-                    net_kbps=round(got["net"][1] / self.period / 1024.0, 3),
-                    latency_ms=round(got["lat"][1], 3),
+                    cpu_pct=round(got["cpu"][1], 3) if got["cpu"] else 0.0,
+                    memory_pct=round(got["mem"][1], 3) if got["mem"] else 0.0,
+                    net_kbps=round(got["net"][1] / self.period / 1024.0, 3) if got["net"] else 0.0,
+                    latency_ms=round(got["lat"][1], 3) if got["lat"] else 0.0,
                 )
             )
         return snapshots
