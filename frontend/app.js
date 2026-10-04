@@ -585,7 +585,7 @@ $('blockedBody').addEventListener('click', async (event) => {
     toast(`Could not unblock ${button.dataset.unblock}`);
     button.disabled = false;
   }
-
+});
 
 tickClock();
 setInterval(tickClock, 1000);
