@@ -6,11 +6,11 @@ import pytest
 
 pytest.importorskip("torch")
 
-from backend.db import Anomaly, DefenseEvent, SessionLocal, init_db  # noqa: E402
-from backend.defense import ActiveDefender  # noqa: E402
-from backend.models.ensemble import Prediction  # noqa: E402
-from backend.pipeline import Pipeline  # noqa: E402
-from backend.schema import NodeSnapshot  # noqa: E402
+from backend.db import Anomaly, DefenseEvent, SessionLocal, init_db
+from backend.defense import ActiveDefender
+from backend.models.ensemble import Prediction
+from backend.pipeline import Pipeline
+from backend.schema import NodeSnapshot
 
 
 class StubEnsemble:

@@ -4,7 +4,12 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from backend.defense import ActiveDefender, SafeModeMiddleware, firewall_commands, firewall_setup_commands
+from backend.defense import (
+    ActiveDefender,
+    SafeModeMiddleware,
+    firewall_commands,
+    firewall_setup_commands,
+)
 
 
 class FakeClock:

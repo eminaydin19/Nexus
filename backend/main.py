@@ -7,7 +7,15 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import torch
-from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -15,13 +23,18 @@ from backend import metrics as prom
 from backend.alerting import SlackNotifier
 from backend.config import settings
 from backend.db import DefenseEvent, SessionLocal, init_db
+from backend.defense import ActiveDefender, SafeModeMiddleware
 from backend.ingestion import build_source
-from backend.schema import NodeSnapshot
 from backend.models.ensemble import Ensemble
 from backend.pipeline import Pipeline, metric_history, recent_anomalies
-from backend.security import ApiKeyMiddleware, BasicAuthMiddleware, RateLimitMiddleware, client_ip
-from backend.defense import ActiveDefender, SafeModeMiddleware
-from training.train import train, load_db
+from backend.schema import NodeSnapshot
+from backend.security import (
+    ApiKeyMiddleware,
+    BasicAuthMiddleware,
+    RateLimitMiddleware,
+    client_ip,
+)
+from training.train import load_db, train
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("nexus")
@@ -93,8 +106,8 @@ async def _continuous_learning() -> None:
                     pipeline.ensemble.install_bundle(bundle)
                     await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
                     log.info("Autonomous learning cycle complete. Models updated.")
-        except Exception as e:
-            log.exception(f"Continuous learning failed: {e}")
+        except Exception:
+            log.exception("Continuous learning failed")
 
 
 @asynccontextmanager
@@ -242,7 +255,7 @@ async def trigger_retrain():
         return {"status": "ok", "message": "Models successfully retrained and hot-swapped."}
     except Exception as e:
         log.exception("Manual retrain failed")
-        raise HTTPException(500, f"Retrain failed: {str(e)}")
+        raise HTTPException(500, f"Retrain failed: {e!s}")
 
 
 @app.post("/api/ingest")

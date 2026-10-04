@@ -2,8 +2,10 @@ import argparse
 import os
 import socket
 import time
-import requests
+
 import psutil
+import requests
+
 
 def get_net_kbps(interval: float = 1.0) -> float:
     net1 = psutil.net_io_counters()

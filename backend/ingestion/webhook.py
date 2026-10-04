@@ -1,5 +1,7 @@
 import asyncio
+
 from backend.schema import NodeSnapshot
+
 
 class WebhookSource:
     name = "webhook"

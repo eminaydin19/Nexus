@@ -1,7 +1,18 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import JSON, Boolean, Float, Index, Integer, String, create_engine, event, inspect, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Float,
+    Index,
+    Integer,
+    String,
+    create_engine,
+    event,
+    inspect,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from backend.config import settings

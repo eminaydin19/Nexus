@@ -10,8 +10,8 @@ from backend.alerting import SlackNotifier
 from backend.config import settings
 from backend.db import Anomaly, DefenseEvent, Metric, SessionLocal
 from backend.ingestion.base import Source
-from backend.models.ensemble import Ensemble
 from backend.metrics import counters
+from backend.models.ensemble import Ensemble
 from backend.schema import NodeSnapshot
 
 log = logging.getLogger(__name__)

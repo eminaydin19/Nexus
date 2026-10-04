@@ -2,10 +2,10 @@ import pytest
 
 pytest.importorskip("torch")
 
-from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, inspect, text  # noqa: E402
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, inspect, text
 
-from backend import db  # noqa: E402
+from backend import db
 
 GOOD = {"node_id": "web-1", "cpu_pct": 12.5, "memory_pct": 40.0, "net_kbps": 120.0, "latency_ms": 18.0}
 KEY = {"X-API-Key": "test-key"}
