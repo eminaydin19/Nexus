@@ -1,0 +1,40 @@
+services:
+  nexus:
+    build: .
+    image: nexus:latest
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATA_DIR: /data
+    ports:
+      - "${HTTP_BIND:-80}:8000"
+    volumes:
+      - nexus-data:/data
+    mem_limit: 800m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on:
+      - nexus
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    mem_limit: 64m
+
+volumes:
+  nexus-data:
+  caddy-data:

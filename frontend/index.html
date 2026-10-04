@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus · Anomaly Detection for Cloud Infrastructure</title>
+  <meta name="description" content="Real-time multi-model anomaly detection for cloud infrastructure metrics.">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="backdrop" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <img src="logo.svg" alt="Nexus Logo" width="30" height="30" aria-hidden="true" />
+      <div>
+        <h1>Nexus</h1>
+        <span>Anomaly detection</span>
+      </div>
+    </div>
+
+    <div class="topbar-right">
+      <span class="pill" id="sourcePill"><i class="dot"></i><span id="sourceLabel">Connecting</span></span>
+      <span class="pill" id="modelPill"><i class="dot"></i><span id="modelLabel">Model</span></span>
+      <span class="pill" id="linkPill"><i class="dot"></i><span id="linkLabel">Offline</span></span>
+      <time class="clock" id="clock"></time>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="banner" id="learningBanner" hidden>
+      <strong>Learning mode</strong>
+      <span id="learningText"></span>
+    </section>
+
+    <section class="banner banner-error" id="errorBanner" hidden>
+      <strong>Ingestion error</strong>
+      <span id="errorText"></span>
+    </section>
+
+    <section class="kpis" aria-label="Summary">
+      <article class="card kpi">
+        <span class="kpi-label">Nodes monitored</span>
+        <strong class="kpi-value" id="kpiNodes">0</strong>
+        <span class="kpi-sub" id="kpiNodesSub">waiting for data</span>
+      </article>
+      <article class="card kpi">
+        <span class="kpi-label">Anomalies (24h)</span>
+        <strong class="kpi-value" id="kpiAnomalies">0</strong>
+        <span class="kpi-sub" id="kpiAnomaliesSub">none detected</span>
+      </article>
+      <article class="card kpi">
+        <span class="kpi-label">Alert threshold</span>
+        <strong class="kpi-value" id="kpiThreshold">&ndash;</strong>
+        <span class="kpi-sub">ensemble score</span>
+      </article>
+      <article class="card kpi">
+        <span class="kpi-label">Polling</span>
+        <strong class="kpi-value" id="kpiInterval">&ndash;</strong>
+        <span class="kpi-sub" id="kpiPollSub">no data yet</span>
+      </article>
+    </section>
+
+    <div class="layout">
+      <aside class="card fleet" aria-label="Nodes">
+        <div class="card-head">
+          <h2>Fleet</h2>
+          <span class="muted" id="fleetCount"></span>
+        </div>
+        <div class="fleet-list" id="fleetList"></div>
+        <p class="empty" id="fleetEmpty">No nodes reporting yet.</p>
+      </aside>
+
+      <section class="detail" aria-label="Selected node">
+        <div class="card">
+          <div class="card-head">
+            <div>
+              <h2 id="detailTitle">Select a node</h2>
+              <span class="muted" id="detailSub"></span>
+            </div>
+            <div class="segmented" id="rangeSelect" role="group" aria-label="Time range">
+              <button type="button" data-minutes="15">15m</button>
+              <button type="button" data-minutes="60" class="active">1h</button>
+              <button type="button" data-minutes="360">6h</button>
+              <button type="button" data-minutes="1440">24h</button>
+            </div>
+          </div>
+          <div class="chart-tall"><canvas id="scoreChart"></canvas></div>
+        </div>
+
+        <div class="metric-grid">
+          <article class="card"><div class="card-head"><h3>CPU</h3><strong class="metric-now" id="now-cpu_pct"></strong></div><div class="chart-small"><canvas id="chart-cpu_pct"></canvas></div></article>
+          <article class="card"><div class="card-head"><h3>Memory</h3><strong class="metric-now" id="now-memory_pct"></strong></div><div class="chart-small"><canvas id="chart-memory_pct"></canvas></div></article>
+          <article class="card"><div class="card-head"><h3>Network in</h3><strong class="metric-now" id="now-net_kbps"></strong></div><div class="chart-small"><canvas id="chart-net_kbps"></canvas></div></article>
+          <article class="card"><div class="card-head"><h3>Latency</h3><strong class="metric-now" id="now-latency_ms"></strong></div><div class="chart-small"><canvas id="chart-latency_ms"></canvas></div></article>
+        </div>
+      </section>
+    </div>
+
+    <div class="layout layout-lower">
+      <section class="card" aria-label="Anomaly history">
+        <div class="card-head">
+          <h2>Anomaly history</h2>
+          <div class="segmented" id="metricFilter" role="group" aria-label="Filter by metric">
+            <button type="button" data-filter="all" class="active">All</button>
+            <button type="button" data-filter="cpu">CPU</button>
+            <button type="button" data-filter="memory">Memory</button>
+            <button type="button" data-filter="network">Network</button>
+            <button type="button" data-filter="latency">Latency</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Time</th><th>Node</th><th>Driver</th><th>Severity</th><th>Score</th><th>Flagged by</th></tr>
+            </thead>
+            <tbody id="anomalyBody"></tbody>
+          </table>
+          <p class="empty" id="anomalyEmpty">No anomalies recorded.</p>
+        </div>
+      </section>
+
+      <section class="card" aria-label="Model">
+        <div class="card-head"><h2>Detection model</h2></div>
+        <div class="scores" id="scoreBars"></div>
+
+        <h3 class="section-title">Ensemble weights</h3>
+        <div class="weights" id="weights">
+          <label>Isolation Forest <input type="range" min="0" max="100" value="25" data-key="iforest"><output></output></label>
+          <label>LSTM autoencoder <input type="range" min="0" max="100" value="45" data-key="lstm"><output></output></label>
+          <label>VAE <input type="range" min="0" max="100" value="30" data-key="vae"><output></output></label>
+        </div>
+
+        <h3 class="section-title">Training report</h3>
+        <dl class="report" id="report"></dl>
+      </section>
+    </div>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="vendor/chart.umd.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
