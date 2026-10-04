@@ -21,6 +21,7 @@ from backend.models.ensemble import Ensemble
 from backend.pipeline import Pipeline, metric_history, recent_anomalies
 from backend.security import ApiKeyMiddleware, BasicAuthMiddleware, RateLimitMiddleware, client_ip
 from backend.defense import ActiveDefender, SafeModeMiddleware
+from training.train import train, load_db
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("nexus")
@@ -78,6 +79,23 @@ async def _housekeeping() -> None:
         except Exception:
             log.exception("defense housekeeping failed")
 
+async def _continuous_learning() -> None:
+    # Retrain every 24 hours automatically
+    while True:
+        await asyncio.sleep(86400)
+        try:
+            log.info("Starting autonomous continuous learning cycle...")
+            data = await asyncio.to_thread(load_db)
+            if data:
+                bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_auto")
+                pipeline = getattr(app.state, "pipeline", None)
+                if pipeline:
+                    pipeline.ensemble.install_bundle(bundle)
+                    await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
+                    log.info("Autonomous learning cycle complete. Models updated.")
+        except Exception as e:
+            log.exception(f"Continuous learning failed: {e}")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -88,6 +106,7 @@ async def lifespan(app: FastAPI):
         weights={
             "iforest": settings.weight_isolation_forest,
             "lstm": settings.weight_lstm_ae,
+            "transformer": settings.weight_transformer,
             "vae": settings.weight_vae,
         },
         threshold_override=settings.anomaly_threshold,
@@ -115,12 +134,13 @@ async def lifespan(app: FastAPI):
         log.warning("INGEST_API_KEY is not set: /api/ingest accepts unauthenticated telemetry")
     task = asyncio.create_task(pipeline.run())
     housekeeping = asyncio.create_task(_housekeeping())
+    continuous = asyncio.create_task(_continuous_learning())
     try:
         yield
     finally:
-        for background in (task, housekeeping):
+        for background in (task, housekeeping, continuous):
             background.cancel()
-        for background in (task, housekeeping):
+        for background in (task, housekeeping, continuous):
             with suppress(asyncio.CancelledError):
                 await background
         await defender_instance.shutdown()
@@ -158,6 +178,7 @@ def _pipeline() -> Pipeline:
 class Weights(BaseModel):
     iforest: float = Field(ge=0)
     lstm: float = Field(ge=0)
+    transformer: float = Field(ge=0)
     vae: float = Field(ge=0)
 
 
@@ -207,6 +228,21 @@ async def set_weights(body: Weights):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"weights": _pipeline().ensemble.weights}
+
+
+@app.post("/api/retrain")
+async def trigger_retrain():
+    try:
+        data = await asyncio.to_thread(load_db)
+        if not data:
+            raise HTTPException(400, "Not enough data to retrain.")
+        bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_manual")
+        _pipeline().ensemble.install_bundle(bundle)
+        await _pipeline().broadcast({"type": "retrain_complete", "status": "success"})
+        return {"status": "ok", "message": "Models successfully retrained and hot-swapped."}
+    except Exception as e:
+        log.exception("Manual retrain failed")
+        raise HTTPException(500, f"Retrain failed: {str(e)}")
 
 
 @app.post("/api/ingest")

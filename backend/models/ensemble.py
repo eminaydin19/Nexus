@@ -11,12 +11,13 @@ from backend.explain import contributions as explain_contributions
 from backend.models.features import FeatureScaler
 from backend.models.isolation_forest import IsolationForestModel
 from backend.models.lstm_autoencoder import LSTMAutoEncoder
+from backend.models.transformer_autoencoder import TransformerAutoEncoder
 from backend.models.vae import VAE
 from backend.schema import FEATURE_SHORT
 
 log = logging.getLogger(__name__)
 
-MODEL_KEYS = ("iforest", "lstm", "vae")
+MODEL_KEYS = ("iforest", "lstm", "vae", "transformer")
 FLAG_SCORE = 0.5
 BUNDLE_FORMAT = 1
 
@@ -106,6 +107,7 @@ class Ensemble:
         self._scaler = FeatureScaler.from_dict(bundle["scaler"])
         self._iforest = IsolationForestModel(bundle["iforest"])
         self._lstm = LSTMAutoEncoder.from_state(bundle["lstm"])
+        self._transformer = TransformerAutoEncoder.from_state(bundle["transformer"])
         self._vae = VAE.from_state(bundle["vae"])
         self._calibration = {k: tuple(v) for k, v in bundle["calibration"].items()}
         self.bundle = bundle
@@ -116,6 +118,7 @@ class Ensemble:
         return {
             "iforest": to_score(self._iforest.error(last), *self._calibration["iforest"]),
             "lstm": to_score(self._lstm.error(scaled_windows), *self._calibration["lstm"]),
+            "transformer": to_score(self._transformer.error(scaled_windows), *self._calibration["transformer"]),
             "vae": to_score(self._vae.error(last), *self._calibration["vae"]),
         }
 
@@ -149,10 +152,12 @@ class Ensemble:
                 "iforest": float(to_score(self._iforest.error(last), *self._calibration["iforest"])[0]),
                 "vae": float(to_score(self._vae.error(last), *self._calibration["vae"])[0]),
                 "lstm": None,
+                "transformer": None,
             }
             if len(buffer) == self.window:
                 windows = np.stack(buffer)[None, :, :]
                 scores["lstm"] = float(to_score(self._lstm.error(windows), *self._calibration["lstm"])[0])
+                scores["transformer"] = float(to_score(self._transformer.error(windows), *self._calibration["transformer"])[0])
 
         ensemble = float(self.combine(scores))
         is_anomaly = ensemble >= self.threshold

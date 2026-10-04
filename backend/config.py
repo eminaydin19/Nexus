@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     weight_isolation_forest: float = 0.25
     weight_lstm_ae: float = 0.45
     weight_vae: float = 0.30
+    weight_transformer: float = 0.30
     anomaly_threshold: float = 0.0
     critical_score: float = 0.85
 

@@ -9,6 +9,7 @@ const METRICS = [
 const MODEL_ROWS = [
   { key: 'iforest', label: 'Isolation Forest' },
   { key: 'lstm', label: 'LSTM autoencoder' },
+  { key: 'transformer', label: 'Transformer (Attention)' },
   { key: 'vae', label: 'VAE' },
   { key: 'ensemble', label: 'Ensemble' },
 ];
@@ -584,7 +585,7 @@ $('blockedBody').addEventListener('click', async (event) => {
     toast(`Could not unblock ${button.dataset.unblock}`);
     button.disabled = false;
   }
-});
+
 
 tickClock();
 setInterval(tickClock, 1000);

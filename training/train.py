@@ -16,6 +16,7 @@ from backend.models.ensemble import BUNDLE_FORMAT, Ensemble
 from backend.models.features import FeatureScaler
 from backend.models.isolation_forest import IsolationForestModel
 from backend.models.lstm_autoencoder import LSTMAutoEncoder
+from backend.models.transformer_autoencoder import TransformerAutoEncoder
 from backend.models.vae import VAE
 from backend.schema import FEATURES, N_FEATURES
 
@@ -126,7 +127,9 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     vae_loss = vae.fit(train_scaled, epochs=epochs, seed=seed)
     lstm = LSTMAutoEncoder()
     lstm_loss = lstm.fit(train_windows, epochs=epochs, seed=seed)
-    log.info("final loss: vae=%.4f lstm=%.4f", vae_loss, lstm_loss)
+    transformer = TransformerAutoEncoder()
+    transformer_loss = transformer.fit(train_windows, epochs=epochs, seed=seed)
+    log.info("final loss: vae=%.4f lstm=%.4f transformer=%.4f", vae_loss, lstm_loss, transformer_loss)
 
     val_windows = windows_from(val_scaled_parts, window)
     eval_on = "validation"
@@ -140,6 +143,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     errors = {
         "iforest": iforest.error(last),
         "lstm": lstm.error(val_windows),
+        "transformer": transformer.error(val_windows),
         "vae": vae.error(last),
     }
     calibration = {}
@@ -155,6 +159,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         "scaler": scaler.to_dict(),
         "iforest": iforest.forest,
         "lstm": lstm.to_state(),
+        "transformer": transformer.to_state(),
         "vae": vae.to_state(),
         "calibration": calibration,
         "threshold": 0.5,
@@ -163,6 +168,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         {
             "iforest": settings.weight_isolation_forest,
             "lstm": settings.weight_lstm_ae,
+            "transformer": settings.weight_transformer,
             "vae": settings.weight_vae,
         }
     )

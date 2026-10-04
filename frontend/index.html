@@ -131,7 +131,9 @@
       </section>
 
       <section class="card" aria-label="Model">
-        <div class="card-head"><h2>Detection model</h2></div>
+        <div class="card-head">
+          <h2>Detection model</h2>
+        </div>
         <div class="scores" id="scoreBars"></div>
 
         <h3 class="section-title">Deviation drivers</h3>
@@ -142,6 +144,7 @@
         <div class="weights" id="weights">
           <label>Isolation Forest <input type="range" min="0" max="100" value="25" data-key="iforest"><output></output></label>
           <label>LSTM autoencoder <input type="range" min="0" max="100" value="45" data-key="lstm"><output></output></label>
+          <label>Transformer (Attention) <input type="range" min="0" max="100" value="30" data-key="transformer"><output></output></label>
           <label>VAE <input type="range" min="0" max="100" value="30" data-key="vae"><output></output></label>
         </div>
 
