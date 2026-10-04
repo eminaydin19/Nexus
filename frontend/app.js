@@ -27,7 +27,25 @@ const state = {
   retry: 0,
   weightsTimer: null,
   weightsInitialized: false,
+  defense: null,
+  defenseEvents: [],
 };
+
+const DEFENSE_LABELS = {
+  safe_mode: 'Safe Mode',
+  block: 'Block',
+  block_failed: 'Block failed',
+  block_skipped: 'Block skipped',
+  unblock: 'Unblock',
+  unblock_failed: 'Unblock failed',
+};
+const DRIVER_LABELS = { cpu: 'CPU', memory: 'Memory', network: 'Network', latency: 'Latency' };
+
+(function initTheme() {
+  const saved = localStorage.getItem('nexus-theme');
+  const prefersLight = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches;
+  document.documentElement.dataset.theme = saved || (prefersLight ? 'light' : 'dark');
+})();
 
 const $ = (id) => document.getElementById(id);
 
@@ -240,6 +258,30 @@ function renderDetail() {
     const text = value === null || value === undefined ? (node && node.scores ? 'warm-up' : '–') : value.toFixed(2);
     return `<div class="score-row${hot}"><span>${row.label}</span><div class="track"><i style="width:${pct}%"></i></div><output>${text}</output></div>`;
   }).join('');
+
+  renderDrivers(node);
+}
+
+function topDrivers(contributions, count) {
+  return Object.entries(contributions || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, count);
+}
+
+function renderDrivers(node) {
+  const contributions = node && node.contributions && Object.keys(node.contributions).length ? node.contributions : null;
+  if (!contributions) {
+    $('driverBars').innerHTML = `<p class="muted">${node && node.scores ? 'No data' : 'Available once a model is trained.'}</p>`;
+    return;
+  }
+  const leader = topDrivers(contributions, 1)[0][0];
+  $('driverBars').innerHTML = Object.entries(contributions)
+    .sort((a, b) => b[1] - a[1])
+    .map(([key, share]) => {
+      const hot = key === leader && node.status === 'anomaly' ? ' hot' : '';
+      return `<div class="score-row${hot}"><span>${esc(DRIVER_LABELS[key] || key)}</span><div class="track"><i style="width:${Math.round(share * 100)}%"></i></div><output>${Math.round(share * 100)}%</output></div>`;
+    })
+    .join('');
 }
 
 function renderKpis() {
@@ -270,16 +312,61 @@ function renderAnomalies() {
   $('anomalyBody').innerHTML = rows
     .map((a) => {
       const flags = (a.flags || []).map((f) => `<span class="chip">${esc(f)}</span>`).join('');
+      const why = topDrivers(a.contributions, 2).map(([k, v]) => `${esc(DRIVER_LABELS[k] || k)} ${Math.round(v * 100)}%`).join(' · ');
       return `<tr>
         <td class="mono">${esc(new Date(a.ts * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }))}</td>
         <td class="mono">${esc(a.node)}</td>
         <td>${esc(a.culprit)}</td>
+        <td class="muted">${why || '–'}</td>
         <td><span class="badge ${esc(a.severity)}">${esc(a.severity)}</span></td>
         <td class="mono">${fmt(a.scores.ensemble, 2)}</td>
         <td>${flags || '–'}</td>
       </tr>`;
     })
     .join('');
+}
+
+function renderDefense() {
+  const d = state.defense;
+  if (!d) return;
+  const now = serverNow();
+
+  const modeText = { off: 'Off', dry_run: 'Dry run', enforce: 'Enforcing' }[d.mode] || d.mode;
+  const pillClass = d.safe_mode ? 'bad' : d.mode === 'enforce' ? 'ok' : d.mode === 'dry_run' ? 'warn' : '';
+  setPill('defensePill', 'defenseLabel', pillClass, d.safe_mode ? 'Safe Mode' : `Defense: ${modeText}`);
+
+  $('safeBanner').hidden = !d.safe_mode;
+  if (d.safe_mode && d.safe_mode_until) {
+    $('safeText').textContent = `Non-essential API traffic is being rejected for another ${Math.max(0, Math.round(d.safe_mode_until - now))}s.`;
+  }
+
+  const badge = $('defenseMode');
+  badge.textContent = modeText;
+  badge.className = `badge ${d.mode === 'enforce' ? 'ok' : d.mode === 'dry_run' ? 'learning' : 'stale'}`;
+  $('defenseSub').textContent = d.mode === 'off'
+    ? 'Disabled'
+    : `${d.firewall} \u00b7 blocks last ${Math.round(d.block_seconds / 60)} min${d.mode === 'dry_run' ? ' \u00b7 simulated, no firewall changes' : ''}`;
+
+  $('blockedEmpty').hidden = d.blocked.length > 0;
+  $('blockedBody').innerHTML = d.blocked.map((b) => {
+    const remaining = Math.max(0, Math.round(b.until - now));
+    const label = b.simulated ? '<span class="chip">simulated</span>' : '';
+    return `<tr><td class="mono">${esc(b.ip)} ${label}</td><td class="mono">${esc(b.node)}</td><td>${remaining}s</td>
+      <td><button type="button" class="btn btn-small" data-unblock="${esc(b.ip)}">Unblock</button></td></tr>`;
+  }).join('');
+
+  const events = state.defenseEvents.slice(0, 30);
+  $('defenseEmpty').hidden = events.length > 0;
+  $('defenseBody').innerHTML = events.map((e) => {
+    const cls = e.ok === false ? 'critical' : e.type === 'safe_mode' ? 'warning' : e.type === 'block' ? 'critical' : 'ok';
+    const target = [e.node, e.ip].filter(Boolean).join(' \u00b7 ') || '\u2013';
+    return `<tr>
+      <td class="mono">${esc(new Date(e.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }))}</td>
+      <td><span class="badge ${cls}">${esc(DEFENSE_LABELS[e.type] || e.type)}</span></td>
+      <td class="mono">${esc(target)}</td>
+      <td class="muted wrap">${esc(e.detail || '')}</td>
+    </tr>`;
+  }).join('');
 }
 
 function setPill(id, labelId, cls, text) {
@@ -381,9 +468,20 @@ function onMessage(event) {
     state.clockOffset = msg.health.server_time - Date.now() / 1000;
     state.nodes.clear();
     state.anomalies = msg.anomalies;
+    state.defense = msg.health.defense;
+    state.defenseEvents = msg.defense_events || [];
     applyNodes(msg.nodes);
     renderHealth();
     renderAll();
+    return;
+  }
+  if (msg.type === 'defense') {
+    state.defense = msg.status;
+    state.defenseEvents = [msg.event, ...state.defenseEvents].slice(0, 100);
+    if (msg.event.type === 'safe_mode' || msg.event.type === 'block') {
+      toast(`DEFENSE \u00b7 ${DEFENSE_LABELS[msg.event.type]}${msg.event.ip ? ` \u00b7 ${msg.event.ip}` : ''}${msg.event.mode === 'dry_run' ? ' (dry run)' : ''}`);
+    }
+    renderDefense();
     return;
   }
   if (msg.type === 'update') {
@@ -405,6 +503,7 @@ function renderAll() {
   renderFleet();
   renderDetail();
   renderAnomalies();
+  renderDefense();
 }
 
 function connect() {
@@ -430,8 +529,10 @@ async function refreshHealth() {
     if (!res.ok) return;
     state.health = await res.json();
     state.clockOffset = state.health.server_time - Date.now() / 1000;
+    if (state.health.defense) state.defense = state.health.defense;
     renderHealth();
     renderKpis();
+    renderDefense();
     redrawCharts();
   } catch {
     return;
@@ -465,7 +566,25 @@ $('metricFilter').addEventListener('click', (event) => {
 
 document.querySelectorAll('#weights input').forEach((input) => input.addEventListener('input', onWeightsInput));
 
+$('themeToggle').addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = next;
+  localStorage.setItem('nexus-theme', next);
+});
 
+$('blockedBody').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-unblock]');
+  if (!button) return;
+  button.disabled = true;
+  try {
+    const res = await fetch(`/api/defense/unblock/${encodeURIComponent(button.dataset.unblock)}`, { method: 'POST' });
+    if (!res.ok) throw new Error(res.status);
+    toast(`Unblocked ${button.dataset.unblock}`);
+  } catch {
+    toast(`Could not unblock ${button.dataset.unblock}`);
+    button.disabled = false;
+  }
+});
 
 tickClock();
 setInterval(tickClock, 1000);
@@ -474,6 +593,7 @@ setInterval(() => {
   renderFleet();
   renderDetail();
   renderKpis();
+  renderDefense();
 }, 5000);
 refreshHealth();
 connect();

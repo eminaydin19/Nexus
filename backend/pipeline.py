@@ -8,9 +8,10 @@ import numpy as np
 
 from backend.alerting import SlackNotifier
 from backend.config import settings
-from backend.db import Anomaly, Metric, SessionLocal
+from backend.db import Anomaly, DefenseEvent, Metric, SessionLocal
 from backend.ingestion.base import Source
 from backend.models.ensemble import Ensemble
+from backend.metrics import counters
 from backend.schema import NodeSnapshot
 
 log = logging.getLogger(__name__)
@@ -49,17 +50,20 @@ def metric_history(node: str, minutes: int, points: int) -> list[dict]:
 
 
 class Pipeline:
-    def __init__(self, source: Source, ensemble: Ensemble, notifier: SlackNotifier):
+    def __init__(self, source: Source, ensemble: Ensemble, notifier: SlackNotifier, defender=None):
         self.source = source
         self.ensemble = ensemble
         self.notifier = notifier
+        self.defender = defender
+        self.node_ips: dict[str, str] = {}
+        self._tasks: set[asyncio.Task] = set()
         self.latest: dict[str, dict] = {}
         self.clients: set = set()
         self.last_poll: float | None = None
         self.last_error: str | None = None
         self._last_stored: dict[str, float] = {}
         self._last_prune = 0.0
-        self._retention_days = 1 if source.name == "mock" else settings.retention_days
+        self._retention_days = settings.retention_days
 
     def health(self) -> dict:
         return {
@@ -73,6 +77,7 @@ class Pipeline:
             "server_time": time.time(),
             "model": self.ensemble.info(),
             "slack": self.notifier.enabled,
+            "defense": self.defender.status() if self.defender else None,
         }
 
     def prime_from_db(self) -> None:
@@ -108,14 +113,28 @@ class Pipeline:
                 self.last_error = f"{type(exc).__name__}: {exc}"
             await asyncio.sleep(self.source.interval)
 
-    async def handle(self, snapshots: list[NodeSnapshot]) -> None:
+    async def handle(self, snapshots: list[NodeSnapshot], source_ip: str | None = None) -> None:
+        if source_ip:
+            for snap in snapshots:
+                self.node_ips[snap.node_id] = source_ip
+        counters.inc("nexus_ingest_total", len(snapshots))
         payloads, anomalies = await asyncio.to_thread(self._score_and_store, snapshots)
         for payload in payloads:
             self.latest[payload["node"]] = payload
         await self.broadcast({"type": "update", "nodes": payloads, "anomalies": anomalies})
         for anomaly in anomalies:
+            counters.inc("nexus_anomalies_total", severity=anomaly["severity"])
             if anomaly["severity"] == "critical":
                 await self.notifier.notify(anomaly)
+
+            if self.defender:
+                # Mitigation may shell out to a firewall; never block ingestion on it.
+                node = anomaly["node"]
+                task = asyncio.create_task(
+                    self.defender.mitigate(node, anomaly["scores"]["ensemble"], self.node_ips.get(node))
+                )
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
 
     def _score_and_store(self, snapshots: list[NodeSnapshot]) -> tuple[list[dict], list[dict]]:
         if self.ensemble.reload_if_changed(settings.bundle_path):
@@ -144,6 +163,7 @@ class Pipeline:
                         "severity": prediction.severity if prediction else None,
                         "culprit": prediction.culprit if prediction else None,
                         "flags": prediction.flags if prediction else [],
+                        "contributions": prediction.contributions if prediction else {},
                     }
                 )
                 db.add(
@@ -175,6 +195,7 @@ class Pipeline:
                         lstm_score=prediction.scores["lstm"],
                         vae_score=prediction.scores["vae"],
                         flags=prediction.flags,
+                        contributions=prediction.contributions,
                     )
                     db.add(row)
                     db.flush()
@@ -191,6 +212,7 @@ class Pipeline:
         cutoff = now - timedelta(days=self._retention_days).total_seconds()
         db.query(Metric).filter(Metric.ts < cutoff).delete(synchronize_session=False)
         db.query(Anomaly).filter(Anomaly.ts < cutoff).delete(synchronize_session=False)
+        db.query(DefenseEvent).filter(DefenseEvent.ts < cutoff).delete(synchronize_session=False)
         db.commit()
 
     async def broadcast(self, message: dict) -> None:

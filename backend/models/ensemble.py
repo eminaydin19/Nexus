@@ -7,6 +7,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 
+from backend.explain import contributions as explain_contributions
 from backend.models.features import FeatureScaler
 from backend.models.isolation_forest import IsolationForestModel
 from backend.models.lstm_autoencoder import LSTMAutoEncoder
@@ -33,6 +34,7 @@ class Prediction:
     severity: str | None
     culprit: str
     flags: list[str] = field(default_factory=list)
+    contributions: dict[str, float] = field(default_factory=dict)
 
 
 class Ensemble:
@@ -166,6 +168,7 @@ class Ensemble:
             severity=severity,
             culprit=culprit,
             flags=flags,
+            contributions=explain_contributions(scaled),
         )
 
     def info(self) -> dict:

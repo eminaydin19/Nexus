@@ -1,63 +1,79 @@
-# Nexus
+<div align="center">
+  <h1>🛡️ Nexus AI Security</h1>
+  <p><strong>Real-time Anomaly Detection & Active Defense for AWS Cloud Infrastructure</strong></p>
+  <img src="https://img.shields.io/badge/Production-Ready-success?style=flat-square" />
+  <img src="https://img.shields.io/badge/AWS-CloudWatch-orange?style=flat-square&logo=amazon-aws" />
+  <img src="https://img.shields.io/badge/AI-Powered-blue?style=flat-square" />
+</div>
 
-Nexus is a real-time anomaly detection system for cloud infrastructure. It continuously analyzes host metrics (CPU, memory, network I/O, and latency) to identify operational irregularities, degrading performance, and systemic failures before they escalate into critical incidents.
+<br>
 
-## Architecture
+Nexus is an advanced, AI-driven security and telemetry analysis system designed for cloud environments. It continuously ingests real-time metrics, analyzes them using a multi-model Machine Learning ensemble, and actively defends your infrastructure by automatically quarantining malicious actors at the firewall level.
 
-Traditional alerting relies on static thresholds, which often fail to capture complex, non-linear relationships in system behavior, leading to alert fatigue or undetected outages. Nexus addresses this by applying a multi-model ensemble approach:
+## 🚀 Key Features
 
-- **Isolation Forest:** Rapidly identifies statistical outliers in multidimensional space.
-- **LSTM Autoencoders:** Captures sequential dependencies to detect temporal anomalies.
-- **Variational Autoencoders (VAE):** Models the latent distribution of healthy states to flag structural deviations.
+- **🧠 Multi-Model AI Ensemble:** Uses a combination of **Isolation Forest**, **LSTM Autoencoders**, and **Variational Autoencoders (VAE)** to detect both statistical outliers and complex behavioral anomalies.
+- **🛡️ Active Defense Firewall:** Automatically blocks malicious IPs in real-time. Supports `iptables`, `nftables`, and macOS `pfctl`. Includes a **Safe Mode** to protect APIs during critical attacks.
+- **☁️ AWS CloudWatch Integration:** Directly ingests metrics and logs from AWS CloudWatch using Boto3. 100% real data, production-ready.
+- **📊 Real-time Dashboard:** A beautiful, responsive WebSockets-based dashboard with Dark/Light mode, deviation drivers, and active defense management.
+- **⚡ High Performance:** CPU-bound inference pipeline optimized for edge nodes and small AWS EC2 instances to prevent out-of-memory errors.
 
-By aggregating anomaly scores from these models, Nexus provides a unified "Ensemble Score," which balances precision and recall, dramatically reducing false positives in production environments.
+## 🏗️ Architecture
 
-## Deployment
+1. **Ingestion:** Receives telemetry securely via CloudWatch or agent APIs using strict rate limits and `API_KEY` validation.
+2. **Analysis:** The AI ensemble evaluates metrics (CPU, Memory, Network, Latency). It computes an aggregate **Ensemble Score**.
+3. **Defense:** If the score exceeds the `CRITICAL_SCORE` threshold, Nexus triggers **Safe Mode** and injects block rules into the host's firewall.
+4. **Observability:** Metrics are exposed via a Prometheus `/metrics` endpoint, and events are logged to a local SQLite database for the dashboard.
 
-The system is optimized for edge and low-resource environments, utilizing a CPU-bound inference pipeline that prevents out-of-memory errors on small virtual machines. 
+## 📦 1-Click AWS Installation
 
-### Prerequisites
-- Docker
-- Docker Compose
-- Python 3.10+ (for the native host probe)
+Nexus comes with a fully automated, one-command setup script tailored for AWS EC2 (Ubuntu/Debian).
 
-### Getting Started
-
-1. **Environment Setup**
-   Clone the repository and prepare the configuration:
+1. Connect to your AWS EC2 instance via SSH.
+2. Clone this repository:
    ```bash
-   git clone https://github.com/eminaydin19/Nexus.git
+   git clone https://github.com/YOUR_USERNAME/Nexus.git
    cd Nexus
-   cp .env.example .env
    ```
-   *Note: Ensure `INGESTION_SOURCE=webhook` is set in your `.env` file.*
-
-2. **Start the Nexus Services**
-   Bring up the backend, models, and real-time dashboard:
+3. Run the installer:
    ```bash
-   docker compose up -d --build
-   ```
-   The dashboard is exposed by default on port `80` via a Caddy reverse proxy.
-
-3. **Deploy the Metric Probe**
-   To stream actual system telemetry into Nexus, deploy the native Python probe on your target instances. 
-   ```bash
-   pip install psutil
-   INTERVAL=5 NODE_ID=$(hostname) API_URL=http://<YOUR_NEXUS_HOST>/api/ingest nohup python3 deploy/probe.py > probe.log 2>&1 &
+   ./install.sh
    ```
 
-## Configuration
+The script will automatically install Docker, prompt you for your AWS IAM keys (to fetch CloudWatch data), generate a secure `.env` configuration, and spin up the entire system.
 
-Nexus behavior, including model sensitivity and alerting thresholds, can be adjusted dynamically via the `.env` file. A service restart is required to apply changes.
+## 🛠️ Configuration (.env)
+
+Nexus is highly customizable. The `install.sh` script generates your `.env` file, but you can manually tune the AI models and defense systems:
 
 | Variable | Default | Description |
 |---|---|---|
-| `WEIGHT_ISOLATION_FOREST` | 0.25 | Relative weight of the Isolation Forest model |
-| `WEIGHT_LSTM_AE` | 0.45 | Relative weight of the LSTM Autoencoder |
-| `WEIGHT_VAE` | 0.30 | Relative weight of the Variational Autoencoder |
-| `CRITICAL_SCORE` | 0.85 | Threshold (0.0 - 1.0) required to trigger an alert |
-| `SLACK_WEBHOOK_URL` | | (Optional) Webhook URL for incident notification |
+| `INGESTION_SOURCE` | `cloudwatch` | Source of data. Set to `cloudwatch` for AWS production. |
+| `WEIGHT_ISOLATION_FOREST` | 0.25 | Relative weight of the Isolation Forest model. |
+| `WEIGHT_LSTM_AE` | 0.45 | Relative weight of the LSTM Autoencoder. |
+| `WEIGHT_VAE` | 0.30 | Relative weight of the Variational Autoencoder. |
+| `CRITICAL_SCORE` | 0.85 | Threshold (0.0 - 1.0) required to trigger Active Defense. |
+| `DEFENSE_MODE` | `dry_run` | `off`, `dry_run` (log only) or `enforce` (update firewall). |
+| `DEFENSE_FIREWALL` | `auto` | `iptables`, `nftables` or `pfctl`. |
+| `DEFENSE_BLOCK_SECONDS` | 300 | Quarantine duration for blocked IPs. |
 
-## License
+## 🛡️ Active Defense Deep-Dive
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+When the AI detects an attack:
+1. **Safe Mode Activation:** Nexus returns `503 Service Unavailable` for non-essential APIs, protecting your backend while keeping the health and dashboard sockets alive.
+2. **IP Quarantine:** The source IP of the malicious telemetry is immediately blocked at the OS level (`iptables`/`nftables`).
+3. **Auto-Recovery:** Blocks expire automatically after `DEFENSE_BLOCK_SECONDS`. You can also manually unblock IPs via the Dashboard.
+
+*Note: To use `enforce` mode in Docker, the container must be run with `--privileged` or `CAP_NET_ADMIN` to manipulate the host's firewall.*
+
+## 📈 Prometheus & Monitoring
+You can easily scrape Nexus using Prometheus. The `/metrics` endpoint is protected by basic auth.
+```yaml
+scrape_configs:
+  - job_name: nexus
+    basic_auth: { username: admin, password: <DASHBOARD_PASSWORD> }
+    static_configs: [{ targets: ["nexus-host:80"] }]
+```
+
+## 📄 License
+This project is licensed under the MIT License.

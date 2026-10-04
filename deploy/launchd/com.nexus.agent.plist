@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nexus.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/nexus-agent/venv/bin/python</string>
+    <string>/usr/local/nexus-agent/agent.py</string>
+    <string>--interval</string>
+    <string>5</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NEXUS_URL</key>
+    <string>https://nexus.example.com/api/ingest</string>
+    <key>NEXUS_API_KEY</key>
+    <string>CHANGE_ME</string>
+    <key>NEXUS_NODE_ID</key>
+    <string>mac-1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/nexus-agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/nexus-agent.log</string>
+</dict>
+</plist>

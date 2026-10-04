@@ -36,6 +36,21 @@ class Settings(BaseSettings):
     dashboard_user: str = ""
     dashboard_password: str = ""
 
+    # Shared secret agents must send in the X-API-Key header (or Bearer token) to /api/ingest.
+    ingest_api_key: str = ""
+    # Per-client request budget per minute (0 disables rate limiting).
+    rate_limit_per_minute: int = 300
+    # Honour X-Forwarded-For. Only enable behind a trusted reverse proxy (e.g. Caddy).
+    trust_proxy_headers: bool = False
+
+    # Active defense. "dry_run" only logs/records what it would do; "enforce" runs firewall commands.
+    defense_mode: Literal["off", "dry_run", "enforce"] = "dry_run"
+    defense_firewall: Literal["auto", "iptables", "nftables", "pfctl"] = "auto"
+    defense_block_seconds: int = 300
+    defense_safe_mode_seconds: int = 60
+    # Comma separated IPs/CIDRs that must never be blocked.
+    defense_allowlist: str = "127.0.0.1,::1"
+
     @property
     def data_path(self) -> Path:
         return Path(self.data_dir)
@@ -49,6 +64,10 @@ class Settings(BaseSettings):
     @property
     def bundle_path(self) -> Path:
         return self.data_path / "models" / "ensemble.joblib"
+
+    @property
+    def allowlist(self) -> list[str]:
+        return [i.strip() for i in self.defense_allowlist.split(",") if i.strip()]
 
     @property
     def instance_ids(self) -> list[str]:

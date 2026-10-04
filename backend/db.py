@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import JSON, Boolean, Float, Index, Integer, String, create_engine, event
+from sqlalchemy import JSON, Boolean, Float, Index, Integer, String, create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from backend.config import settings
@@ -64,6 +64,7 @@ class Anomaly(Base):
     lstm_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     vae_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     flags: Mapped[list] = mapped_column(JSON, default=list)
+    contributions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     def as_dict(self) -> dict:
         return {
@@ -84,8 +85,49 @@ class Anomaly(Base):
                 "vae": self.vae_score,
             },
             "flags": self.flags or [],
+            "contributions": self.contributions or {},
         }
+
+
+class DefenseEvent(Base):
+    __tablename__ = "defense_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[float] = mapped_column(Float, index=True)
+    type: Mapped[str] = mapped_column(String(32))
+    mode: Mapped[str] = mapped_column(String(16))
+    node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    detail: Mapped[str] = mapped_column(String(400), default="")
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "ts": self.ts,
+            "type": self.type,
+            "mode": self.mode,
+            "node": self.node_id,
+            "ip": self.ip,
+            "ok": self.ok,
+            "score": self.score,
+            "detail": self.detail,
+        }
+
+
+# Columns added after the first release: (table, column, DDL type).
+_ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON")]
+
+
+def _migrate() -> None:
+    inspector = inspect(engine)
+    for table, column, ddl in _ADDITIVE_COLUMNS:
+        if table in inspector.get_table_names() and column not in {c["name"] for c in inspector.get_columns(table)}:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}'))
 
 
 def init_db() -> None:
     Base.metadata.create_all(bind=engine)
+    _migrate()

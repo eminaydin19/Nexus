@@ -57,14 +57,7 @@ def load_csv(path: Path) -> NodeData:
     return {node: _split_columns(np.array(values)) for node, values in rows.items()}
 
 
-def load_mock(steps: int, seed: int) -> NodeData:
-    from backend.ingestion.mock import MockSource
 
-    source = MockSource(seed=seed)
-    rows: dict[str, list[list[float]]] = {}
-    for s in source.generate(steps, step_seconds=60.0):
-        rows.setdefault(s.node_id, []).append([s.timestamp, *s.vector()])
-    return {node: _split_columns(np.array(values)) for node, values in rows.items()}
 
 
 def _split_columns(array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -210,12 +203,12 @@ def save(bundle: dict, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m training.train")
-    parser.add_argument("--source", choices=["db", "csv", "mock"], default="db")
+    parser.add_argument("--source", choices=["db", "csv"], default="db")
     parser.add_argument("--csv", type=Path)
     parser.add_argument("--window", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--min-rows", type=int, default=500)
-    parser.add_argument("--mock-steps", type=int, default=1500)
+
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=settings.bundle_path)
     args = parser.parse_args()
@@ -227,8 +220,6 @@ def main() -> None:
         if not args.csv:
             parser.error("--csv is required with --source csv")
         data = load_csv(args.csv)
-    elif args.source == "mock":
-        data = load_mock(args.mock_steps, args.seed)
     else:
         data = load_db()
 

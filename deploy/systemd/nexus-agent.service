@@ -1,0 +1,24 @@
+[Unit]
+Description=Nexus telemetry agent
+Documentation=https://github.com/eminaydin19/Nexus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Create /etc/nexus-agent.env (chmod 600) containing:
+#   NEXUS_URL=https://nexus.example.com/api/ingest
+#   NEXUS_API_KEY=<INGEST_API_KEY>
+#   NEXUS_NODE_ID=web-1
+EnvironmentFile=/etc/nexus-agent.env
+ExecStart=/opt/nexus-agent/venv/bin/python /opt/nexus-agent/agent.py --interval 5
+Restart=always
+RestartSec=5
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
