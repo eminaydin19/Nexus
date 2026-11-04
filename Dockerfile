@@ -16,6 +16,9 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
 COPY backend backend
 COPY training training
 COPY frontend frontend
+COPY nexus_agent nexus_agent
+COPY requirements-agent.txt .
+COPY install-agent.sh .
 
 RUN useradd --system --uid 10001 nexus \
     && mkdir -p /data \

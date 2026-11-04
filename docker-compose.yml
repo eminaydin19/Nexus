@@ -1,15 +1,18 @@
+# nexus is reachable only through Caddy (profile "https") or docker-compose.local.yml. install.sh picks one in .env.
+name: nexus
+
 services:
   nexus:
     build: .
-    image: nexus:latest
+    image: nexus:2.0.0
     restart: unless-stopped
     env_file:
       - path: .env
         required: false
     environment:
       DATA_DIR: /data
-    ports:
-      - "${HTTP_BIND:-80}:8000"
+    expose:
+      - "8000"
     volumes:
       - nexus-data:/data
     mem_limit: 800m
@@ -20,7 +23,7 @@ services:
         max-file: "3"
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.10.2-alpine
     profiles: ["https"]
     restart: unless-stopped
     depends_on:

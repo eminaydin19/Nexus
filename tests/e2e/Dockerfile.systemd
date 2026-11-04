@@ -1,0 +1,13 @@
+# A bare server with systemd. python3-venv and nftables are left out on purpose: the installer must bring them.
+ARG BASE=ubuntu:22.04
+FROM ${BASE}
+
+RUN if command -v apt-get >/dev/null; then \
+        apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus python3 curl ca-certificates rsyslog procps && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf install -y --allowerasing systemd python3 curl ca-certificates rsyslog procps-ng shadow-utils; \
+    fi \
+    && systemctl mask getty.target console-getty.service systemd-firstboot.service systemd-networkd-wait-online.service
+
+STOPSIGNAL SIGRTMIN+3
+ENTRYPOINT ["/sbin/init"]

@@ -1,6 +1,8 @@
+import re
 from pathlib import Path
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,6 +43,17 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 300
     # Honour X-Forwarded-For. Only enable behind a trusted reverse proxy (e.g. Caddy).
     trust_proxy_headers: bool = False
+    # The address agents enroll with. Set by install.sh, never derived from a request.
+    public_url: str = ""
+
+    @field_validator("public_url")
+    @classmethod
+    def _origin_only(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        # This value lands inside a shell script that people pipe into sudo bash.
+        if value and not re.fullmatch(r"https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:\d+)?", value):
+            raise ValueError("PUBLIC_URL must look like https://host[:port]")
+        return value
 
     def require_dashboard_credentials(self) -> None:
         if not (self.dashboard_user and self.dashboard_password):

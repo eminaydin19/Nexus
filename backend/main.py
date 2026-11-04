@@ -1,9 +1,14 @@
 import asyncio
+import gzip
+import hashlib
+import io
 import ipaddress
 import json
 import logging
+import tarfile
 import time
 from contextlib import asynccontextmanager, suppress
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -40,7 +45,9 @@ from training.train import NotEnoughDataError, load_db, train
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("nexus")
 
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+FRONTEND_DIR = ROOT_DIR / "frontend"
+AGENT_FILE_SUFFIXES = {".py", ".json", ".txt"}
 
 
 def recent_events(limit: int, node=None, rule=None, action=None, simulated=None) -> list[dict]:
@@ -148,7 +155,7 @@ app = FastAPI(title="Nexus", version="2.0.0", lifespan=lifespan)
 
 def basic_exempt_paths() -> tuple[str, ...]:
     # These authenticate with an agent key or enroll token instead of dashboard credentials.
-    return ("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh")
+    return ("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh", "/agent.tar.gz")
 
 
 app.add_middleware(
@@ -278,6 +285,36 @@ def _slack_worthy(event: dict) -> bool:
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/install-agent.sh")
+def install_agent_script():
+    # settings.public_url only: a request's Host header could make a victim's server enroll with an attacker.
+    script = (ROOT_DIR / "install-agent.sh").read_text().replace("__NEXUS_PUBLIC_URL__", settings.public_url, 1)
+    return Response(script, media_type="text/x-shellscript", headers={"Cache-Control": "no-store"})
+
+
+@lru_cache(maxsize=1)
+def _agent_tarball() -> bytes:
+    package = sorted(
+        p for p in (ROOT_DIR / "nexus_agent").rglob("*") if p.is_file() and p.suffix in AGENT_FILE_SUFFIXES
+    )
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed, tarfile.open(
+        fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT
+    ) as tar:
+        for path in [ROOT_DIR / "requirements-agent.txt", *package]:
+            data = path.read_bytes()
+            info = tarfile.TarInfo(path.relative_to(ROOT_DIR).as_posix())
+            info.size, info.mode = len(data), 0o644
+            tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+@app.get("/agent.tar.gz")
+def agent_tarball():
+    data = _agent_tarball()
+    return Response(data, media_type="application/gzip", headers={"X-Nexus-Agent-SHA256": hashlib.sha256(data).hexdigest()})
 
 
 @app.get("/api/health")

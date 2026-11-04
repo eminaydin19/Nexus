@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# Nexus agent installer. Served by central at /install-agent.sh.
+#   curl -fsSL https://<central>/install-agent.sh | sudo bash -s -- --token <one-time-token>
+# Nothing runs until the last line, and a cut anywhere in that line is a syntax error, so a truncated download changes nothing.
+
+EMBEDDED_URL='__NEXUS_PUBLIC_URL__'
+
+SERVICE=nexus-agent
+AGENT_USER=nexus-agent
+INSTALL_DIR=/opt/nexus-agent
+ENV_FILE=/etc/nexus-agent.env
+STATE_DIR=/var/lib/nexus-agent
+UNIT_FILE=/etc/systemd/system/nexus-agent.service
+
+TOKEN=""
+URL=""
+URL_FLAG=""
+MAX_MODE=""
+INSECURE=""
+UNINSTALL=""
+ENROLLED=""
+WORKDIR=""
+ROLLBACK=0
+CREATED_USER=0
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'nexus-agent: %s\n' "$*" >&2; }
+die() {
+    warn "$*"
+    exit 1
+}
+
+usage() {
+    say "Usage: install-agent.sh --token <token> [--url <central-url>] [--max-mode off|observe|enforce] [--insecure]"
+    say "       install-agent.sh --uninstall"
+    say "NEXUS_ENROLL_TOKEN is preferred over --token, which other local users can see in ps."
+}
+
+parse_args() {
+    TOKEN="${NEXUS_ENROLL_TOKEN:-}"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --token | --url | --max-mode)
+                [ "$#" -ge 2 ] || die "$1 needs a value"
+                case "$1" in
+                    --token) TOKEN="${NEXUS_ENROLL_TOKEN:-$2}" ;;
+                    --url) URL_FLAG="$2" ;;
+                    --max-mode) MAX_MODE="$2" ;;
+                esac
+                shift 2
+                ;;
+            --insecure) INSECURE=1 && shift ;;
+            --uninstall) UNINSTALL=1 && shift ;;
+            -h | --help) usage && exit 0 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    case "$MAX_MODE" in
+        "" | off | observe | enforce) ;;
+        *) die "--max-mode must be off, observe or enforce" ;;
+    esac
+}
+
+require_root() {
+    [ "$(id -u)" = 0 ] || die "this installer must run as root (use sudo)"
+}
+
+require_systemd() {
+    if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then
+        die "systemd is required, and it is not running on this system"
+    fi
+}
+
+require_python() {
+    command -v python3 >/dev/null 2>&1 || die "python3 3.9 or newer is required, and python3 was not found"
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' ||
+        die "python3 3.9 or newer is required, found: $(python3 --version 2>&1)"
+}
+
+# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+NORMALIZE_URL_PY='
+import ipaddress, re, sys
+from urllib.parse import urlsplit
+
+def refuse(why):
+    sys.exit("nexus-agent: " + why)
+
+raw, insecure = sys.argv[1], sys.argv[2] == "1"
+if not re.fullmatch(r"[A-Za-z0-9._~:/\[\]%-]+", raw):
+    refuse("the central URL has invalid characters")
+parts = urlsplit(raw)
+try:
+    parts.port
+except ValueError:
+    refuse("the central URL has an invalid port")
+if parts.scheme not in ("http", "https") or not parts.hostname:
+    refuse("the central URL must look like https://host")
+if parts.username or parts.password or parts.query or parts.fragment:
+    refuse("the central URL must not contain credentials, a query or a fragment")
+try:
+    loopback = ipaddress.ip_address(parts.hostname).is_loopback
+except ValueError:
+    loopback = parts.hostname == "localhost"
+if parts.scheme != "https" and not insecure and not loopback:
+    refuse("the central URL must use https; only loopback or --insecure may use http")
+path = parts.path.rstrip("/")
+if path.endswith("/api/ingest"):
+    path = path[: -len("/api/ingest")]
+print("%s://%s%s" % (parts.scheme, parts.netloc, path))
+'
+
+normalize_url() {
+    python3 -I -c "$NORMALIZE_URL_PY" "$1" "${2:-}"
+}
+
+env_value() {
+    [ ! -f "$ENV_FILE" ] || sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+}
+
+# Sets URL, ENROLLED and INSECURE. An enrolled host keeps talking to the central that issued its key.
+resolve_target() {
+    local raw
+    if [ -n "$(env_value NEXUS_API_KEY)" ]; then
+        ENROLLED=1
+        raw="$(env_value NEXUS_URL)"
+        [ -n "$raw" ] || die "$ENV_FILE has a key but no NEXUS_URL; run --uninstall and install again"
+        case "$(env_value NEXUS_INSECURE)" in 1 | true | yes) INSECURE=1 ;; esac
+        URL="$(normalize_url "$raw" "$INSECURE")" || exit 1
+        if [ -n "$URL_FLAG" ] && [ "$(normalize_url "$URL_FLAG" "$INSECURE")" != "$URL" ]; then
+            die "this server is enrolled with $URL; to move it, run --uninstall first"
+        fi
+        return 0
+    fi
+    case "$EMBEDDED_URL" in __*) EMBEDDED_URL="" ;; esac
+    raw="${URL_FLAG:-$EMBEDDED_URL}"
+    [ -n "$raw" ] || die "central did not embed its address; pass --url https://<central>"
+    URL="$(normalize_url "$raw" "$INSECURE")" || exit 1
+    [ -n "$TOKEN" ] || die "an enrollment token is required: set NEXUS_ENROLL_TOKEN or pass --token"
+}
+
+# Stops before any change on systems without apt or dnf.
+ensure_packages() {
+    local missing=()
+    python3 -c 'import ensurepip, venv' >/dev/null 2>&1 || missing+=(python3-venv)
+    command -v nft >/dev/null 2>&1 || missing+=(nftables)
+    [ "${#missing[@]}" -gt 0 ] || return 0
+    if command -v apt-get >/dev/null 2>&1; then
+        say "Installing ${missing[*]} with apt-get"
+        apt-get update -qq </dev/null || die "apt-get update failed"
+        # confold keeps a firewall config the operator already has on disk.
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${missing[@]}" </dev/null ||
+            die "could not install ${missing[*]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        say "Installing ${missing[*]} with dnf"
+        dnf install -y -q "${missing[@]}" </dev/null || die "could not install ${missing[*]}"
+    else
+        die "please install these packages and run the installer again: ${missing[*]}"
+    fi
+}
+
+# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+EXTRACT_PY='
+import hashlib, os, sys, tarfile
+from pathlib import PurePosixPath
+
+MAX_BYTES = 50 * 1024 * 1024
+
+def refuse(why):
+    sys.exit("nexus-agent: agent package refused: " + why)
+
+path, want, dest = sys.argv[1:4]
+with open(path, "rb") as f:
+    if hashlib.sha256(f.read()).hexdigest() != want.lower():
+        refuse("sha256 mismatch, the download is corrupt")
+try:
+    with tarfile.open(path, "r:gz") as tar:
+        members = tar.getmembers()
+        names = set()
+        for m in members:
+            parts = PurePosixPath(m.name).parts
+            if not m.isfile():
+                refuse("%r is not a regular file" % m.name)
+            if m.name.startswith("/") or ".." in parts or not parts:
+                refuse("unsafe path %r" % m.name)
+            if parts[0] != "nexus_agent" and m.name != "requirements-agent.txt":
+                refuse("unexpected file %r" % m.name)
+            names.add(m.name)
+        if sum(m.size for m in members) > MAX_BYTES:
+            refuse("too large")
+        if not {"nexus_agent/__main__.py", "requirements-agent.txt"} <= names:
+            refuse("required files are missing")
+        for m in members:
+            target = os.path.join(dest, m.name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with tar.extractfile(m) as src, open(target, "wb") as out:
+                out.write(src.read())
+except (tarfile.TarError, OSError, EOFError) as exc:
+    refuse(str(exc))
+'
+
+verify_and_extract() {
+    python3 -I -c "$EXTRACT_PY" "$1" "$2" "$3"
+}
+
+download_agent() {
+    local proto=https sha
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    case "$URL" in http://*) proto=http ;; esac
+    # No -L: the agent itself never follows redirects, so a redirect here would be a misconfigured URL.
+    curl -fsS --proto "=$proto" --connect-timeout 10 --max-time 300 \
+        -D "$WORKDIR/headers" -o "$WORKDIR/agent.tar.gz" "$URL/agent.tar.gz" ||
+        die "could not download the agent from $URL"
+    sha="$(tr -d '\r' <"$WORKDIR/headers" | awk 'tolower($1) == "x-nexus-agent-sha256:" { v = $2 } END { print v }')"
+    [ -n "$sha" ] || die "$URL did not send a checksum for the agent package; is this the Nexus central URL?"
+    mkdir "$WORKDIR/agent"
+    verify_and_extract "$WORKDIR/agent.tar.gz" "$sha" "$WORKDIR/agent" || exit 1
+}
+
+install_code() {
+    mkdir -p "$INSTALL_DIR"
+    chmod 755 "$INSTALL_DIR"
+    # A distribution upgrade can leave a venv whose interpreter is gone.
+    if ! "$INSTALL_DIR/venv/bin/python" -c '' >/dev/null 2>&1; then
+        python3 -m venv --clear "$INSTALL_DIR/venv" || die "could not create the virtualenv"
+    fi
+    "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-input \
+        -r "$WORKDIR/agent/requirements-agent.txt" || die "could not install the agent's Python packages"
+    rm -rf "$INSTALL_DIR/nexus_agent.new"
+    cp -R "$WORKDIR/agent/nexus_agent" "$INSTALL_DIR/nexus_agent.new"
+    # Whole-directory swap: a leftover __pycache__ could shadow the new sources.
+    rm -rf "$INSTALL_DIR/nexus_agent"
+    mv "$INSTALL_DIR/nexus_agent.new" "$INSTALL_DIR/nexus_agent"
+}
+
+ensure_user() {
+    local group
+    if ! id "$AGENT_USER" >/dev/null 2>&1; then
+        useradd --system --user-group --no-create-home --home-dir "$STATE_DIR" \
+            --shell "$(command -v nologin || echo /bin/false)" "$AGENT_USER" || die "could not create $AGENT_USER"
+        CREATED_USER=1
+    fi
+    for group in adm systemd-journal; do
+        if getent group "$group" >/dev/null; then
+            usermod -aG "$group" "$AGENT_USER" || die "could not add $AGENT_USER to $group"
+        fi
+    done
+}
+
+# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+ENV_FILE_PY='
+import json, os, re, sys
+
+url, max_mode, insecure = sys.argv[1:4]
+try:
+    answer = json.load(sys.stdin)
+    node_id, api_key = answer["node_id"], answer["api_key"]
+except (ValueError, KeyError, TypeError):
+    sys.exit("nexus-agent: central sent an invalid enrollment answer")
+for value in (node_id, api_key):
+    # Both end up in an EnvironmentFile; a newline could add settings central must not control.
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
+        sys.exit("nexus-agent: central sent an invalid enrollment answer")
+print("NEXUS_URL=" + url)
+print("NEXUS_API_KEY=" + api_key)
+print("NEXUS_NODE_ID=" + node_id)
+if max_mode:
+    print("NEXUS_MAX_MODE=" + max_mode)
+if insecure:
+    print("NEXUS_INSECURE=1")
+'
+
+enroll_and_write_env() {
+    local answer
+    # The token goes by environment and the answer stays in a variable: argv is world-readable in ps.
+    answer="$(cd "$INSTALL_DIR" && NEXUS_ENROLL_TOKEN="$TOKEN" NEXUS_INSECURE="$INSECURE" \
+        "$INSTALL_DIR/venv/bin/python" -m nexus_agent enroll --url "$URL")" ||
+        die "enrollment failed; check the token (it works once and expires) and the URL"
+    TOKEN=""
+    (
+        umask 077
+        printf '%s' "$answer" | python3 -I -c "$ENV_FILE_PY" "$URL" "$MAX_MODE" "$INSECURE" >"$ENV_FILE.tmp"
+    ) || die "could not write $ENV_FILE"
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
+    # The key is on disk now, so a later failure must keep it: the token cannot be used twice.
+    ROLLBACK=0
+}
+
+update_max_mode() {
+    [ -n "$MAX_MODE" ] || return 0
+    (
+        umask 077
+        grep -v '^NEXUS_MAX_MODE=' "$ENV_FILE" >"$ENV_FILE.tmp" || true
+        printf 'NEXUS_MAX_MODE=%s\n' "$MAX_MODE" >>"$ENV_FILE.tmp"
+    ) || die "could not update $ENV_FILE"
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
+}
+
+write_unit() {
+    cat >"$UNIT_FILE" <<'UNIT'
+[Unit]
+Description=Nexus defense agent
+Documentation=https://github.com/eminaydin19/Nexus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexus-agent
+WorkingDirectory=/opt/nexus-agent
+EnvironmentFile=/etc/nexus-agent.env
+ExecStart=/opt/nexus-agent/venv/bin/python -m nexus_agent run
+StateDirectory=nexus-agent
+Restart=always
+RestartSec=5
+AmbientCapabilities=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 644 "$UNIT_FILE"
+}
+
+current_mode() {
+    python3 -I - "$STATE_DIR/state.json" "$(env_value NEXUS_MAX_MODE)" <<'PY'
+import json, sys
+
+MODES = ("off", "observe", "enforce")
+try:
+    mode = json.load(open(sys.argv[1])).get("mode")
+except (OSError, ValueError, AttributeError):
+    mode = None
+mode = mode if mode in MODES else "observe"
+limit = sys.argv[2] if sys.argv[2] in MODES else "enforce"
+print(min(mode, limit, key=MODES.index))
+PY
+}
+
+# Restart=always makes a crashing service look active for a moment, so it has to stay up for a few checks.
+wait_for_service() {
+    local i stable=0
+    for ((i = 0; i < 15; i++)); do
+        if systemctl is-active --quiet "$SERVICE"; then
+            stable=$((stable + 1))
+            [ "$stable" -lt 3 ] || return 0
+        else
+            stable=0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+start_service() {
+    systemctl daemon-reload
+    systemctl enable --quiet "$SERVICE"
+    systemctl restart "$SERVICE" || true
+    if ! wait_for_service; then
+        warn "the service did not stay active. Last journal lines:"
+        journalctl -u "$SERVICE" -n 30 --no-pager >&2 || true
+        die "fix the cause and run the installer again, or remove the agent with --uninstall"
+    fi
+}
+
+report() {
+    local mode
+    mode="$(current_mode)"
+    say ""
+    say "Nexus agent is active and reporting to $URL"
+    say "Mode: $mode"
+    case "$mode" in
+        observe) say "It is in observe mode: no traffic will be blocked until you enable enforce in the panel." ;;
+        off) say "Detection is off: no traffic will be blocked." ;;
+        enforce) say "This server was already in enforce mode, so it keeps blocking as before." ;;
+    esac
+    say "Check it with: systemctl status $SERVICE"
+    say "Logs:          journalctl -u $SERVICE"
+    say "Remove it with: curl -fsSL $URL/install-agent.sh | sudo bash -s -- --uninstall"
+}
+
+remove_user() {
+    id "$AGENT_USER" >/dev/null 2>&1 || return 0
+    userdel "$AGENT_USER" 2>/dev/null || warn "could not remove user $AGENT_USER"
+}
+
+rollback() {
+    warn "rolling back this installation"
+    rm -rf "$INSTALL_DIR"
+    rm -f "$ENV_FILE.tmp"
+    [ "$CREATED_USER" = 0 ] || remove_user
+}
+
+on_exit() {
+    local status=$?
+    trap - EXIT
+    [ -z "$WORKDIR" ] || rm -rf "$WORKDIR"
+    if [ "$status" -ne 0 ] && [ "$ROLLBACK" = 1 ]; then
+        rollback
+    fi
+    exit "$status"
+}
+
+uninstall() {
+    local status=0
+    # Stop first: a running agent in enforce mode would create the table again.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "$SERVICE" 2>/dev/null || true
+    fi
+    if [ -x "$INSTALL_DIR/venv/bin/python" ] && [ -d "$INSTALL_DIR/nexus_agent" ]; then
+        (cd "$INSTALL_DIR" && "$INSTALL_DIR/venv/bin/python" -m nexus_agent uninstall) ||
+            warn "the agent could not remove its firewall table; trying nft directly"
+    fi
+    if command -v nft >/dev/null 2>&1 && nft list table inet nexus >/dev/null 2>&1; then
+        nft delete table inet nexus || { warn "could not delete nftables table inet nexus" && status=1; }
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --quiet "$SERVICE" 2>/dev/null || true
+    fi
+    rm -f "$UNIT_FILE"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl reset-failed "$SERVICE" 2>/dev/null || true
+    fi
+    rm -rf "$INSTALL_DIR" "$STATE_DIR"
+    rm -f "$ENV_FILE" "$ENV_FILE.tmp"
+    remove_user
+    say "Nexus agent removed. Revoke this server in the panel if it should not come back."
+    return "$status"
+}
+
+main() {
+    set -euo pipefail
+    umask 022
+    PATH="$PATH:/usr/sbin:/sbin"
+    parse_args "$@"
+    require_root
+    if [ -n "$UNINSTALL" ]; then
+        uninstall
+        return
+    fi
+    require_systemd
+    require_python
+    resolve_target
+    if [ -n "$INSECURE" ]; then
+        warn "warning: with --insecure the token and the agent key can travel without TLS"
+    fi
+    ensure_packages
+
+    trap on_exit EXIT
+    trap 'exit 130' INT TERM
+    WORKDIR="$(mktemp -d)"
+    download_agent
+
+    if [ -n "$ENROLLED" ]; then
+        say "Already enrolled: keeping the key and upgrading the agent code"
+        install_code
+        update_max_mode
+    else
+        ROLLBACK=1
+        ensure_user
+        install_code
+        enroll_and_write_env
+    fi
+    ensure_user
+    write_unit
+    start_service
+    report
+}
+
+{ main "$@"; }

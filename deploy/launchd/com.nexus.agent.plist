@@ -7,18 +7,24 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/local/nexus-agent/venv/bin/python</string>
-    <string>/usr/local/nexus-agent/agent.py</string>
-    <string>--interval</string>
-    <string>5</string>
+    <string>-m</string>
+    <string>nexus_agent</string>
+    <string>run</string>
   </array>
+  <key>WorkingDirectory</key>
+  <string>/usr/local/nexus-agent</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>NEXUS_URL</key>
-    <string>https://nexus.example.com/api/ingest</string>
+    <string>https://nexus.example.com</string>
     <key>NEXUS_API_KEY</key>
     <string>CHANGE_ME</string>
     <key>NEXUS_NODE_ID</key>
     <string>mac-1</string>
+    <key>NEXUS_MAX_MODE</key>
+    <string>observe</string>
+    <key>NEXUS_STATE_DIR</key>
+    <string>/usr/local/nexus-agent/state</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

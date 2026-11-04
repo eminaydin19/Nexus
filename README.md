@@ -25,22 +25,23 @@ Nexus is an advanced security and telemetry analysis system designed for cloud e
 - **High Performance:** CPU-bound inference pipeline optimized for edge nodes and small AWS EC2 instances to prevent memory bottlenecks.
 - **Continuous Learning:** The system automatically retrains its neural networks every 24 hours in the background without downtime.
 
-## 1-Click AWS Installation
+## Installation
 
-Nexus comes with a fully automated setup script tailored for AWS EC2 (Ubuntu/Debian).
+Nexus runs on any Linux server with Docker and Docker Compose 2.24 or newer. AWS is not needed.
 
-1. Connect to your AWS EC2 instance via SSH.
-2. Clone this repository:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/Nexus.git
-   cd Nexus
-   ```
-3. Run the installer:
-   ```bash
-   ./install.sh
-   ```
+```bash
+git clone https://github.com/eminaydin19/Nexus.git && cd Nexus && ./install.sh --domain nexus.example.com
+```
 
-The script will automatically install Docker, prompt you for your AWS IAM keys (to fetch CloudWatch data), generate a secure `.env` configuration, and spin up the entire system.
+With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.sh`), Nexus listens on `127.0.0.1:8000` only, and you reach it over an SSH tunnel; only an agent on the same machine can connect then.
+
+The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. Running it again upgrades Nexus and keeps your secrets and data. At the end it prints where to log in and how to add your first server:
+
+```bash
+curl -fsSL https://nexus.example.com/install-agent.sh | sudo bash -s -- --token <one-time-token>
+```
+
+The agent needs systemd and Python 3.9 or newer. It starts in observe mode: no traffic is blocked until you enable enforce in the panel. Remove it with `--uninstall`. CloudWatch ingestion remains optional, see `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`.
 
 ## Configuration (.env)
 
@@ -48,7 +49,7 @@ Nexus is highly customizable. The `install.sh` script generates your `.env` file
 
 | Variable | Default | Description |
 |---|---|---|
-| `INGESTION_SOURCE` | `cloudwatch` | Source of data. Set to `cloudwatch` for AWS production. |
+| `INGESTION_SOURCE` | `webhook` | Source of data. Agents use `webhook`. `cloudwatch` is optional and needs AWS. |
 | `WEIGHT_ISOLATION_FOREST` | 0.25 | Relative weight of the Isolation Forest model. |
 | `WEIGHT_LSTM_AE` | 0.45 | Relative weight of the LSTM Autoencoder. |
 | `WEIGHT_TRANSFORMER` | 0.30 | Relative weight of the Transformer Attention model. |

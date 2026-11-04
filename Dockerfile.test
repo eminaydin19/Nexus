@@ -4,6 +4,9 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 PIP_DISABLE_
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends shellcheck openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt requirements-dev.txt ./
 RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install -r requirements-dev.txt psutil requests
