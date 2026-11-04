@@ -79,3 +79,17 @@ def test_forwarded_host_only_trusted_behind_proxy():
     h = {"Origin": "https://nexus.example", "X-Forwarded-Host": "nexus.example"}
     assert _origin_client(True).post("/x", headers=h).status_code == 200
     assert _origin_client(False).post("/x", headers=h).status_code == 403
+
+
+def test_ingest_requires_basic_auth_when_no_api_key():
+    from fastapi import FastAPI
+
+    from backend.main import basic_exempt_paths
+    from backend.security import BasicAuthMiddleware
+
+    cfg = Settings(dashboard_user="admin", dashboard_password="x", ingest_api_key="")
+    assert "/api/ingest" not in basic_exempt_paths(cfg)
+    app = FastAPI()
+    app.add_middleware(BasicAuthMiddleware, username="admin", password="x", exempt_paths=basic_exempt_paths(cfg))
+    app.post("/api/ingest")(lambda: {})
+    assert TestClient(app).post("/api/ingest").status_code == 401

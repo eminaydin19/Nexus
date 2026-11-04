@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from backend import metrics as prom
 from backend.alerting import SlackNotifier
-from backend.config import settings
+from backend.config import Settings, settings
 from backend.db import DefenseEvent, SessionLocal, init_db
 from backend.defense import ActiveDefender, SafeModeMiddleware
 from backend.ingestion import build_source
@@ -190,12 +190,17 @@ app.add_middleware(SafeModeMiddleware, defender=defender_instance)
 if settings.ingest_api_key:
     app.add_middleware(ApiKeyMiddleware, api_key=settings.ingest_api_key)
 
-# Agent endpoints authenticate with their own keys instead of dashboard credentials.
+def basic_exempt_paths(cfg: Settings) -> tuple[str, ...]:
+    # Ingest is only exempt while the API key middleware guards it; without a key it needs Basic auth.
+    ingest = ("/api/ingest",) if cfg.ingest_api_key else ()
+    return ("/healthz", *ingest, "/api/agents/enroll", "/install-agent.sh")
+
+
 app.add_middleware(
     BasicAuthMiddleware,
     username=settings.dashboard_user,
     password=settings.dashboard_password,
-    exempt_paths=("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh"),
+    exempt_paths=basic_exempt_paths(settings),
 )
 app.add_middleware(OriginCheckMiddleware, trust_proxy=settings.trust_proxy_headers)
 
