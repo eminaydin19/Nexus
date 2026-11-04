@@ -2,6 +2,7 @@ import base64
 import secrets
 import time
 from collections import deque
+from urllib.parse import urlsplit
 
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -132,3 +133,29 @@ class BasicAuthMiddleware:
             return
         response = Response("Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Nexus"'})
         await response(scope, receive, send)
+
+
+class OriginCheckMiddleware:
+    """CSRF guard: rejects state-changing requests whose Origin host differs from the request host.
+
+    Requests without Origin (agents, curl) pass; browsers always send it on cross-site writes.
+    """
+
+    UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+
+    def __init__(self, app: ASGIApp, trust_proxy: bool = False):
+        self.app = app
+        self.trust_proxy = trust_proxy
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["method"] in self.UNSAFE:
+            headers = dict(scope["headers"])
+            origin = headers.get(b"origin", b"").decode("latin-1")
+            host = headers.get(b"host", b"")
+            if self.trust_proxy:
+                host = headers.get(b"x-forwarded-host", host)
+            if origin and urlsplit(origin).netloc != host.decode("latin-1"):
+                counters.inc("nexus_auth_failures_total")
+                await JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)

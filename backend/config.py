@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     # Comma separated IPs/CIDRs that must never be blocked.
     defense_allowlist: str = "127.0.0.1,::1"
 
+    def require_dashboard_credentials(self) -> None:
+        if not (self.dashboard_user and self.dashboard_password):
+            raise RuntimeError("DASHBOARD_USER and DASHBOARD_PASSWORD must be set")
+
     @property
     def data_path(self) -> Path:
         return Path(self.data_dir)

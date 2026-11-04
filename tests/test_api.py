@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 
 pytest.importorskip("torch")
@@ -9,13 +11,14 @@ from backend import db
 
 GOOD = {"node_id": "web-1", "cpu_pct": 12.5, "memory_pct": 40.0, "net_kbps": 120.0, "latency_ms": 18.0}
 KEY = {"X-API-Key": "test-key"}
+BASIC = {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
 
 
 @pytest.fixture(scope="module")
 def client():
     from backend.main import app
 
-    with TestClient(app) as c:
+    with TestClient(app, headers=BASIC) as c:
         yield c
 
 

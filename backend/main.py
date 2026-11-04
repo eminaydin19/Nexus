@@ -31,6 +31,7 @@ from backend.schema import NodeSnapshot
 from backend.security import (
     ApiKeyMiddleware,
     BasicAuthMiddleware,
+    OriginCheckMiddleware,
     RateLimitMiddleware,
     client_ip,
 )
@@ -142,6 +143,7 @@ def build_ensemble(cfg) -> Ensemble:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    settings.require_dashboard_credentials()
     init_db()
     torch.set_num_threads(1)
 
@@ -188,15 +190,14 @@ app.add_middleware(SafeModeMiddleware, defender=defender_instance)
 if settings.ingest_api_key:
     app.add_middleware(ApiKeyMiddleware, api_key=settings.ingest_api_key)
 
-if settings.dashboard_user and settings.dashboard_password:
-    # Agents authenticate with the API key instead of dashboard credentials.
-    basic_exempt = ("/healthz", "/api/ingest") if settings.ingest_api_key else ("/healthz",)
-    app.add_middleware(
-        BasicAuthMiddleware,
-        username=settings.dashboard_user,
-        password=settings.dashboard_password,
-        exempt_paths=basic_exempt,
-    )
+# Agent endpoints authenticate with their own keys instead of dashboard credentials.
+app.add_middleware(
+    BasicAuthMiddleware,
+    username=settings.dashboard_user,
+    password=settings.dashboard_password,
+    exempt_paths=("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh"),
+)
+app.add_middleware(OriginCheckMiddleware, trust_proxy=settings.trust_proxy_headers)
 
 app.add_middleware(
     RateLimitMiddleware,
