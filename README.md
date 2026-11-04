@@ -35,13 +35,13 @@ git clone https://github.com/eminaydin19/Nexus.git && cd Nexus && ./install.sh -
 
 With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.sh`), Nexus listens on `127.0.0.1:8000` only, and you reach it over an SSH tunnel; only an agent on the same machine can connect then.
 
-The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. Running it again upgrades Nexus and keeps your secrets and data. At the end it prints where to log in and how to add your first server:
+The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. To upgrade, run `git pull` first and then the installer again: it rebuilds Nexus and keeps your secrets and data. At the end it prints where to log in and how to add your first server:
 
 ```bash
 curl -fsSL https://nexus.example.com/install-agent.sh | sudo bash -s -- --token <one-time-token>
 ```
 
-The agent needs systemd and Python 3.9 or newer. It starts in observe mode: no traffic is blocked until you enable enforce in the panel. Remove it with `--uninstall`. CloudWatch ingestion remains optional, see `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`.
+The agent needs systemd and Python 3.9 or newer. It starts in observe mode: no traffic is blocked until you enable enforce in the panel. Remove it with `--uninstall`. Python 3.9 can come from your distribution, for example `python3.9` on Ubuntu 20.04 or `python39` on the RHEL 8 family. CloudWatch ingestion remains optional, see `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`.
 
 ## Configuration (.env)
 

@@ -48,6 +48,16 @@ log = logging.getLogger("nexus")
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = ROOT_DIR / "frontend"
 AGENT_FILE_SUFFIXES = {".py", ".json", ".txt"}
+AGENT_EXCLUDED_DIRS = {"__pycache__", "tests"}
+
+
+def _ships_with_agent(path: Path) -> bool:
+    parts = path.relative_to(ROOT_DIR).parts
+    return (
+        path.is_file()
+        and path.suffix in AGENT_FILE_SUFFIXES
+        and not any(part in AGENT_EXCLUDED_DIRS or part.startswith(".") for part in parts)
+    )
 
 
 def recent_events(limit: int, node=None, rule=None, action=None, simulated=None) -> list[dict]:
@@ -296,9 +306,7 @@ def install_agent_script():
 
 @lru_cache(maxsize=1)
 def _agent_tarball() -> bytes:
-    package = sorted(
-        p for p in (ROOT_DIR / "nexus_agent").rglob("*") if p.is_file() and p.suffix in AGENT_FILE_SUFFIXES
-    )
+    package = sorted(p for p in (ROOT_DIR / "nexus_agent").rglob("*") if _ships_with_agent(p))
     buffer = io.BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as compressed, tarfile.open(
         fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT

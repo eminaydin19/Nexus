@@ -183,14 +183,18 @@ def load_ssh_ok(state_dir) -> list:
     return items if isinstance(items, list) else []
 
 
-def save_state(state_dir, mode: str, allowlist: List[str], ssh_ok: Optional[list] = None) -> bool:
+def save_state(state_dir, mode: str, allowlist: List[str], ssh_ok: Optional[list] = None,
+               last_send: Optional[float] = None) -> bool:
     tmp = None
     try:
         directory = Path(state_dir)
         directory.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".state-")
+        state = {"mode": mode, "allowlist": allowlist, "ssh_ok": ssh_ok or []}
+        if last_send is not None:
+            state["last_send"] = last_send
         with os.fdopen(fd, "w") as f:
-            json.dump({"mode": mode, "allowlist": allowlist, "ssh_ok": ssh_ok or []}, f)
+            json.dump(state, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, str(directory / STATE_FILE))

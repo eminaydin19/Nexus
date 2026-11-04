@@ -11,6 +11,11 @@ INSTALL_DIR=/opt/nexus-agent
 ENV_FILE=/etc/nexus-agent.env
 STATE_DIR=/var/lib/nexus-agent
 UNIT_FILE=/etc/systemd/system/nexus-agent.service
+OS_RELEASE=/etc/os-release
+# Marks a user as created here. Anything else named nexus-agent belongs to someone and must stay untouched.
+USER_MARKER="Nexus agent (managed)"
+PYTHON=python3
+REPORT_WAIT=15
 
 TOKEN=""
 URL=""
@@ -18,7 +23,11 @@ URL_FLAG=""
 MAX_MODE=""
 INSECURE=""
 UNINSTALL=""
+RE_ENROLL=""
 ENROLLED=""
+HAD_KEY=""
+REPORTING=0
+STARTED_AT=0
 WORKDIR=""
 ROLLBACK=0
 CREATED_USER=0
@@ -31,7 +40,7 @@ die() {
 }
 
 usage() {
-    say "Usage: install-agent.sh --token <token> [--url <central-url>] [--max-mode off|observe|enforce] [--insecure]"
+    say "Usage: install-agent.sh --token <token> [--url <central-url>] [--max-mode off|observe|enforce] [--insecure] [--re-enroll]"
     say "       install-agent.sh --uninstall"
     say "NEXUS_ENROLL_TOKEN is preferred over --token, which other local users can see in ps."
 }
@@ -51,6 +60,7 @@ parse_args() {
                 ;;
             --insecure) INSECURE=1 && shift ;;
             --uninstall) UNINSTALL=1 && shift ;;
+            --re-enroll) RE_ENROLL=1 && shift ;;
             -h | --help) usage && exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -71,10 +81,44 @@ require_systemd() {
     fi
 }
 
+python_fix() {
+    local release=""
+    # shellcheck disable=SC1090  # the path is the system's os-release
+    [ ! -r "$OS_RELEASE" ] || release="$(. "$OS_RELEASE" 2>/dev/null && printf '%s|%s|%s' "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}")"
+    case "$release" in
+        ubuntu\|*\|20.04) say "Install it with: apt install python3.9 python3.9-venv" ;;
+        rhel\|*\|8* | *rhel*\|8*) say "Install it with: dnf install python39" ;;
+        *) say "Install Python 3.9 or newer with your system's package manager" ;;
+    esac
+}
+
 require_python() {
-    command -v python3 >/dev/null 2>&1 || die "python3 3.9 or newer is required, and python3 was not found"
-    python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' ||
-        die "python3 3.9 or newer is required, found: $(python3 --version 2>&1)"
+    local candidate
+    for candidate in python3 python3.13 python3.12 python3.11 python3.10 python3.9; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+            "$candidate" -I -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+            PYTHON="$candidate"
+            return 0
+        fi
+    done
+    die "Python 3.9 or newer is required and was not found. $(python_fix), then run the installer again."
+}
+
+require_curl() {
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+}
+
+passwd_line() {
+    getent passwd "$AGENT_USER" 2>/dev/null || true
+}
+
+user_is_ours() {
+    [ "$(passwd_line | cut -d: -f5)" = "$USER_MARKER" ]
+}
+
+check_existing_user() {
+    [ -z "$(passwd_line)" ] || user_is_ours ||
+        die "a user named $AGENT_USER already exists and this installer did not create it. Nothing was changed. Rename that user, then run the installer again."
 }
 
 # shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
@@ -88,11 +132,11 @@ def refuse(why):
 raw, insecure = sys.argv[1], sys.argv[2] == "1"
 if not re.fullmatch(r"[A-Za-z0-9._~:/\[\]%-]+", raw):
     refuse("the central URL has invalid characters")
-parts = urlsplit(raw)
 try:
+    parts = urlsplit(raw)
     parts.port
 except ValueError:
-    refuse("the central URL has an invalid port")
+    refuse("the central URL has an invalid host or port")
 if parts.scheme not in ("http", "https") or not parts.hostname:
     refuse("the central URL must look like https://host")
 if parts.username or parts.password or parts.query or parts.fragment:
@@ -110,53 +154,74 @@ print("%s://%s%s" % (parts.scheme, parts.netloc, path))
 '
 
 normalize_url() {
-    python3 -I -c "$NORMALIZE_URL_PY" "$1" "${2:-}"
+    "$PYTHON" -I -c "$NORMALIZE_URL_PY" "$1" "${2:-}"
 }
 
 env_value() {
     [ ! -f "$ENV_FILE" ] || sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
 }
 
-# Sets URL, ENROLLED and INSECURE. An enrolled host keeps talking to the central that issued its key.
+# Sets URL, ENROLLED, HAD_KEY and INSECURE. An enrolled host keeps talking to the central that issued its key.
 resolve_target() {
     local raw
-    if [ -n "$(env_value NEXUS_API_KEY)" ]; then
-        ENROLLED=1
-        raw="$(env_value NEXUS_URL)"
-        [ -n "$raw" ] || die "$ENV_FILE has a key but no NEXUS_URL; run --uninstall and install again"
-        case "$(env_value NEXUS_INSECURE)" in 1 | true | yes) INSECURE=1 ;; esac
-        URL="$(normalize_url "$raw" "$INSECURE")" || exit 1
-        if [ -n "$URL_FLAG" ] && [ "$(normalize_url "$URL_FLAG" "$INSECURE")" != "$URL" ]; then
-            die "this server is enrolled with $URL; to move it, run --uninstall first"
-        fi
-        return 0
-    fi
     case "$EMBEDDED_URL" in __*) EMBEDDED_URL="" ;; esac
-    raw="${URL_FLAG:-$EMBEDDED_URL}"
+    if [ -n "$(env_value NEXUS_API_KEY)" ]; then
+        HAD_KEY=1
+        raw="$(env_value NEXUS_URL)"
+        case "$(env_value NEXUS_INSECURE)" in 1 | true | yes) INSECURE=1 ;; esac
+        if [ -z "$RE_ENROLL" ]; then
+            ENROLLED=1
+            [ -n "$raw" ] || die "$ENV_FILE has a key but no NEXUS_URL; run --uninstall and install again"
+            URL="$(normalize_url "$raw" "$INSECURE")" || exit 1
+            if [ -n "$URL_FLAG" ] && [ "$(normalize_url "$URL_FLAG" "$INSECURE")" != "$URL" ]; then
+                die "this server is enrolled with $URL; to move it, use --re-enroll with a new token, or --uninstall first"
+            fi
+            return 0
+        fi
+        raw="${URL_FLAG:-${EMBEDDED_URL:-$raw}}"
+    else
+        raw="${URL_FLAG:-$EMBEDDED_URL}"
+    fi
     [ -n "$raw" ] || die "central did not embed its address; pass --url https://<central>"
     URL="$(normalize_url "$raw" "$INSECURE")" || exit 1
     [ -n "$TOKEN" ] || die "an enrollment token is required: set NEXUS_ENROLL_TOKEN or pass --token"
 }
 
+venv_package() {
+    case "$1:$PYTHON" in
+        dnf:python3) echo python3-libs ;;
+        dnf:python3.9) echo python39-libs ;;
+        dnf:*) echo "$PYTHON-libs" ;;
+        *) echo "$PYTHON-venv" ;;
+    esac
+}
+
 # Stops before any change on systems without apt or dnf.
 ensure_packages() {
-    local missing=()
-    python3 -c 'import ensurepip, venv' >/dev/null 2>&1 || missing+=(python3-venv)
+    local manager="" missing=()
+    if command -v apt-get >/dev/null 2>&1; then
+        manager=apt
+    elif command -v dnf >/dev/null 2>&1; then
+        manager=dnf
+    fi
+    "$PYTHON" -I -c 'import ensurepip, venv' >/dev/null 2>&1 || missing+=("$(venv_package "$manager")")
     command -v nft >/dev/null 2>&1 || missing+=(nftables)
     [ "${#missing[@]}" -gt 0 ] || return 0
-    if command -v apt-get >/dev/null 2>&1; then
-        say "Installing ${missing[*]} with apt-get"
-        apt-get update -qq </dev/null || die "apt-get update failed"
-        # confold keeps a firewall config the operator already has on disk.
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${missing[@]}" </dev/null ||
-            die "could not install ${missing[*]}"
-    elif command -v dnf >/dev/null 2>&1; then
-        say "Installing ${missing[*]} with dnf"
-        dnf install -y -q "${missing[@]}" </dev/null || die "could not install ${missing[*]}"
-    else
-        die "please install these packages and run the installer again: ${missing[*]}"
-    fi
+    case "$manager" in
+        apt)
+            say "Installing ${missing[*]} with apt-get"
+            apt-get update -qq </dev/null || die "apt-get update failed"
+            # confold keeps a firewall config the operator already has on disk.
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+                -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${missing[@]}" </dev/null ||
+                die "could not install ${missing[*]}"
+            ;;
+        dnf)
+            say "Installing ${missing[*]} with dnf"
+            dnf install -y -q "${missing[@]}" </dev/null || die "could not install ${missing[*]}"
+            ;;
+        *) die "please install these packages and run the installer again: ${missing[*]}" ;;
+    esac
 }
 
 # shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
@@ -200,12 +265,11 @@ except (tarfile.TarError, OSError, EOFError) as exc:
 '
 
 verify_and_extract() {
-    python3 -I -c "$EXTRACT_PY" "$1" "$2" "$3"
+    "$PYTHON" -I -c "$EXTRACT_PY" "$1" "$2" "$3"
 }
 
 download_agent() {
     local proto=https sha
-    command -v curl >/dev/null 2>&1 || die "curl is required"
     case "$URL" in http://*) proto=http ;; esac
     # No -L: the agent itself never follows redirects, so a redirect here would be a misconfigured URL.
     curl -fsS --proto "=$proto" --connect-timeout 10 --max-time 300 \
@@ -222,7 +286,7 @@ install_code() {
     chmod 755 "$INSTALL_DIR"
     # A distribution upgrade can leave a venv whose interpreter is gone.
     if ! "$INSTALL_DIR/venv/bin/python" -c '' >/dev/null 2>&1; then
-        python3 -m venv --clear "$INSTALL_DIR/venv" || die "could not create the virtualenv"
+        "$PYTHON" -m venv --clear "$INSTALL_DIR/venv" || die "could not create the virtualenv"
     fi
     "$INSTALL_DIR/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-input \
         -r "$WORKDIR/agent/requirements-agent.txt" || die "could not install the agent's Python packages"
@@ -235,8 +299,8 @@ install_code() {
 
 ensure_user() {
     local group
-    if ! id "$AGENT_USER" >/dev/null 2>&1; then
-        useradd --system --user-group --no-create-home --home-dir "$STATE_DIR" \
+    if [ -z "$(passwd_line)" ]; then
+        useradd --system --user-group --no-create-home --home-dir "$STATE_DIR" --comment "$USER_MARKER" \
             --shell "$(command -v nologin || echo /bin/false)" "$AGENT_USER" || die "could not create $AGENT_USER"
         CREATED_USER=1
     fi
@@ -277,10 +341,17 @@ enroll_and_write_env() {
         "$INSTALL_DIR/venv/bin/python" -m nexus_agent enroll --url "$URL")" ||
         die "enrollment failed; check the token (it works once and expires) and the URL"
     TOKEN=""
+    local keep='^(NEXUS_URL|NEXUS_API_KEY|NEXUS_NODE_ID|NEXUS_INSECURE)='
+    [ -z "$MAX_MODE" ] || keep='^(NEXUS_URL|NEXUS_API_KEY|NEXUS_NODE_ID|NEXUS_INSECURE|NEXUS_MAX_MODE)='
     (
         umask 077
-        printf '%s' "$answer" | python3 -I -c "$ENV_FILE_PY" "$URL" "$MAX_MODE" "$INSECURE" >"$ENV_FILE.tmp"
-    ) || die "could not write $ENV_FILE"
+        printf '%s' "$answer" | "$PYTHON" -I -c "$ENV_FILE_PY" "$URL" "$MAX_MODE" "$INSECURE" >"$ENV_FILE.tmp"
+    ) || {
+        rm -f "$ENV_FILE.tmp"
+        die "could not write $ENV_FILE"
+    }
+    # A re-enroll keeps the operator's other settings.
+    [ ! -f "$ENV_FILE" ] || grep -Ev "$keep" "$ENV_FILE" >>"$ENV_FILE.tmp" || true
     mv "$ENV_FILE.tmp" "$ENV_FILE"
     # The key is on disk now, so a later failure must keep it: the token cannot be used twice.
     ROLLBACK=0
@@ -328,7 +399,7 @@ UNIT
 }
 
 current_mode() {
-    python3 -I - "$STATE_DIR/state.json" "$(env_value NEXUS_MAX_MODE)" <<'PY'
+    "$PYTHON" -I - "$STATE_DIR/state.json" "$(env_value NEXUS_MAX_MODE)" <<'PY'
 import json, sys
 
 MODES = ("off", "observe", "enforce")
@@ -357,6 +428,31 @@ wait_for_service() {
     return 1
 }
 
+# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+LAST_SEND_PY='
+import json, sys
+
+try:
+    last_send = json.load(open(sys.argv[1])).get("last_send")
+except (OSError, ValueError, AttributeError):
+    sys.exit(1)
+fresh = isinstance(last_send, (int, float)) and not isinstance(last_send, bool) and last_send >= float(sys.argv[2])
+sys.exit(0 if fresh else 1)
+'
+
+# "Active" only means the process runs. A send since this start is what proves central hears it.
+wait_for_report() {
+    local i
+    REPORTING=0
+    for ((i = 0; i < REPORT_WAIT; i++)); do
+        if "$PYTHON" -I -c "$LAST_SEND_PY" "$STATE_DIR/state.json" "$STARTED_AT"; then
+            REPORTING=1
+            return 0
+        fi
+        sleep 1
+    done
+}
+
 start_service() {
     systemctl daemon-reload
     systemctl enable --quiet "$SERVICE"
@@ -372,7 +468,11 @@ report() {
     local mode
     mode="$(current_mode)"
     say ""
-    say "Nexus agent is active and reporting to $URL"
+    if [ "$REPORTING" = 1 ]; then
+        say "Nexus agent is active and reporting to $URL"
+    else
+        say "Service active, not yet reporting to $URL. Watch it with: journalctl -u $SERVICE"
+    fi
     say "Mode: $mode"
     case "$mode" in
         observe) say "It is in observe mode: no traffic will be blocked until you enable enforce in the panel." ;;
@@ -385,8 +485,12 @@ report() {
 }
 
 remove_user() {
-    id "$AGENT_USER" >/dev/null 2>&1 || return 0
-    userdel "$AGENT_USER" 2>/dev/null || warn "could not remove user $AGENT_USER"
+    [ -n "$(passwd_line)" ] || return 0
+    if user_is_ours; then
+        userdel "$AGENT_USER" 2>/dev/null || warn "could not remove user $AGENT_USER"
+    else
+        say "Leaving user $AGENT_USER in place: this installer did not create it."
+    fi
 }
 
 rollback() {
@@ -437,6 +541,8 @@ uninstall() {
 main() {
     set -euo pipefail
     umask 022
+    # Python puts the current directory on sys.path, and this runs as root: a planted venv.py would run.
+    cd /
     PATH="$PATH:/usr/sbin:/sbin"
     parse_args "$@"
     require_root
@@ -446,7 +552,9 @@ main() {
     fi
     require_systemd
     require_python
+    check_existing_user
     resolve_target
+    require_curl
     if [ -n "$INSECURE" ]; then
         warn "warning: with --insecure the token and the agent key can travel without TLS"
     fi
@@ -459,17 +567,22 @@ main() {
 
     if [ -n "$ENROLLED" ]; then
         say "Already enrolled: keeping the key and upgrading the agent code"
+        [ -z "$TOKEN" ] || say "The enrollment token was ignored. To replace the key, run again with --re-enroll."
+        chmod 600 "$ENV_FILE"
         install_code
         update_max_mode
     else
-        ROLLBACK=1
+        # A failed re-enroll must leave the working install and its key alone.
+        [ -n "$HAD_KEY" ] || ROLLBACK=1
         ensure_user
         install_code
         enroll_and_write_env
     fi
     ensure_user
     write_unit
+    STARTED_AT="$(date +%s)"
     start_service
+    wait_for_report
     report
 }
 

@@ -1,5 +1,5 @@
 # nexus is reachable only through Caddy (profile "https") or docker-compose.local.yml. install.sh picks one in .env.
-name: nexus
+name: nexus-defense
 
 services:
   nexus:

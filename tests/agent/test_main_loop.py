@@ -1068,6 +1068,34 @@ def test_recent_ssh_past_24h_is_pruned_on_load(tmp_path):
     assert Rig(tmp_path).protector.reason(IP) is None
 
 
+def test_first_successful_send_is_written_to_state(rig):
+    rig.agent.send_once()
+    rig.agent.tick()
+    data = json.loads((rig.cfg.state_dir / "state.json").read_text())
+    assert data["last_send"] == rig.clock()
+    assert data["mode"] == "observe"
+
+
+def test_failed_send_is_not_written_to_state(rig):
+    rig.client.down = True
+    rig.agent.send_once()
+    rig.agent.tick()
+    assert not (rig.cfg.state_dir / "state.json").exists()
+
+
+def test_last_send_is_refreshed_but_not_on_every_send(rig, monkeypatch):
+    writes = []
+    monkeypatch.setattr(agent_main, "save_state", lambda *a: writes.append(a) or True)
+    for _ in range(5):
+        rig.agent.send_once()
+        rig.agent.tick()
+    assert len(writes) == 1
+    rig.clock.t += 61
+    rig.agent.send_once()
+    rig.agent.tick()
+    assert len(writes) == 2 and writes[-1][-1] == rig.clock()
+
+
 def test_no_state_write_when_nothing_changed(rig):
     rig.clock.t += 120
     rig.agent.tick()

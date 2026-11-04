@@ -55,6 +55,7 @@ NETWORK_REFRESH = 300
 NETWORK_RETRY = 60
 SSH_STATE_INTERVAL = 60
 SSH_SILENCE_WARN = 3600
+LAST_SEND_SAVE_INTERVAL = 60
 
 
 class Agent:
@@ -72,6 +73,8 @@ class Agent:
         self._await_sample = False
         self._ssh_silence_warned = False
         self._saved_ssh = []  # type: list
+        self._last_send = None  # type: Optional[float]
+        self._last_send_saved = None  # type: Optional[float]
         self._next_ssh_save = 0.0
         self._send_thread = None  # type: Optional[threading.Thread]
         self._state_mode = "observe"
@@ -135,10 +138,16 @@ class Agent:
 
     def _persist(self) -> None:
         self._saved_ssh = self.protector.export_ssh_ok()
-        save_state(self.cfg.state_dir, self._state_mode, self._allow, self._saved_ssh)
+        self._last_send_saved = self._last_send
+        save_state(self.cfg.state_dir, self._state_mode, self._allow, self._saved_ssh, self._last_send)
 
     def _save_ssh_if_changed(self) -> None:
         if self.protector.export_ssh_ok() != self._saved_ssh:
+            self._persist()
+
+    def _save_last_send_if_due(self) -> None:
+        sent, saved = self._last_send, self._last_send_saved
+        if sent is not None and (saved is None or sent - saved >= LAST_SEND_SAVE_INTERVAL):
             self._persist()
 
     # -- commands -----------------------------------------------------------
@@ -216,6 +225,8 @@ class Agent:
         while self._commands:
             self.handle_command(self._commands.popleft())
         self._process_lines()
+        # Here, not in the send thread, so a late send cannot overwrite a newer mode with its older copy.
+        self._save_last_send_if_due()
         now = self.mono()
         if now >= self._next_ssh_save:
             self._next_ssh_save = now + SSH_STATE_INTERVAL
@@ -368,6 +379,7 @@ class Agent:
             return self._backoff()
         self._latency_ms = min((time.perf_counter() - started) * 1000.0, MAX_LATENCY_MS)
         self._failures = 0
+        self._last_send = self.clock()
         with self._lock:
             del self._acks[:len(acks)]
             backlog = bool(self._events)

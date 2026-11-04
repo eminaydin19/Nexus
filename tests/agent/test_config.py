@@ -171,3 +171,11 @@ def test_ssh_ok_state_roundtrip_and_tolerance(tmp_path):
     assert load_state(tmp_path) == ("observe", [])
     (tmp_path / "state.json").write_text("{broken")
     assert load_ssh_ok(tmp_path) == []
+
+
+def test_state_keeps_last_send_only_when_given(tmp_path):
+    save_state(tmp_path, "observe", [], [], 12.5)
+    assert json.loads((tmp_path / "state.json").read_text())["last_send"] == 12.5
+    assert load_state(tmp_path) == ("observe", [])
+    save_state(tmp_path, "observe", [])
+    assert "last_send" not in json.loads((tmp_path / "state.json").read_text())

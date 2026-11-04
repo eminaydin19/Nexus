@@ -47,6 +47,22 @@ expect "no address is refused" absent installer --token x
 nothing_left "after refusals"
 expect "packages untouched by a refusal" absent command -v nft
 
+echo "--- a same-named user that is not ours"
+useradd -c "Somebody Else" nexus-agent
+output="$(installer --url "$CENTRAL" --insecure --token never-used 2>&1)"
+status=$?
+echo "$output" | tail -2
+expect "foreign user refuses the install" test "$status" -ne 0
+expect "nothing installed for a foreign user" absent command -v nft
+expect "no install dir for a foreign user" test ! -e /opt/nexus-agent
+groups_before="$(id nexus-agent)"
+output="$(installer --uninstall 2>&1)"
+echo "$output" | tail -2
+says() { grep -qF "$1" <<<"$output"; }
+expect "uninstall says it leaves the user" says "Leaving user nexus-agent in place"
+expect "the foreign user is untouched" test "$(id nexus-agent)" = "$groups_before"
+userdel nexus-agent
+
 echo "--- bad token rolls back"
 output="$(installer --url "$CENTRAL" --insecure --token BAD-TOKEN-VALUE 2>&1)"
 status=$?
@@ -58,15 +74,26 @@ nothing_left "after a failed enroll"
 
 echo "--- fresh install with NEXUS_ENROLL_TOKEN"
 TOKEN="$(new_token)"
-output="$(NEXUS_ENROLL_TOKEN="$TOKEN" installer --url "$CENTRAL" --insecure 2>&1)"
+mkdir /root/hostile
+for planted in venv pip ensurepip secrets; do
+    echo "open('/root/hostile/RAN', 'a').write('$planted')" >"/root/hostile/$planted.py"
+done
+output="$(cd /root/hostile && NEXUS_ENROLL_TOKEN="$TOKEN" bash /root/install-agent.sh --url "$CENTRAL" --insecure 2>&1)"
 status=$?
 echo "$output" | tail -12
 expect "install succeeds" test "$status" -eq 0
+expect "planted modules in the working directory did not run" test ! -e /root/hostile/RAN
+expect "the venv uses Python 3.9 or newer" /opt/nexus-agent/venv/bin/python -c 'import sys; sys.exit(sys.version_info < (3, 9))'
+/opt/nexus-agent/venv/bin/python --version
+marked() { [ "$(getent passwd nexus-agent | cut -d: -f5)" = "Nexus agent (managed)" ]; }
+expect "the user carries the marker" marked
 KEY="$(sed -n 's/^NEXUS_API_KEY=//p' /etc/nexus-agent.env)"
 expect "a key was stored" test -n "$KEY"
 no_secret() { ! grep -qF -e "$KEY" -e "$TOKEN" <<<"$output"; }
 expect "key and token not printed" no_secret
-says() { grep -qF "$1" <<<"$output"; }
+expect "says reporting after a real send" says "is active and reporting to"
+last_send_written() { python3 -c 'import json; assert json.load(open("/var/lib/nexus-agent/state.json"))["last_send"] > 0'; }
+expect "state.json has last_send" last_send_written
 expect "says observe" says "Mode: observe"
 expect "says nothing is blocked" says "no traffic will be blocked until you enable enforce in the panel"
 expect "says how to check" says "systemctl status nexus-agent"
@@ -179,16 +206,42 @@ echo "--- re-run keeps the key and does not enroll again"
 BEFORE="$(sha256sum /etc/nexus-agent.env)"
 COUNT="$(node_count)"
 touch /opt/nexus-agent/nexus_agent/planted_stale_file
+chmod 644 /etc/nexus-agent.env
 output="$(installer --url "$CENTRAL" --token UNUSED-TOKEN 2>&1)"
 status=$?
 echo "$output" | tail -8
 expect "re-run succeeds" test "$status" -eq 0
 expect "env file unchanged" test "$(sha256sum /etc/nexus-agent.env)" = "$BEFORE"
+expect "env file back to 600" test "$(stat -c %a /etc/nexus-agent.env)" = 600
+expect "says the token was ignored" says "token was ignored"
 expect "no second enrollment" test "$(node_count)" = "$COUNT"
 expect "code was replaced" test ! -e /opt/nexus-agent/nexus_agent/planted_stale_file
 expect "reports the kept enforce mode truthfully" says "Mode: enforce"
 expect "service active after upgrade" systemctl is-active --quiet nexus-agent
 expect "a different central is refused" absent installer --url https://other.example.com
+
+echo "--- --re-enroll"
+OLD_KEY="$KEY"
+output="$(installer --re-enroll --token BAD-TOKEN-VALUE 2>&1)"
+status=$?
+expect "re-enroll with a bad token fails" test "$status" -ne 0
+expect "failed re-enroll keeps the key" test "$(sed -n 's/^NEXUS_API_KEY=//p' /etc/nexus-agent.env)" = "$OLD_KEY"
+expect "failed re-enroll keeps the install" test -x /opt/nexus-agent/venv/bin/python
+expect "failed re-enroll keeps the service" systemctl is-active --quiet nexus-agent
+COUNT="$(node_count)"
+RE_TOKEN="$(new_token)"
+output="$(NEXUS_ENROLL_TOKEN="$RE_TOKEN" installer --re-enroll 2>&1)"
+status=$?
+echo "$output" | tail -7
+expect "re-enroll succeeds" test "$status" -eq 0
+KEY="$(sed -n 's/^NEXUS_API_KEY=//p' /etc/nexus-agent.env)"
+expect "the key was replaced" test "$KEY" != "$OLD_KEY"
+expect "one key line only" test "$(grep -c '^NEXUS_API_KEY=' /etc/nexus-agent.env)" = 1
+expect "env file still 600" test "$(stat -c %a /etc/nexus-agent.env)" = 600
+expect "a new node was enrolled" test "$(node_count)" -gt "$COUNT"
+expect "the new key reports" says "is active and reporting to"
+no_new_secret() { ! grep -qF -e "$KEY" -e "$RE_TOKEN" <<<"$output"; }
+expect "new key and token not printed" no_new_secret
 expect "customer table untouched by re-run" nft list table inet customer
 
 echo "--- a service that cannot start is reported"
@@ -204,7 +257,7 @@ expect "key not in the journal output" no_key_shown
 cp -p /root/env.saved /etc/nexus-agent.env
 rm -f /root/env.saved
 
-leak_in_journal() { ! journalctl --no-pager | grep -qF -e "$KEY" -e "$TOKEN"; }
+leak_in_journal() { ! journalctl --no-pager | grep -qF -e "$KEY" -e "$OLD_KEY" -e "$TOKEN" -e "$RE_TOKEN"; }
 expect "key and token never reached the journal" leak_in_journal
 
 echo "--- uninstall while enforcing leaves nothing"

@@ -52,7 +52,8 @@ def test_local_override_binds_loopback_by_default():
 
 def test_compose_pins_images_and_project_name():
     cfg = compose()
-    assert cfg["name"] == "nexus"  # volumes must not change with the checkout directory's name
+    # Distinctive, or another stack named "nexus" (Sonatype, say) would take over these containers and volumes.
+    assert cfg["name"] == "nexus-defense"
     for service in cfg["services"].values():
         tag = service["image"].rpartition(":")[2]
         assert re.fullmatch(r"\d+\.\d+\.\d+(-[a-z]+)?", tag), service["image"]
@@ -122,9 +123,27 @@ def test_public_url_accepts_origin():
     assert Settings(public_url="").public_url == ""
 
 
-def test_agent_tarball_excludes_backend(client):
-    planted = ROOT / "nexus_agent" / "__pycache__"
-    planted.mkdir(exist_ok=True)
+@pytest.fixture
+def planted_agent_files():
+    from backend.main import _agent_tarball
+
+    package = ROOT / "nexus_agent"
+    planted = [package / "__pycache__" / "planted.py", package / "__pycache__" / "planted.cpython-312.pyc",
+               package / ".env", package / ".env.txt", package / "tests" / "test_planted.py"]
+    made_tests = not (package / "tests").exists()
+    for path in planted:
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("SECRET\n")
+    _agent_tarball.cache_clear()
+    yield
+    for path in planted:
+        path.unlink()
+    if made_tests:
+        (package / "tests").rmdir()
+    _agent_tarball.cache_clear()
+
+
+def test_agent_tarball_excludes_backend(client, planted_agent_files):
     r = client.get("/agent.tar.gz")
     assert r.status_code == 200
     assert hashlib.sha256(r.content).hexdigest() == r.headers["X-Nexus-Agent-SHA256"]
@@ -226,12 +245,123 @@ def test_rerun_without_flag_keeps_domain(central):
     assert dotenv(central)["COMPOSE_PROFILES"] == "https"
 
 
-def test_rerun_republishes_nothing_when_old_env_had_public_port(central):
-    (central / ".env").write_text("HTTP_BIND=80\nDASHBOARD_PASSWORD=old\n")
+def test_rerun_without_domain_keeps_what_is_in_env_and_warns_about_public_http(central):
+    (central / ".env").write_text(
+        "HTTP_BIND=0.0.0.0:80\nDASHBOARD_PASSWORD=old\nPUBLIC_URL=https://mine.example.com\nTRUST_PROXY_HEADERS=true\n"
+    )
     r = run_install(central)
     assert r.returncode == 0, r.stderr
-    assert dotenv(central)["HTTP_BIND"] == "127.0.0.1:8000"
-    assert dotenv(central)["DASHBOARD_PASSWORD"] == "old"
+    env = dotenv(central)
+    assert env["HTTP_BIND"] == "0.0.0.0:80"
+    assert env["PUBLIC_URL"] == "https://mine.example.com"
+    assert env["TRUST_PROXY_HEADERS"] == "true"
+    assert env["DASHBOARD_PASSWORD"] == "old"
+    assert "HTTP_BIND" in r.stderr and "http" in r.stderr.lower()
+
+
+def test_rerun_with_loopback_bind_does_not_warn(central):
+    run_install(central)
+    r = run_install(central)
+    assert r.returncode == 0, r.stderr
+    assert "HTTP_BIND" not in r.stderr
+
+
+def test_domain_flag_overwrites_those_settings(central):
+    (central / ".env").write_text("HTTP_BIND=0.0.0.0:80\nDASHBOARD_PASSWORD=old\nTRUST_PROXY_HEADERS=false\n")
+    r = run_install(central, "--domain", "nexus.example.com")
+    assert r.returncode == 0, r.stderr
+    env = dotenv(central)
+    assert "HTTP_BIND" not in env and env["TRUST_PROXY_HEADERS"] == "true"
+    assert env["PUBLIC_URL"] == "https://nexus.example.com"
+
+
+def test_no_domain_report_only_mentions_a_local_agent(central):
+    r = run_install(central)
+    assert "only" in r.stdout and "this machine" in r.stdout
+    assert "other servers" not in r.stdout.lower() and "server to protect" not in r.stdout
+
+
+def test_failed_up_says_where_the_password_is_without_printing_it(central):
+    stub(central / "bin", "docker", '[ "$2" = up ] && exit 1; exit 0')
+    r = run_install(central)
+    assert r.returncode != 0
+    assert f"{central}/.env" in r.stderr
+    password = dotenv(central)["DASHBOARD_PASSWORD"]
+    assert password not in r.stdout + r.stderr
+
+
+def test_ctrl_d_at_the_prompt_is_explained(central):
+    primary, secondary = pty.openpty()
+    os.write(primary, b"\x04")
+    try:
+        r = run_install(central, stdin=secondary)
+    finally:
+        os.close(primary)
+        os.close(secondary)
+    assert r.returncode != 0
+    assert "--domain" in r.stderr
+    assert not (central / ".env").exists()
+
+
+def docker_with(central, ps="", inspect_ok=True, volumes=""):
+    stub(central / "bin", "docker", f"""echo "$*" >> {central}/docker.log
+case "$1 $2" in
+  "ps -a") echo {ps!r} ;;
+  "volume inspect") exit {0 if inspect_ok else 1} ;;
+  "volume ls") echo {volumes!r} ;;
+esac
+exit 0""")
+
+
+def test_another_checkout_owning_the_project_is_refused(central, tmp_path_factory):
+    other = tmp_path_factory.mktemp("other-checkout")
+    docker_with(central, ps=str(other))
+    r = run_install(central)
+    assert r.returncode != 0 and str(other) in r.stderr
+    assert not (central / ".env").exists()
+    assert " up " not in (central / "docker.log").read_text()
+
+
+def test_own_checkout_owning_the_project_is_fine(central):
+    docker_with(central, ps=str(central.resolve()))
+    r = run_install(central)
+    assert r.returncode == 0, r.stderr
+
+
+def test_other_data_volume_stops_and_changes_nothing(central):
+    docker_with(central, inspect_ok=False, volumes="nexus_nexus-data")
+    r = run_install(central)
+    assert r.returncode != 0
+    assert "nexus_nexus-data" in r.stderr and "--adopt-empty-data" in r.stderr
+    assert not (central / ".env").exists()
+    assert " up " not in (central / "docker.log").read_text()
+
+
+def test_adopt_empty_data_proceeds(central):
+    docker_with(central, inspect_ok=False, volumes="nexus_nexus-data")
+    r = run_install(central, "--adopt-empty-data")
+    assert r.returncode == 0, r.stderr
+    assert "up -d" in (central / "docker.log").read_text()
+
+
+def test_no_volumes_at_all_is_a_plain_first_install(central):
+    docker_with(central, inspect_ok=False, volumes="")
+    assert run_install(central).returncode == 0
+
+
+def test_install_from_a_hostile_cwd_runs_nothing_from_it(central, tmp_path_factory):
+    hostile = tmp_path_factory.mktemp("hostile")
+    marker = hostile / "RAN"
+    for name in ("secrets", "venv", "pip", "os"):
+        (hostile / f"{name}.py").write_text(f"open({str(marker)!r}, 'w')\n")
+    stub(central / "bin", "openssl", "exit 1")  # force the Python path
+    env = {"PATH": f"{central}/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(central)}
+    r = subprocess.run(["/bin/bash", str(central / "install.sh")], cwd=hostile, env=env, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert not marker.exists()
+    assert len(dotenv(central)["DASHBOARD_PASSWORD"]) >= 32
+    assert not (hostile / ".env").exists()
 
 
 def test_non_tty_does_not_prompt(central):
@@ -273,7 +403,7 @@ def test_missing_docker_is_a_clear_error(central):
         ["/bin/bash", str(central / "install.sh")],
         env={"PATH": f"{central}/bin/real"}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
     )
-    assert r.returncode != 0 and "docker" in r.stderr.lower()
+    assert r.returncode != 0 and "Docker is required" in r.stderr
 
 
 def test_missing_compose_is_a_clear_error(central):
@@ -288,6 +418,14 @@ def test_outside_checkout_is_a_clear_error(central):
     assert r.returncode != 0 and "git clone" in r.stderr
 
 
+def test_readme_says_upgrade_needs_git_pull():
+    assert "git pull" in read("README.md")
+
+
+def test_ci_updates_apt_before_installing_shellcheck():
+    assert re.search(r"apt-get update[^\n]*\n\s*sudo apt-get install -y shellcheck", read(".github/workflows/ci.yml"))
+
+
 def test_install_never_prompts_for_aws():
     text = read("install.sh")
     assert "AWS_ACCESS_KEY" not in text and "AWS" not in text and "cloudwatch" not in text.lower()
@@ -297,7 +435,7 @@ def test_install_never_prompts_for_aws():
 # -- install-agent.sh -------------------------------------------------------
 
 
-def agent_shell(tmp_path, body, path=None, env=None):
+def agent_shell(tmp_path, body, path=None, env=None, timeout=30):
     """Source the installer without its last line, point its paths into tmp_path, then run body."""
     lib = tmp_path / "lib.sh"
     lib.write_text("".join(read("install-agent.sh").splitlines(True)[:-1]))
@@ -309,7 +447,8 @@ STATE_DIR={tmp_path}/state
 UNIT_FILE={tmp_path}/agent.service
 """
     run_env = {"PATH": path or "/usr/local/bin:/usr/bin:/bin", "HOME": str(tmp_path), **(env or {})}
-    return subprocess.run(["/bin/bash", "-c", prelude + body], env=run_env, capture_output=True, text=True, timeout=30)
+    return subprocess.run(["/bin/bash", "-c", prelude + body], env=run_env, capture_output=True, text=True,
+                          timeout=timeout)
 
 
 @pytest.mark.parametrize(
@@ -330,6 +469,7 @@ UNIT_FILE={tmp_path}/agent.service
         ("https://n.example.com\nNEXUS_MAX_MODE=enforce", "", None),
         ("https://n example.com", "", None),
         ("n.example.com", "", None),
+        ("http://[::1", "1", None),
     ],
 )
 def test_url_policy(tmp_path, url, insecure, expected):
@@ -414,10 +554,134 @@ def test_refuses_without_systemd(tmp_path):
 NO_HOST_CHECKS = "require_root() { :; }; require_systemd() { :; }; ensure_packages() { echo PACKAGES; }; "
 
 
-def test_old_python_is_a_clear_error(tmp_path):
+def os_release(tmp_path, text):
+    path = tmp_path / "os-release"
+    path.write_text(text)
+    return f"OS_RELEASE={path}; "
+
+
+@pytest.mark.parametrize(
+    "release,fix",
+    [
+        ('ID=ubuntu\nVERSION_ID="20.04"\n', "apt install python3.9 python3.9-venv"),
+        ('ID="almalinux"\nID_LIKE="rhel centos fedora"\nVERSION_ID="8.10"\n', "dnf install python39"),
+        ('ID="rocky"\nID_LIKE="rhel centos fedora"\nVERSION_ID="8.9"\n', "dnf install python39"),
+        ("ID=arch\n", "Python 3.9"),
+    ],
+)
+def test_no_usable_python_prints_the_exact_fix(tmp_path, release, fix):
     stub(tmp_path / "bin", "python3", "exit 1")
-    r = agent_shell(tmp_path, "require_root() { :; }; require_python", path=f"{tmp_path}/bin:/usr/bin:/bin")
-    assert r.returncode != 0 and "3.9" in r.stderr
+    r = agent_shell(tmp_path, os_release(tmp_path, release) + "require_python; echo CONTINUED", path=f"{tmp_path}/bin")
+    assert r.returncode != 0 and "CONTINUED" not in r.stdout
+    assert fix in r.stderr
+
+
+def test_python_search_takes_the_first_new_enough(tmp_path):
+    bin_dir = tmp_path / "bin"
+    stub(bin_dir, "python3", "exit 1")
+    stub(bin_dir, "python3.13", "exit 1")
+    stub(bin_dir, "python3.11")
+    stub(bin_dir, "python3.9")
+    r = agent_shell(tmp_path, 'require_python; echo "$PYTHON"', path=str(bin_dir))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "python3.11"
+
+
+def test_python_search_prefers_plain_python3(tmp_path):
+    bin_dir = tmp_path / "bin"
+    stub(bin_dir, "python3")
+    stub(bin_dir, "python3.13")
+    r = agent_shell(tmp_path, 'require_python; echo "$PYTHON"', path=str(bin_dir))
+    assert r.stdout.strip() == "python3"
+
+
+@pytest.mark.parametrize(
+    "manager,python,package",
+    [
+        ("apt-get", "python3", "python3-venv"),
+        ("apt-get", "python3.9", "python3.9-venv"),
+        ("dnf", "python3", "python3-libs"),
+        ("dnf", "python3.9", "python39-libs"),
+        ("dnf", "python3.11", "python3.11-libs"),
+    ],
+)
+def test_venv_package_follows_family_and_interpreter(tmp_path, manager, python, package):
+    bin_dir = tmp_path / "bin"
+    log = tmp_path / "pkg.log"
+    stub(bin_dir, python, "exit 1")  # the venv module is missing
+    stub(bin_dir, "nft")
+    stub(bin_dir, manager, f'echo "$*" >> {log}')
+    r = agent_shell(tmp_path, f"PYTHON={python}; ensure_packages", path=str(bin_dir))
+    assert r.returncode == 0, r.stderr
+    assert package in log.read_text().split()
+
+
+def test_venv_check_uses_the_chosen_interpreter(tmp_path):
+    bin_dir = tmp_path / "bin"
+    log = tmp_path / "pkg.log"
+    stub(bin_dir, "python3", "exit 1")  # would say venv is missing
+    stub(bin_dir, "python3.9")
+    stub(bin_dir, "nft")
+    stub(bin_dir, "apt-get", f'echo "$*" >> {log}')
+    r = agent_shell(tmp_path, "PYTHON=python3.9; ensure_packages", path=str(bin_dir))
+    assert r.returncode == 0, r.stderr
+    assert not log.exists()
+
+
+def test_missing_curl_stops_before_packages(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    r = agent_shell(
+        tmp_path,
+        NO_HOST_CHECKS + f'PATH={bin_dir}:/usr/local/bin; command() {{ [ "$2" != curl ] && builtin command "$@"; }}; '
+        "main --token t --url https://n.example.com",
+        path=f"{bin_dir}:/usr/local/bin:/usr/bin:/bin",
+    )
+    assert r.returncode != 0 and "curl" in r.stderr
+    assert "PACKAGES" not in r.stdout
+
+
+MARKED = "nexus-agent:x:999:999:Nexus agent (managed):/var/lib/nexus-agent:/usr/sbin/nologin"
+FOREIGN = "nexus-agent:x:1001:1001:Somebody Else:/home/nexus-agent:/bin/bash"
+
+
+def getent_says(tmp_path, line):
+    stub(tmp_path / "bin", "getent", f'[ "$1" = passwd ] && echo "{line}"; exit 0')
+
+
+def test_foreign_user_refused_before_any_change(tmp_path):
+    getent_says(tmp_path, FOREIGN)
+    r = agent_shell(tmp_path, NO_HOST_CHECKS + "main --token t --url https://n.example.com",
+                    path=f"{tmp_path}/bin:/usr/local/bin:/usr/bin:/bin")
+    assert r.returncode != 0 and "nexus-agent" in r.stderr
+    assert "PACKAGES" not in r.stdout
+
+
+def test_own_user_passes_the_check(tmp_path):
+    getent_says(tmp_path, MARKED)
+    r = agent_shell(tmp_path, "check_existing_user; echo FINE", path=f"{tmp_path}/bin:/usr/local/bin:/usr/bin:/bin")
+    assert "FINE" in r.stdout
+
+
+def test_created_user_gets_the_marker(tmp_path):
+    log = tmp_path / "useradd.log"
+    stub(tmp_path / "bin", "useradd", f'printf "%s\\n" "$@" >> {log}')
+    stub(tmp_path / "bin", "getent", "exit 2")
+    r = agent_shell(tmp_path, "ensure_user", path=f"{tmp_path}/bin:/usr/local/bin:/usr/bin:/bin")
+    assert r.returncode == 0, r.stderr
+    assert "Nexus agent (managed)" in log.read_text().splitlines()
+
+
+def test_uninstall_leaves_a_foreign_user_and_says_so(tmp_path):
+    bin_dir = tmp_path / "bin"
+    log = tmp_path / "calls.log"
+    getent_says(tmp_path, FOREIGN)
+    stub(bin_dir, "systemctl")
+    stub(bin_dir, "userdel", f'echo "userdel $*" >> {log}')
+    r = agent_shell(tmp_path, "uninstall", path=f"{bin_dir}:/usr/bin:/bin")
+    assert r.returncode == 0, r.stderr
+    assert not log.exists()
+    assert "nexus-agent" in r.stdout + r.stderr and "not" in (r.stdout + r.stderr).lower()
 
 
 def test_http_refused_before_changing_anything(tmp_path):
@@ -521,7 +785,7 @@ def test_rollback_removes_fresh_install_on_failure(tmp_path):
     (tmp_path / "agent.env.tmp").write_text("x")
     bin_dir = tmp_path / "bin"
     stub(bin_dir, "userdel", f'echo "$*" >> {tmp_path}/userdel.log')
-    stub(bin_dir, "id")
+    getent_says(tmp_path, MARKED)
     r = agent_shell(
         tmp_path,
         "trap on_exit EXIT; ROLLBACK=1; CREATED_USER=1; parse_args --token t; URL=https://n.example.com; enroll_and_write_env",
@@ -545,7 +809,7 @@ def test_uninstall_works_when_partly_installed(tmp_path):
     log = tmp_path / "calls.log"
     for tool in ("systemctl", "userdel"):
         stub(bin_dir, tool, f'echo "{tool} $*" >> {log}')
-    stub(bin_dir, "id")
+    getent_says(tmp_path, MARKED)
     # The venv is gone, so the table must still go through nft itself.
     stub(bin_dir, "nft", f'echo "nft $*" >> {log}; exit 0')
     (tmp_path / "state").mkdir()
@@ -593,6 +857,113 @@ def test_installer_states_observe_default():
 
 def test_enroll_command_has_no_token_argument():
     assert not re.search(r"nexus_agent enroll[^\n]*--token", read("install-agent.sh"))
+
+
+def full_flow_lib(tmp_path):
+    """Everything real except what needs root, systemd or central. The fake package answers enroll."""
+    return f"""
+require_root() {{ :; }}; require_systemd() {{ :; }}; require_curl() {{ :; }}; ensure_user() {{ :; }}; ensure_packages() {{ :; }}
+check_existing_user() {{ :; }}; start_service() {{ :; }}; wait_for_report() {{ :; }}; report() {{ echo REPORTED; }}
+download_agent() {{
+    mkdir -p "$WORKDIR/agent/nexus_agent"
+    : > "$WORKDIR/agent/requirements-agent.txt"
+    printf 'print(%s)\\n' "'{{\\"node_id\\": \\"web-1\\", \\"api_key\\": \\"$NEW_KEY\\"}}'" > "$WORKDIR/agent/nexus_agent/__main__.py"
+}}
+"""
+
+
+@pytest.fixture
+def hostile_cwd(tmp_path_factory):
+    hostile = tmp_path_factory.mktemp("hostile")
+    for name in ("venv", "pip", "ensurepip", "secrets", "tarfile"):
+        (hostile / f"{name}.py").write_text(f"open({str(hostile / 'RAN')!r}, 'a').write('{name}')\n")
+    return hostile
+
+
+def test_install_agent_from_a_hostile_cwd_runs_nothing_from_it(tmp_path, hostile_cwd):
+    r = agent_shell(tmp_path, full_flow_lib(tmp_path) + f"cd {hostile_cwd}; main --token t --url https://n.example.com",
+                    env={"NEW_KEY": "fresh"}, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REPORTED" in r.stdout
+    assert not (hostile_cwd / "RAN").exists(), (hostile_cwd / "RAN").read_text()
+    assert (tmp_path / "opt/venv/bin/python").exists()
+    assert "NEXUS_API_KEY=fresh" in (tmp_path / "agent.env").read_text()
+
+
+def test_token_is_ignored_with_a_notice_when_enrolled(tmp_path):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text("NEXUS_URL=https://n.example.com\nNEXUS_API_KEY=kept\n")
+    env_file.chmod(0o644)
+    r = agent_shell(tmp_path, full_flow_lib(tmp_path) + "main --token SOMETOKEN", env={"NEW_KEY": "fresh"}, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "NEXUS_API_KEY=kept" in env_file.read_text()
+    assert "token" in r.stdout.lower() and "ignored" in r.stdout.lower()
+    assert "SOMETOKEN" not in r.stdout + r.stderr
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+
+def test_no_token_no_notice_when_enrolled(tmp_path):
+    (tmp_path / "agent.env").write_text("NEXUS_URL=https://n.example.com\nNEXUS_API_KEY=kept\n")
+    r = agent_shell(tmp_path, full_flow_lib(tmp_path) + "main", env={"NEW_KEY": "fresh"}, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ignored" not in r.stdout.lower()
+
+
+def test_re_enroll_replaces_the_key_and_keeps_other_settings(tmp_path):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text(
+        "NEXUS_URL=https://old.example.com\nNEXUS_API_KEY=old\nNEXUS_NODE_ID=old-node\n"
+        "NEXUS_ALLOWLIST=10.0.0.1\nNEXUS_MAX_MODE=observe\n"
+    )
+    r = agent_shell(tmp_path, full_flow_lib(tmp_path) + "main --re-enroll --token t --url https://new.example.com",
+                    env={"NEW_KEY": "fresh"}, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    lines = env_file.read_text().splitlines()
+    assert "NEXUS_API_KEY=fresh" in lines and "NEXUS_API_KEY=old" not in lines
+    assert "NEXUS_URL=https://new.example.com" in lines and "NEXUS_URL=https://old.example.com" not in lines
+    assert "NEXUS_NODE_ID=web-1" in lines and "NEXUS_NODE_ID=old-node" not in lines
+    assert "NEXUS_ALLOWLIST=10.0.0.1" in lines
+    assert lines.count("NEXUS_MAX_MODE=observe") == 1
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+
+def test_re_enroll_needs_a_token(tmp_path):
+    (tmp_path / "agent.env").write_text("NEXUS_URL=https://n.example.com\nNEXUS_API_KEY=old\n")
+    r = agent_shell(tmp_path, "parse_args --re-enroll; resolve_target")
+    assert r.returncode != 0 and "token" in r.stderr.lower()
+
+
+def test_failed_re_enroll_keeps_the_old_key_and_install(tmp_path):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text("NEXUS_URL=https://n.example.com\nNEXUS_API_KEY=old\n")
+    r = agent_shell(
+        tmp_path,
+        full_flow_lib(tmp_path) + "main --re-enroll --token t",
+        env={"NEW_KEY": "bad key with spaces"}, timeout=120,
+    )
+    assert r.returncode != 0
+    assert env_file.read_text() == "NEXUS_URL=https://n.example.com\nNEXUS_API_KEY=old\n"
+    assert (tmp_path / "opt/venv/bin/python").exists()
+    assert not (tmp_path / "agent.env.tmp").exists()
+
+
+def report_shell(tmp_path, state):
+    (tmp_path / "state").mkdir()
+    if state is not None:
+        (tmp_path / "state" / "state.json").write_text(json.dumps(state))
+    return agent_shell(tmp_path, 'URL=https://n.example.com; REPORT_WAIT=1; STARTED_AT=1000; PYTHON=python3; wait_for_report; report')
+
+
+def test_report_says_reporting_only_after_a_send_since_start(tmp_path):
+    r = report_shell(tmp_path, {"mode": "observe", "last_send": 1001})
+    assert "reporting to https://n.example.com" in r.stdout and "not yet" not in r.stdout
+
+
+@pytest.mark.parametrize("state", [None, {"mode": "observe"}, {"mode": "observe", "last_send": 999}, {"last_send": "x"}])
+def test_report_does_not_claim_reporting_without_proof(tmp_path, state):
+    r = report_shell(tmp_path, state)
+    assert "service active, not yet reporting" in r.stdout.lower()
+    assert "journalctl -u nexus-agent" in r.stdout
 
 
 # -- truncation -------------------------------------------------------------

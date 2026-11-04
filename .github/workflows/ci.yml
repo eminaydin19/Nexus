@@ -17,6 +17,7 @@ jobs:
           cache-dependency-path: requirements*.txt
       - name: Install dependencies
         run: |
+          sudo apt-get update
           sudo apt-get install -y shellcheck
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-dev.txt psutil requests
