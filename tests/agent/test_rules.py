@@ -91,6 +91,11 @@ def test_web_login_30_fails_blocks_web_ports_15m():
     ("/login/", "POST", 401, True),
     ("/Login", "POST", 401, False),
     ("/login", "GET", 401, False),
+    ("/login", "POST", 200, False),
+    ("/login", "POST", 302, False),
+    ("/wp-login.php", "POST", 200, True),
+    ("/wp-login.php", "POST", 401, True),
+    ("/wp-login.php", "POST", 302, False),
     ("/login", "POST", 500, False),
     ("/other", "POST", 401, False),
 ])
@@ -173,14 +178,64 @@ def test_patterns_linear_on_16kb():
     assert time.time() - t < 1.0
 
 
-def test_port_scan_20_ports_60s_all_ports_15m():
-    eng, _, _ = mk()
+def scan(eng, ip=IP, first=1000, n=20):
     got = []
-    for p in range(1000, 1019):
-        got += eng.feed_scan(IP, p)
-    assert got == []
+    for p in range(first, first + n):
+        got += eng.feed_scan(ip, p)
+    return got
+
+
+def test_spoof_style_scan_alone_only_alerts():
+    eng, _, _ = mk()
+    assert scan(eng, n=19) == []
     d = eng.feed_scan(IP, 1019)[0]
+    assert (d.rule, d.action, d.ports, d.ttl) == ("port_scan", "alert", (), 0)
+    assert scan(eng, n=20)[0].action == "alert"  # alerts again, no offense escalation, never a block
+    assert eng._offense == {}
+
+
+def test_scan_plus_ssh_fail_blocks_all_ports_15m():
+    eng, _, _ = mk()
+    eng.feed(ssh_fail())
+    d = scan(eng)[0]
     assert (d.rule, d.action, d.ports, d.ttl) == ("port_scan", "block_all", (), 900)
+
+
+@pytest.mark.parametrize("bad", [
+    lambda: web("/.env"), lambda: web("/a?<script"), lambda: web("/login", 401, "POST"),
+])
+def test_scan_plus_other_handshake_evidence_blocks(bad):
+    eng, _, _ = mk()
+    eng.feed(bad())
+    assert scan(eng)[0].action == "block_all"
+
+
+def test_scan_bad_activity_must_be_in_current_window():
+    eng, clock, _ = mk()
+    eng.feed(ssh_fail())
+    clock.t += 301
+    assert scan(eng)[0].action == "alert"
+
+
+def test_trusted_ip_scan_plus_bad_activity_only_alerts():
+    eng, _, prot = mk()
+    prot.note_login_ok(IP)
+    eng.feed(ssh_fail())
+    assert scan(eng)[0].action == "alert"
+
+
+def test_trusted_ip_scan_plus_probe_hit_only_alerts():
+    eng, _, prot = mk()
+    prot.note_login_ok(IP)
+    eng.feed(web("/.env"))  # the probe voids trust, but the hit was seen while trusted
+    assert prot.threshold_multiplier(IP) == 1
+    assert scan(eng)[0].action == "alert"
+
+
+def test_protected_ip_scan_emits_nothing():
+    eng, _, _ = mk(allowlist=["198.18.0.0/24"])
+    assert scan(eng, "198.18.0.9") == []
+    assert eng.suppressed["allowlist"] == 1
 
 
 def test_port_scan_window_60s_and_distinct():
@@ -193,20 +248,16 @@ def test_port_scan_window_60s_and_distinct():
     assert eng.feed_scan(IP, 1000) == []
 
 
-def test_port_scan_not_tripled_for_trusted():
+def test_port_scan_threshold_not_tripled_for_trusted():
     eng, _, prot = mk()
     prot.note_login_ok(IP)
-    assert prot.threshold_multiplier(IP) == 3
-    got = []
-    for p in range(1000, 1020):
-        got += eng.feed_scan(IP, p)
-    assert len(got) == 1
+    assert len(scan(eng)) == 1
 
 
 def test_conn_flood_rate_limits_not_blocks():
     eng, _, _ = mk()
-    assert eng.feed_connections({IP: 200}, 0) == []
-    d = eng.feed_connections({IP: 201}, 0)[0]
+    assert eng.feed_connections({IP: 199}, 0) == []
+    d = eng.feed_connections({IP: 200}, 0)[0]
     assert (d.rule, d.action, d.ttl, d.ip) == ("conn_flood", "rate_limit", 600, IP)
 
 
@@ -232,8 +283,8 @@ def test_conn_flood_protected_and_cdn_ips_accepted_silently():
 def test_conn_flood_trust_multiplier():
     eng, _, prot = mk()
     prot.note_login_ok(IP)
-    assert eng.feed_connections({IP: 600}, 0) == []
-    assert len(eng.feed_connections({IP: 601}, 0)) == 1
+    assert eng.feed_connections({IP: 599}, 0) == []
+    assert len(eng.feed_connections({IP: 600}, 0)) == 1
 
 
 def test_distributed_flood_alert_only():
@@ -261,11 +312,32 @@ def test_distributed_flood_needs_over_1000_total():
     assert eng.feed_connections({"198.51.100.1": 100}, 0) == []
 
 
-def test_trusted_ip_threshold_tripled():
+def test_trusted_ip_web_login_threshold_tripled():
     eng, _, prot = mk()
     prot.note_login_ok(IP)
-    assert all_decisions(eng, lambda i: ssh_fail(), 29) == []
-    assert len(eng.feed(ssh_fail())) == 1
+    assert all_decisions(eng, lambda i: web("/login", 401, "POST"), 89) == []
+    assert len(eng.feed(web("/login", 401, "POST"))) == 1
+
+
+def test_ssh_threshold_not_tripled_for_trusted_ip():
+    eng, _, prot = mk()
+    prot.note_login_ok(IP)
+    assert prot.threshold_multiplier(IP) == 3
+    assert len(all_decisions(eng, lambda i: ssh_fail(), 10)) == 1
+
+
+def test_single_request_with_three_patterns_does_not_block():
+    eng, _, _ = mk()
+    url = '/search?q=<script+src="../js/a.js"></script><script>$(function(){})</script>'
+    assert len(rules.exploit_hits(url)) >= 3
+    assert eng.feed(web(url, 200)) == []
+
+
+def test_same_patterns_across_two_requests_fire():
+    eng, _, _ = mk()
+    assert eng.feed(web("/a?<script+src=../x", 200)) == []
+    d = eng.feed(web("/a?$(id)", 200))
+    assert len(d) == 1 and d[0].rule == "web_exploit"
 
 
 def test_trusted_multiplier_applies_to_exploit():
@@ -281,12 +353,23 @@ def test_at_least_nine_exploit_patterns_for_trusted_ips():
     assert len(rules._EXPLOIT) >= 9
 
 
-def test_login_ok_post_feeds_protector():
+def test_wp_login_302_feeds_protector_but_other_paths_do_not():
     eng, _, prot = mk()
-    eng.feed(web("/login?next=/", 302, "POST"))
+    eng.feed(web("/login", 302, "POST"))
+    eng.feed(web("/admin", 200, "POST"))
+    eng.feed(web("/wp-login.php", 200, "POST"))
+    assert prot.threshold_multiplier(IP) == 1
+    eng.feed(web("/wp-login.php?redirect=/", 302, "POST"))
     assert prot.threshold_multiplier(IP) == 3
-    assert all_decisions(eng, lambda i: web("/login", 401, "POST"), 89) == []
+    assert all_decisions(eng, lambda i: web("/login", 401, "POST"), 88) == []
     assert len(eng.feed(web("/login", 401, "POST"))) == 1
+
+
+def test_failed_wp_logins_do_not_undo_probe_trust_reset():
+    eng, _, prot = mk()
+    eng.feed(web("/.env"))
+    eng.feed(web("/wp-login.php", 302, "POST"))
+    assert prot.threshold_multiplier(IP) == 1
 
 
 def test_protected_ip_produces_no_block_and_counts_once_per_crossing():
@@ -370,10 +453,7 @@ def test_behind_cdn_mode_web_alert_ssh_and_scan_normal():
     got = all_decisions(eng, lambda i: web(["/a?<script", "/a?f=/etc/passwd", "/a/../b"][i], 200), 3)
     assert [(d.rule, d.action, d.ports, d.ttl) for d in got] == [("web_exploit", "alert", (), 0)]
     assert all_decisions(eng, lambda i: ssh_fail(), 10)[0].action == "block_port"
-    got = []
-    for p in range(20):
-        got += eng.feed_scan("203.0.113.77", 3000 + p)
-    assert got[0].action == "block_all"
+    assert scan(eng, first=3000)[0].action == "block_all"  # the SSH failures above are the handshake evidence
     eng.set_behind_cdn(False)
 
 
@@ -453,3 +533,39 @@ def test_defaults_match_spec():
     assert (c.ssh_fail_threshold, c.web_login_threshold, c.probe_threshold, c.exploit_threshold, c.scan_ports) == (10, 30, 10, 3, 20)
     assert c.login_paths == ("/login", "/wp-login.php", "/admin", "/api/login")
     assert c.max_tracked_ips == 100000 and c.ssh_ports == (22,) and c.web_ports == (80, 443)
+
+
+def test_forget_clears_offense_history():
+    eng, clock, _ = mk()
+    all_decisions(eng, lambda i: ssh_fail(), 10)
+    eng.forget(IP)
+    assert all_decisions(eng, lambda i: ssh_fail(), 10)[0].ttl == 3600
+
+
+V6 = ["2001:db8:1:2::%x" % n for n in range(1, 12)]
+
+
+def test_ipv6_rules_key_on_slash_64():
+    eng, _, _ = mk()
+    got = []
+    for i in range(10):
+        got += eng.feed(ssh_fail(V6[i]))
+    assert len(got) == 1 and got[0].ip == V6[9]
+    assert eng.feed(ssh_fail(V6[10])) == []  # duplicate tracking is per /64 too
+    assert eng.feed(ssh_fail("2001:db8:1:3::1")) == []  # another /64 starts fresh
+
+
+def test_ipv6_offense_history_per_64_and_forget_from_any_address():
+    eng, clock, _ = mk()
+    for i in range(10):
+        eng.feed(ssh_fail(V6[i]))
+    clock.t += 3601
+    got = []
+    for i in range(10):
+        got += eng.feed(ssh_fail(V6[i]))
+    assert got[0].ttl == 7200
+    eng.forget(V6[5])
+    got = []
+    for i in range(10):
+        got += eng.feed(ssh_fail(V6[i]))
+    assert len(got) == 1 and got[0].ttl == 3600

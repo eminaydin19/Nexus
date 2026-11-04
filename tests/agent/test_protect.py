@@ -165,6 +165,16 @@ def test_login_ok_trusts_then_probe_clears(p, clock):
     assert p.threshold_multiplier("203.0.113.5") == 1
 
 
+def test_probe_window_wins_over_later_login_ok(p, clock):
+    ip = "203.0.113.6"
+    p.note_probe(ip)
+    p.note_login_ok(ip)
+    assert p.threshold_multiplier(ip) == 1
+    clock.t += 3601
+    p.note_login_ok(ip)
+    assert p.threshold_multiplier(ip) == 3
+
+
 def test_trust_table_bounded(p, monkeypatch):
     monkeypatch.setattr(protect, "MAX_TRUST_IPS", 50)
     for i in range(80):

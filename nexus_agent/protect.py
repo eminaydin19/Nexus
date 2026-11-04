@@ -221,6 +221,8 @@ class Protector:
         if e is None:
             return 1
         now = self._clock()
+        if e[3] > now:
+            return 1  # a probe hit voids trust for an hour, whatever else the IP does meanwhile
         if e[2] > now:
             return TRUST_MULTIPLIER
         if e[3] <= now and now - e[0] < TRUST_WINDOW and e[1] >= TRUST_REQUESTS:

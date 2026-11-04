@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import itertools
 import logging
 import os
@@ -26,6 +27,7 @@ FLOOD_RATIO = 5
 FLOOD_MIN_TOTAL = 1000
 FLOOD_ALPHA = 0.05
 MIN_WINDOW_EVENTS = 1000
+EXPLOIT_MIN_REQUESTS = 2
 EVIDENCE_LINES = 3
 EVIDENCE_CHARS = 500
 MAX_DECODES = 2
@@ -55,6 +57,16 @@ def _load_lines(name: str) -> List[str]:
 
 _PROBE_PATHS = frozenset(p.lower() for p in _load_lines("probe_paths.txt"))
 _EXPLOIT = tuple(re.compile(p, re.I) for p in _load_lines("exploit_patterns.txt"))
+
+
+def _ident(ip: str) -> str:
+    # An IPv6 block is applied at /64, so a source can rotate inside it; track the whole prefix as one source.
+    if ":" not in ip:
+        return ip
+    try:
+        return str(ipaddress.ip_network(ip + "/64", strict=False))
+    except ValueError:
+        return ip
 
 
 def _decode(s: str) -> str:
@@ -141,6 +153,7 @@ class RuleEngine:
         self._active = OrderedDict()  # type: OrderedDict  # (rule, ip) -> expiry of its last Decision
         self._offense = OrderedDict()  # type: OrderedDict  # (rule, ip) -> [count, last_ts]
         self._conn_suppressed = set()  # type: set
+        self._bad = OrderedDict()  # type: OrderedDict  # key -> [last bad ts, last bad ts while trusted]
         self._last_sweep = None  # type: Optional[float]
         self._avg = None  # type: Optional[float]
         self._last_flood = None  # type: Optional[float]
@@ -150,12 +163,13 @@ class RuleEngine:
         self._behind_cdn = bool(value)
 
     def forget(self, ip: str) -> None:
-        # Offense history is kept on purpose: a manually unblocked repeat offender still earns a longer next ttl.
         with self._lock:
-            for od in (self._win, self._active):
-                for key in [k for k in od if k[1] == ip]:
+            ident = _ident(ip)
+            for od in (self._win, self._active, self._offense):
+                for key in [k for k in od if k[1] == ident]:
                     del od[key]
-            self._conn_suppressed.discard(ip)
+            self._bad.pop(ident, None)
+            self._conn_suppressed.discard(ident)
 
     def feed(self, event: LogEvent) -> List[Decision]:
         with self._lock:
@@ -164,9 +178,9 @@ class RuleEngine:
                 self._p.note_ssh_ok(event.ip)
                 return []
             if event.kind == "ssh_fail":
-                mult = self._p.threshold_multiplier(event.ip)
-                return self._hit("ssh_bruteforce", event.ip, (next(self._seq),), event.raw,
-                                 self._cfg.ssh_fail_threshold * mult)
+                self._mark_bad(event.ip)
+                # No trust multiplier: web traffic is cheap to farm and says nothing about who owns SSH access.
+                return self._hit("ssh_bruteforce", event.ip, (next(self._seq),), event.raw, self._cfg.ssh_fail_threshold)
             if event.kind == "web":
                 return self._web(event)
             return []
@@ -183,12 +197,13 @@ class RuleEngine:
             out = []  # type: List[Decision]
             over_protected = set()
             for ip, n in per_ip.items():
-                if n <= self._cfg.max_conn_per_ip or n <= self._cfg.max_conn_per_ip * self._p.threshold_multiplier(ip):
+                if n < self._cfg.max_conn_per_ip or n < self._cfg.max_conn_per_ip * self._p.threshold_multiplier(ip):
                     continue
+                ident = _ident(ip)
                 why = self._p.reason(ip)
                 if why:
-                    over_protected.add(ip)
-                    if ip not in self._conn_suppressed:
+                    over_protected.add(ident)
+                    if ident not in self._conn_suppressed:
                         self.suppressed[why] += 1
                     continue
                 out += self._fire("conn_flood", ip, now, "%d concurrent connections" % n, None)
@@ -216,25 +231,46 @@ class RuleEngine:
         mult = p.threshold_multiplier(ev.ip)
         path, _, _query = ev.path.partition("?")
         out = []  # type: List[Decision]
-        if ev.method == "POST" and path.rstrip("/") in self._login:
-            if ev.status in (401, 403):
+        norm = path.rstrip("/")
+        trusted = mult > 1
+        if ev.method == "POST" and norm in self._login:
+            # Stock WordPress answers a failed login with 200 and a good one with 302; other stacks give no
+            # reliable success signal, so trust there comes only from the plain-request rule.
+            wp = norm == "/wp-login.php"
+            if ev.status in (401, 403) or (wp and ev.status == 200):
+                self._mark_bad(ev.ip, trusted)
                 out += self._hit("web_login_bruteforce", ev.ip, (next(self._seq),), ev.raw,
                                  self._cfg.web_login_threshold * mult, ev.user_agent)
-            elif 200 <= ev.status < 400:
+            elif wp and ev.status == 302:
                 p.note_login_ok(ev.ip)
         lowered = path.lower()
         if lowered in _PROBE_PATHS and 400 <= ev.status < 500:
+            self._mark_bad(ev.ip, trusted)
             p.note_probe(ev.ip)
             out += self._hit("web_probe", ev.ip, (lowered,), ev.raw, self._cfg.probe_threshold * mult, ev.user_agent)
         hits = exploit_hits(ev.path)
         if hits:
-            out += self._hit("web_exploit", ev.ip, hits, ev.raw, self._cfg.exploit_threshold * mult, ev.user_agent)
+            self._mark_bad(ev.ip, trusted)
+            # Several patterns in one URL can be a benign page (inline script with ../ and $( ), so require 2 requests.
+            out += self._hit("web_exploit", ev.ip, hits, ev.raw, self._cfg.exploit_threshold * mult, ev.user_agent,
+                             EXPLOIT_MIN_REQUESTS)
         return out
 
-    def _hit(self, rule: str, ip: str, keys: tuple, raw: str, threshold: int, ua: Optional[str] = None) -> List[Decision]:
+    def _mark_bad(self, ip: str, trusted: bool = False) -> None:
+        now = self._clock()
+        ident = _ident(ip)
+        rec = self._bad.get(ident) or [now, float("-inf")]
+        rec[0] = now
+        if trusted or self._p.threshold_multiplier(ip) > 1:
+            rec[1] = now
+        self._remember(self._bad, ident, rec)
+
+    def _hit(self, rule: str, ip: str, keys: tuple, raw: str, threshold: int, ua: Optional[str] = None,
+             min_events: int = 1) -> List[Decision]:
         now = self._clock()
         span = SCAN_WINDOW if rule == "port_scan" else WINDOW
-        wk = (rule, ip)
+        ident = _ident(ip)
+        wk = (rule, ident)
         dq = self._win.get(wk)
         if dq is None:
             dq = self._win[wk] = deque(maxlen=max(MIN_WINDOW_EVENTS, 4 * threshold))
@@ -245,14 +281,14 @@ class RuleEngine:
         while dq and dq[0][0] <= now - span:
             dq.popleft()
         dq.append((now, keys, raw))
-        if len(set().union(*(e[1] for e in dq))) < threshold:
+        if len(dq) < min_events or len(set().union(*(e[1] for e in dq))) < threshold:
             return []
         evidence = "\n".join(e[2] for e in list(dq)[-EVIDENCE_LINES:])[:EVIDENCE_CHARS]
         del self._win[wk]
         return self._fire(rule, ip, now, evidence, ua)
 
     def _fire(self, rule: str, ip: str, now: float, evidence: str, ua: Optional[str]) -> List[Decision]:
-        key = (rule, ip)
+        key = (rule, _ident(ip))
         if self._active.get(key, 0) > now:
             return []
         web = rule in _WEB_RULES
@@ -262,6 +298,14 @@ class RuleEngine:
         if why:
             self.suppressed[why] += 1
             return []
+        if rule == "port_scan":
+            # Closed-port SYN sources can be spoofed, so a scan alone never blocks: it needs handshake-proven bad
+            # activity from the same source, and never for an IP the Protector currently trusts.
+            bad = self._bad.get(key[1])
+            proven = bad is not None and now - bad[0] < WINDOW
+            trusted = self._p.threshold_multiplier(ip) > 1 or (bad is not None and now - bad[1] < WINDOW)
+            if not proven or trusted:
+                return [Decision(rule, ip, "alert", (), 0, evidence)]
         if web and self._p.verify_bot(ip, ua):
             self.suppressed["verified-bot"] += 1
             return []
@@ -291,6 +335,8 @@ class RuleEngine:
                 dq.popleft()
             if not dq:
                 del self._win[wk]
+        for key in [k for k, v in self._bad.items() if now - v[0] >= WINDOW]:
+            del self._bad[key]
         for key in [k for k, exp in self._active.items() if exp <= now]:
             del self._active[key]
         for key in [k for k, v in self._offense.items() if now - v[1] >= OFFENSE_MEMORY]:
