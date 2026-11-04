@@ -135,7 +135,7 @@ Login yolları ayarlanabilir, varsayılan `/login`, `/wp-login.php`, `/admin`, `
 
 ## Firewall
 
-- **Yalnızca nftables:** Ubuntu 20.04+, Debian 10+, RHEL/Alma/Rocky 8+ destekli. `nft` yoksa agent `observe` modunda kalır ve uyarı verir.
+- **Yalnızca nftables:** Ubuntu 20.04+, Debian 11+, RHEL/Alma/Rocky 8+ destekli (Python 3.9+ gerekir; Ubuntu 20.04 ve RHEL 8 ailesinde `python3.9` paketi ayrıca kurulur). `nft` yoksa agent `observe` modunda kalır ve uyarı verir.
 - **Kendi tablosu:** Tüm kurallar `inet nexus` tablosunda olur, kullanıcının kurallarına dokunulmaz. Kaldırmak için tablo silinir.
 - **Docker uyumu:** Kurallar `prerouting` hook'unda, DNAT'tan önce (priority `-150`, conntrack'ten sonra ve DNAT'ın `-100` önceliğinden önce) çalışır. `input` zinciri Docker'ın yayınladığı portları görmez.
 - **Set yapısı:** Porta göre engel, tüm portlarda kısa engel ve hız sınırı için `timeout` destekli ayrı setler (IPv4 ve IPv6).
@@ -179,7 +179,7 @@ Login yolları ayarlanabilir, varsayılan `/login`, `/wp-login.php`, `/admin`, `
 ## Kurulum
 
 **Merkez (`install.sh` yeniden yazılır):**
-- AWS soruları kalkar, Docker kurulumu kalır.
+- AWS soruları kalkar. Docker otomatik kurulmaz: Yoksa kurulum net bir hatayla durur, çünkü başkasının sunucusunda paket deposu eklemek yan etki yaratır.
 - Dashboard şifresi ve gizli anahtarlar üretilir, `.env` `chmod 600` olur.
 - Alan adı verilirse Caddy ile HTTPS açılır, `TRUST_PROXY_HEADERS=true` olur, uygulama yalnızca iç ağda dinler. Bugünkü compose'ta Caddy ve `nexus` 80. portta çakışır, bu düzeltilir.
 - Alan adı yoksa yalnızca `127.0.0.1` üzerinde dinler ve dashboard'a SSH tüneli ile girilir. Bu modda yalnızca aynı makinedeki agent bağlanır. Şifre internette düz HTTP'den gitmez.
