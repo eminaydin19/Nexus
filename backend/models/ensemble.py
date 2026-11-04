@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 MODEL_KEYS = ("iforest", "lstm", "vae", "transformer")
 FLAG_SCORE = 0.5
-BUNDLE_FORMAT = 1
+BUNDLE_FORMAT = 2
 
 
 def to_score(error: np.ndarray, lo: float, hi: float) -> np.ndarray:
@@ -104,7 +104,8 @@ class Ensemble:
             self._install(bundle)
 
     def _install(self, bundle: dict) -> None:
-        self._scaler = FeatureScaler.from_dict(bundle["scaler"])
+        self._scalers = {node: FeatureScaler.from_dict(d) for node, d in bundle["scalers"].items()}
+        self._default_scaler = FeatureScaler.from_dict(bundle["default_scaler"])
         self._iforest = IsolationForestModel(bundle["iforest"])
         self._lstm = LSTMAutoEncoder.from_state(bundle["lstm"])
         self._transformer = TransformerAutoEncoder.from_state(bundle["transformer"])
@@ -133,10 +134,13 @@ class Ensemble:
             weight_sum += self.weights[key]
         return total / weight_sum
 
+    def _scaler_for(self, node_id: str) -> FeatureScaler:
+        return self._scalers.get(node_id, self._default_scaler)
+
     def prime(self, node_id: str, raw_rows: np.ndarray) -> None:
         if not self.ready or len(raw_rows) == 0:
             return
-        scaled = self._scaler.transform(raw_rows[-self.window :])
+        scaled = self._scaler_for(node_id).transform(raw_rows[-self.window :])
         with self._lock:
             self._buffers[node_id] = deque(scaled, maxlen=self.window)
 
@@ -144,7 +148,7 @@ class Ensemble:
         if not self.ready:
             return None
         with self._lock:
-            scaled = self._scaler.transform(features.reshape(1, -1))[0]
+            scaled = self._scaler_for(node_id).transform(features.reshape(1, -1))[0]
             buffer = self._buffers.setdefault(node_id, deque(maxlen=self.window))
             buffer.append(scaled)
             last = scaled.reshape(1, -1)

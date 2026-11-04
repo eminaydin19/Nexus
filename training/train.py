@@ -22,6 +22,8 @@ from backend.schema import FEATURES, N_FEATURES
 
 log = logging.getLogger("train")
 
+MIN_NODE_ROWS = 50
+
 NodeData = dict[str, tuple[np.ndarray, np.ndarray]]
 
 
@@ -107,17 +109,25 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
             f"Not enough data: {total_rows} rows, need at least {min_rows}. Let the collector run longer."
         )
 
-    train_parts: list[np.ndarray] = []
-    val_parts: list[np.ndarray] = []
-    for ts, x in data.values():
+    train_parts: dict[str, list[np.ndarray]] = {}
+    val_parts: dict[str, list[np.ndarray]] = {}
+    for node, (ts, x) in data.items():
         cut = int(len(x) * 0.8)
-        train_parts.extend(segments(ts[:cut], x[:cut]))
-        val_parts.extend(segments(ts[cut:], x[cut:]))
+        train_parts[node] = segments(ts[:cut], x[:cut])
+        val_parts[node] = segments(ts[cut:], x[cut:])
 
-    train_rows = np.concatenate(train_parts)
-    scaler = FeatureScaler.fit(train_rows)
-    train_scaled_parts = [scaler.transform(p) for p in train_parts]
-    val_scaled_parts = [scaler.transform(p) for p in val_parts]
+    default_scaler = FeatureScaler.fit(np.concatenate([p for parts in train_parts.values() for p in parts]))
+    scalers = {
+        node: FeatureScaler.fit(np.concatenate(parts))
+        for node, parts in train_parts.items()
+        if sum(len(p) for p in parts) >= MIN_NODE_ROWS
+    }
+    train_scaled_parts = [
+        scalers.get(node, default_scaler).transform(p) for node, parts in train_parts.items() for p in parts
+    ]
+    val_scaled_parts = [
+        scalers.get(node, default_scaler).transform(p) for node, parts in val_parts.items() for p in parts
+    ]
 
     train_scaled = np.concatenate(train_scaled_parts)
     train_windows = cap(windows_from(train_scaled_parts, window), 40000, rng)
@@ -160,7 +170,8 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         "format": BUNDLE_FORMAT,
         "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window": window,
-        "scaler": scaler.to_dict(),
+        "scalers": {node: sc.to_dict() for node, sc in scalers.items()},
+        "default_scaler": default_scaler.to_dict(),
         "iforest": iforest.forest,
         "lstm": lstm.to_state(),
         "transformer": transformer.to_state(),
