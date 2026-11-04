@@ -102,31 +102,69 @@ class Anomaly(Base):
         }
 
 
-class DefenseEvent(Base):
-    __tablename__ = "defense_events"
+class SecurityEvent(Base):
+    __tablename__ = "security_events"
+    __table_args__ = (Index("ix_security_events_node_ts", "node_id", "ts"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128))
     ts: Mapped[float] = mapped_column(Float, index=True)
-    type: Mapped[str] = mapped_column(String(32))
-    mode: Mapped[str] = mapped_column(String(16))
-    node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rule: Mapped[str] = mapped_column(String(64), index=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    action: Mapped[str] = mapped_column(String(16))
+    ports: Mapped[list] = mapped_column(JSON, default=list)
+    ttl: Mapped[int] = mapped_column(Integer, default=0)
+    evidence: Mapped[str] = mapped_column(String(500), default="")
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
-    score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    detail: Mapped[str] = mapped_column(String(400), default="")
 
     def as_dict(self) -> dict:
         return {
             "id": self.id,
+            "node_id": self.node_id,
             "ts": self.ts,
-            "type": self.type,
-            "mode": self.mode,
-            "node": self.node_id,
+            "rule": self.rule,
             "ip": self.ip,
+            "action": self.action,
+            "ports": self.ports or [],
+            "ttl": self.ttl,
+            "evidence": self.evidence,
+            "simulated": self.simulated,
             "ok": self.ok,
-            "score": self.score,
-            "detail": self.detail,
         }
+
+
+class ActiveBlock(Base):
+    __tablename__ = "active_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    rule: Mapped[str] = mapped_column(String(64))
+    ports: Mapped[list] = mapped_column(JSON, default=list)
+    until: Mapped[float] = mapped_column(Float)
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    def as_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "ip": self.ip,
+            "rule": self.rule,
+            "ports": self.ports or [],
+            "until": self.until,
+            "simulated": self.simulated,
+        }
+
+
+class AgentCommand(Base):
+    __tablename__ = "agent_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    type: Mapped[str] = mapped_column(String(16))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float)
+    acked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Agent(Base):

@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, inspect, text
 
 from backend import db
 
-GOOD = {"node_id": "web-1", "cpu_pct": 12.5, "memory_pct": 40.0, "net_kbps": 120.0, "latency_ms": 18.0}
+GOOD = {"cpu_pct": 12.5, "memory_pct": 40.0, "net_kbps": 120.0, "latency_ms": 18.0}
 BASIC = {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
 
 
@@ -31,7 +31,7 @@ def test_healthz_is_open(client):
 def test_ingest_accepts_valid_payload_and_exposes_node(client):
     assert client.post("/api/ingest", json=GOOD, headers=client.key).status_code == 200
     nodes = client.get("/api/nodes").json()["nodes"]
-    assert any(n["node"] == "web-1" for n in nodes)
+    assert any(n["node"] == client.node_id for n in nodes)
 
 
 @pytest.mark.parametrize(
@@ -40,24 +40,10 @@ def test_ingest_accepts_valid_payload_and_exposes_node(client):
         {"cpu_pct": 140},
         {"memory_pct": -1},
         {"net_kbps": -5},
-        {"node_id": ""},
-        {"node_id": "bad node; drop table"},
-        {"node_id": "x" * 200},
     ],
 )
 def test_ingest_rejects_bad_payloads(client, patch):
     assert client.post("/api/ingest", json={**GOOD, **patch}, headers=client.key).status_code == 422
-
-
-def test_defense_endpoint_reports_mode_and_events(client):
-    body = client.get("/api/defense").json()
-    assert body["mode"] == "dry_run"
-    assert body["blocked"] == [] and isinstance(body["events"], list)
-
-
-def test_unblock_validates_input(client):
-    assert client.post("/api/defense/unblock/not-an-ip").status_code == 400
-    assert client.post("/api/defense/unblock/203.0.113.77").status_code == 404
 
 
 def test_prometheus_metrics(client):
@@ -66,7 +52,7 @@ def test_prometheus_metrics(client):
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")
     text_body = response.text
-    for name in ("nexus_nodes", "nexus_safe_mode", "nexus_ingest_total", 'nexus_node_cpu_pct{node="web-1"}'):
+    for name in ("nexus_nodes", "nexus_ingest_total", f'nexus_node_cpu_pct{{node="{client.node_id}"}}'):
         assert name in text_body
 
 

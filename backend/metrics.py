@@ -40,7 +40,7 @@ def _line(name: str, value: float, labels: dict[str, object] | tuple | None = No
     return f"{name}{{{label_text}}} {value}" if label_text else f"{name} {value}"
 
 
-def render(pipeline, defender) -> str:
+def render(pipeline) -> str:
     out: list[str] = []
 
     def family(name: str, kind: str, help_text: str, samples: list[tuple[dict, float]]) -> None:
@@ -74,17 +74,12 @@ def render(pipeline, defender) -> str:
         [({"node": n["node"]}, 1 if n["status"] == "anomaly" else 0) for n in nodes],
     )
 
-    status = defender.status() if defender else {}
-    family("nexus_safe_mode", "gauge", "1 while Safe Mode is active.", [({}, 1 if status.get("safe_mode") else 0)])
-    family("nexus_blocked_ips", "gauge", "IP addresses currently blocked.", [({}, len(status.get("blocked", [])))])
-
     snap = counters.snapshot()
     for name, help_text in (
         ("nexus_ingest_total", "Telemetry samples accepted via /api/ingest."),
         ("nexus_anomalies_total", "Anomalies recorded, by severity."),
         ("nexus_rate_limited_total", "Requests rejected by the rate limiter."),
         ("nexus_auth_failures_total", "Rejected ingest requests (bad or missing API key)."),
-        ("nexus_defense_actions_total", "Defense actions taken, by action and mode."),
     ):
         series = snap.get(name, {})
         family(name, "counter", help_text, [(dict(k), v) for k, v in series.items()] or [({}, 0)])

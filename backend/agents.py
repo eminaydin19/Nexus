@@ -1,7 +1,9 @@
 import hashlib
+import ipaddress
 import re
 import secrets
 import time
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -9,9 +11,12 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from backend.commands import enqueue
 from backend.db import Agent, EnrollToken, SessionLocal
 from backend.metrics import counters
 
+MODES = ("off", "observe", "enforce")
+MAX_ALLOWLIST = 1000
 NODE_ID_PATTERN = r"^[A-Za-z0-9._:@-]+$"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:@-]")
 _ENROLL_ATTEMPTS = 5
@@ -153,3 +158,52 @@ def revoke_agent(node_id: str, db: Session = Depends(_db)):
     if not revoke(db, node_id):
         raise HTTPException(404, "unknown agent")
     return {"status": "ok"}
+
+
+class ModeRequest(BaseModel):
+    mode: Literal["off", "observe", "enforce"]
+
+
+class UnblockRequest(BaseModel):
+    ip: str = Field(max_length=45)
+
+
+def _agent_or_404(db: Session, node_id: str) -> Agent:
+    agent = db.get(Agent, node_id)
+    if agent is None:
+        raise HTTPException(404, "unknown agent")
+    return agent
+
+
+@router.post("/{node_id}/unblock")
+def unblock(node_id: str, body: UnblockRequest, db: Session = Depends(_db)):
+    _agent_or_404(db, node_id)
+    try:
+        ip = str(ipaddress.ip_address(body.ip))
+    except ValueError:
+        raise HTTPException(400, "invalid IP address") from None
+    return {"status": "ok", "command_id": enqueue(db, node_id, "unblock", {"ip": ip})}
+
+
+@router.put("/{node_id}/allowlist")
+def set_allowlist(node_id: str, body: list[str], db: Session = Depends(_db)):
+    agent = _agent_or_404(db, node_id)
+    if len(body) > MAX_ALLOWLIST:
+        raise HTTPException(400, f"at most {MAX_ALLOWLIST} entries")
+    try:
+        entries = [str(ipaddress.ip_network(item, strict=False)) for item in body]
+    except ValueError:
+        raise HTTPException(400, "invalid IP or CIDR in allowlist") from None
+    agent.allowlist = entries
+    db.commit()
+    return {"status": "ok", "command_id": enqueue(db, node_id, "allowlist", {"ips": entries})}
+
+
+@router.put("/{node_id}/mode")
+def set_mode(node_id: str, body: ModeRequest, db: Session = Depends(_db)):
+    agent = _agent_or_404(db, node_id)
+    if MODES.index(body.mode) > MODES.index(agent.max_mode):
+        raise HTTPException(409, f"mode exceeds the agent's max_mode ({agent.max_mode})")
+    agent.mode = body.mode
+    db.commit()
+    return {"status": "ok", "command_id": enqueue(db, node_id, "mode", {"mode": body.mode})}

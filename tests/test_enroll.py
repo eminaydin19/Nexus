@@ -31,7 +31,7 @@ def enroll(client, hostname="host-a", token=None):
 
 
 def ingest(client, node_id, key):
-    return client.post("/api/ingest", json={"node_id": node_id, **METRICS}, headers={"X-API-Key": key})
+    return client.post("/api/ingest", json=METRICS, headers={"X-API-Key": key})
 
 
 def test_enroll_returns_node_and_working_key(client):
@@ -66,15 +66,9 @@ def test_enroll_failures_share_one_body(client):
 
 
 def test_ingest_requires_valid_key(client):
-    p = {"node_id": "x", **METRICS}
+    p = METRICS
     assert client.post("/api/ingest", json=p).status_code == 401
     assert client.post("/api/ingest", json=p, headers={"X-API-Key": "wrong"}).status_code == 401
-
-
-def test_key_cannot_write_other_node(client):
-    a = enroll(client, "host-a").json()
-    b = enroll(client, "host-b").json()
-    assert ingest(client, b["node_id"], a["api_key"]).status_code == 403
 
 
 def test_revoked_agent_rejected(client):
