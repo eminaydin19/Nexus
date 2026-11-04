@@ -43,17 +43,36 @@ def test_bundle_has_scaler_per_big_node_and_default(trained):
     assert "default_scaler" in bundle
 
 
+def _last_scaled(ens, node):
+    return np.asarray(ens._buffers[node][-1])
+
+
 def test_big_server_normal_load_is_not_anomalous_because_of_small_server(trained):
-    _, ens = trained
+    bundle, ens = trained
     row = np.array([60.0, 70.0, 10000.0, 50.0])
     for _ in range(ens.window + 1):
         pred = ens.predict("big", row)
     assert pred.ensemble < ens.threshold
+    assert ens._scaler_for("big") is not ens._default_scaler
+    assert np.all(np.abs(_last_scaled(ens, "big")) < 0.5)
+    default = FeatureScaler.from_dict(bundle["default_scaler"])
+    assert np.abs(default.transform(row)).max() > 1.0
 
 
 def test_unknown_node_uses_default_scaler(trained):
-    _, ens = trained
-    assert ens.predict("new", np.array([30.0, 50.0, 100.0, 10.0])) is not None
+    bundle, ens = trained
+    row = np.array([30.0, 50.0, 100.0, 10.0])
+    assert ens.predict("new", row) is not None
+    expected = FeatureScaler.from_dict(bundle["default_scaler"]).transform(row.reshape(1, -1))[0]
+    assert np.allclose(_last_scaled(ens, "new"), expected)
+
+
+def test_node_below_min_rows_uses_default_scaler(trained):
+    bundle, ens = trained
+    row = np.array([30.0, 50.0, 100.0, 10.0])
+    ens.predict("tiny", row)
+    expected = FeatureScaler.from_dict(bundle["default_scaler"]).transform(row.reshape(1, -1))[0]
+    assert np.allclose(_last_scaled(ens, "tiny"), expected)
 
 
 def test_flat_memory_feature_is_finite_and_not_instant_anomaly(trained):
@@ -63,6 +82,8 @@ def test_flat_memory_feature_is_finite_and_not_instant_anomaly(trained):
     row = np.array([20.0, 50.0, 10.0, 5.0])
     for _ in range(ens.window + 1):
         pred = ens.predict("flat", row)
+    scaled = _last_scaled(ens, "flat")
+    assert np.all(np.isfinite(scaled)) and abs(scaled[1]) < 1.0
     assert pred.ensemble < ens.threshold
 
 
