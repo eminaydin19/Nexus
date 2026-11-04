@@ -34,7 +34,7 @@ from backend.security import (
     RateLimitMiddleware,
     client_ip,
 )
-from training.train import load_db, train
+from training.train import NotEnoughDataError, load_db, train
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("nexus")
@@ -92,22 +92,47 @@ async def _housekeeping() -> None:
         except Exception:
             log.exception("defense housekeeping failed")
 
+RETRAIN_CHECK_SECONDS = 3600
+RETRAIN_INTERVAL_SECONDS = 86400
+
+
 async def _continuous_learning() -> None:
-    # Retrain every 24 hours automatically
+    # Hourly attempts while no model exists, otherwise one retrain per day.
+    last_trained = time.monotonic() if getattr(app.state, "pipeline", None) and app.state.pipeline.ensemble.ready else None
     while True:
-        await asyncio.sleep(86400)
+        await asyncio.sleep(RETRAIN_CHECK_SECONDS)
+        pipeline = getattr(app.state, "pipeline", None)
+        if pipeline is None:
+            continue
+        if pipeline.ensemble.ready and last_trained is not None and time.monotonic() - last_trained < RETRAIN_INTERVAL_SECONDS:
+            continue
         try:
             log.info("Starting autonomous continuous learning cycle...")
             data = await asyncio.to_thread(load_db)
-            if data:
-                bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_auto")
-                pipeline = getattr(app.state, "pipeline", None)
-                if pipeline:
-                    pipeline.ensemble.install_bundle(bundle)
-                    await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
-                    log.info("Autonomous learning cycle complete. Models updated.")
-        except Exception as e:
-            log.exception(f"Continuous learning failed: {e}")
+            if not data:
+                continue
+            bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_auto")
+            pipeline.ensemble.install_bundle(bundle)
+            last_trained = time.monotonic()
+            await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
+            log.info("Autonomous learning cycle complete. Models updated.")
+        except NotEnoughDataError as e:
+            log.info("Continuous learning skipped: %s", e)
+        except Exception:
+            log.exception("Continuous learning failed")
+
+
+def build_ensemble(cfg) -> Ensemble:
+    return Ensemble(
+        weights={
+            "iforest": cfg.weight_isolation_forest,
+            "lstm": cfg.weight_lstm_ae,
+            "vae": cfg.weight_vae,
+            "transformer": cfg.weight_transformer,
+        },
+        threshold_override=cfg.anomaly_threshold,
+        critical_score=cfg.critical_score,
+    )
 
 
 @asynccontextmanager
@@ -115,15 +140,7 @@ async def lifespan(app: FastAPI):
     init_db()
     torch.set_num_threads(1)
 
-    ensemble = Ensemble(
-        weights={
-            "iforest": settings.weight_isolation_forest,
-            "lstm": settings.weight_lstm_ae,
-            "vae": settings.weight_vae,
-        },
-        threshold_override=settings.anomaly_threshold,
-        critical_score=settings.critical_score,
-    )
+    ensemble = build_ensemble(settings)
     try:
         if not ensemble.load(settings.bundle_path):
             log.warning("no trained model at %s, running in learning mode", settings.bundle_path)
@@ -191,6 +208,7 @@ class Weights(BaseModel):
     iforest: float = Field(ge=0)
     lstm: float = Field(ge=0)
     vae: float = Field(ge=0)
+    transformer: float = Field(default=0.30, ge=0)
 
 
 class IngestPayload(BaseModel):

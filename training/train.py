@@ -25,6 +25,10 @@ log = logging.getLogger("train")
 NodeData = dict[str, tuple[np.ndarray, np.ndarray]]
 
 
+class NotEnoughDataError(Exception):
+    pass
+
+
 def load_db() -> NodeData:
     from backend.db import Metric, SessionLocal, init_db
 
@@ -99,7 +103,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
 
     total_rows = sum(len(x) for _, x in data.values())
     if total_rows < min_rows:
-        raise SystemExit(
+        raise NotEnoughDataError(
             f"Not enough data: {total_rows} rows, need at least {min_rows}. Let the collector run longer."
         )
 
@@ -118,7 +122,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     train_scaled = np.concatenate(train_scaled_parts)
     train_windows = cap(windows_from(train_scaled_parts, window), 40000, rng)
     if len(train_windows) < 200:
-        raise SystemExit(f"Not enough contiguous history: {len(train_windows)} windows of {window} steps, need 200.")
+        raise NotEnoughDataError(f"Not enough contiguous history: {len(train_windows)} windows of {window} steps, need 200.")
 
     log.info("training on %d rows, %d windows from %d nodes", len(train_scaled), len(train_windows), len(data))
 
@@ -232,7 +236,10 @@ def main() -> None:
     if not data:
         sys.exit("No data found.")
 
-    bundle = train(data, args.window, args.epochs, args.min_rows, args.seed, args.source)
+    try:
+        bundle = train(data, args.window, args.epochs, args.min_rows, args.seed, args.source)
+    except NotEnoughDataError as e:
+        raise SystemExit(str(e))
     save(bundle, args.output)
 
     report = bundle["report"]

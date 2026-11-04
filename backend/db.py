@@ -74,6 +74,7 @@ class Anomaly(Base):
     if_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     lstm_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     vae_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transformer_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     flags: Mapped[list] = mapped_column(JSON, default=list)
     contributions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
@@ -94,6 +95,7 @@ class Anomaly(Base):
                 "iforest": self.if_score,
                 "lstm": self.lstm_score,
                 "vae": self.vae_score,
+                "transformer": self.transformer_score,
             },
             "flags": self.flags or [],
             "contributions": self.contributions or {},
@@ -128,7 +130,7 @@ class DefenseEvent(Base):
 
 
 # Columns added after the first release: (table, column, DDL type).
-_ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON")]
+_ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON"), ("anomalies", "transformer_score", "FLOAT")]
 
 
 def _migrate() -> None:

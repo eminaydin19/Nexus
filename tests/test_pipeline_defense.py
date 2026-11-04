@@ -28,7 +28,7 @@ class StubEnsemble:
 
     def predict(self, _node, _vector):
         return Prediction(
-            scores={"iforest": self.score, "lstm": None, "vae": self.score},
+            scores={"iforest": self.score, "lstm": None, "vae": self.score, "transformer": None},
             ensemble=self.score,
             is_anomaly=True,
             severity="critical" if self.score >= 0.85 else "warning",

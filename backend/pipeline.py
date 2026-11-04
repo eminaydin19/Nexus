@@ -194,6 +194,7 @@ class Pipeline:
                         if_score=prediction.scores["iforest"],
                         lstm_score=prediction.scores["lstm"],
                         vae_score=prediction.scores["vae"],
+                        transformer_score=prediction.scores["transformer"],
                         flags=prediction.flags,
                         contributions=prediction.contributions,
                     )
