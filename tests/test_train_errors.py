@@ -37,3 +37,49 @@ def test_retrain_loop_survives_short_data(monkeypatch):
         task.cancel()
 
     asyncio.run(run())
+
+
+def _run_ticks(monkeypatch, ready, error, ticks):
+    """Run the retrain loop for `ticks` hourly ticks on a fake clock; return the number of train() calls."""
+    calls = []
+    clock = [0.0]
+
+    def fake_train(*args):
+        calls.append(clock[0])
+        raise error
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        if clock[0] >= ticks * 3600:
+            raise asyncio.CancelledError
+        clock[0] += 3600
+        await real_sleep(0)
+
+    monkeypatch.setattr(main, "_now", lambda: clock[0])
+    monkeypatch.setattr(main.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(main, "load_db", lambda: SHORT)
+    monkeypatch.setattr(main, "train", fake_train)
+    monkeypatch.setattr(main.app.state, "pipeline", SimpleNamespace(ensemble=SimpleNamespace(ready=ready)), raising=False)
+    try:
+        asyncio.run(main._continuous_learning())
+    except asyncio.CancelledError:
+        pass
+    return calls
+
+
+def test_ready_model_is_not_retrained_before_24h(monkeypatch):
+    assert _run_ticks(monkeypatch, True, NotEnoughDataError("x"), 24) == []
+
+
+def test_ready_model_retrains_after_24h(monkeypatch):
+    assert len(_run_ticks(monkeypatch, True, NotEnoughDataError("x"), 26)) == 1
+
+
+def test_failed_retrain_with_ready_model_waits_full_interval(monkeypatch):
+    calls = _run_ticks(monkeypatch, True, RuntimeError("boom"), 50)
+    assert calls == [25 * 3600.0, 49 * 3600.0]
+
+
+def test_no_model_retries_hourly(monkeypatch):
+    assert len(_run_ticks(monkeypatch, False, RuntimeError("boom"), 5)) == 5

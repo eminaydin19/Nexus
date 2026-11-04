@@ -94,18 +94,24 @@ async def _housekeeping() -> None:
 
 RETRAIN_CHECK_SECONDS = 3600
 RETRAIN_INTERVAL_SECONDS = 86400
+_now = time.monotonic
 
 
 async def _continuous_learning() -> None:
-    # Hourly attempts while no model exists, otherwise one retrain per day.
-    last_trained = time.monotonic() if getattr(app.state, "pipeline", None) and app.state.pipeline.ensemble.ready else None
+    # Hourly attempts while no model exists; with a model, at most one attempt (even a failed one) per day.
+    last_attempt: float | None = None
     while True:
         await asyncio.sleep(RETRAIN_CHECK_SECONDS)
         pipeline = getattr(app.state, "pipeline", None)
         if pipeline is None:
             continue
-        if pipeline.ensemble.ready and last_trained is not None and time.monotonic() - last_trained < RETRAIN_INTERVAL_SECONDS:
-            continue
+        if pipeline.ensemble.ready:
+            if last_attempt is None:
+                last_attempt = _now()
+                continue
+            if _now() - last_attempt < RETRAIN_INTERVAL_SECONDS:
+                continue
+        last_attempt = _now()
         try:
             log.info("Starting autonomous continuous learning cycle...")
             data = await asyncio.to_thread(load_db)
@@ -113,7 +119,6 @@ async def _continuous_learning() -> None:
                 continue
             bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_auto")
             pipeline.ensemble.install_bundle(bundle)
-            last_trained = time.monotonic()
             await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
             log.info("Autonomous learning cycle complete. Models updated.")
         except NotEnoughDataError as e:
