@@ -85,21 +85,23 @@ def test_tail_survives_invalid_utf8_and_missing_file(tmp_path):
     p = tmp_path / "a.log"
     t = FileTail(p, recheck=0)
     assert t.read_lines() == []
+    p.write_text("")
+    assert t.read_lines() == []
     append(p, b"bad \xff\xfe bytes\n")
     assert t.read_lines() == ["bad �� bytes"]
 
 
-def test_file_created_after_start_is_read_from_its_beginning_on_recheck(tmp_path, caplog):
+def test_file_appearing_after_start_is_followed_from_its_end_on_recheck(tmp_path, caplog):
     now = [0.0]
     p = tmp_path / "a.log"
     with caplog.at_level(logging.INFO, "nexus_agent.collectors"):
         t = FileTail(p, clock=lambda: now[0])
-        p.write_text("first\n")
-        assert t.read_lines() == []  # not rechecked yet
-        now[0] = 59
+        p.write_text("history\n")
         assert t.read_lines() == []
         now[0] = 61
-        assert t.read_lines() == ["first"]
+        assert t.read_lines() == []
+        append(p, b"live\n")
+        assert t.read_lines() == ["live"]
     assert sum("unavailable" in r.message for r in caplog.records) == 1
 
 
@@ -283,11 +285,16 @@ def test_without_journal_a_late_ssh_file_is_picked_once(tmp_path):
     c = LogCollectors(q, ssh_logs=(a, b), web_logs=(), kern_log=tmp_path / "k", journalctl=None, clock=lambda: now[0])
     a.write_text("x\n")
     b.write_text("y\n")
+    os.utime(str(b), (time.time() - 60, time.time() - 60))  # picked by freshest mtime
     c.poll_files()
     assert not list(q.drain(10))
     now[0] = 61
     c.poll_files()
-    assert list(q.drain(10)) == [("ssh", "x")]
+    assert not list(q.drain(10))  # history stays unread
+    append(a, b"live\n")
+    append(b, b"other\n")
+    c.poll_files()
+    assert list(q.drain(10)) == [("ssh", "live")]
 
 
 def test_duplicate_web_paths_are_tailed_once_and_tagged(tmp_path):
@@ -324,7 +331,7 @@ def test_sample_connections_counts_only_inbound(monkeypatch):
     ]
     monkeypatch.setattr(psutil, "net_connections", lambda kind: conns)
     per_ip, syn_recv, active_ssh, ports = sample_connections((22,))
-    assert per_ip == {"203.0.113.9": 2, "203.0.113.10": 1, "198.51.100.7": 1}
+    assert per_ip == {"203.0.113.9": 2, "198.51.100.7": 1}  # SYN_RECV sources can be spoofed
     assert syn_recv == 1
     assert active_ssh == {"198.51.100.7"}
     assert ports == {22, 80}
@@ -358,3 +365,204 @@ def test_sample_metrics_shape_and_bounds(monkeypatch):
     assert sample_metrics()["net_kbps"] == 0.0
     monkeypatch.setattr(psutil, "net_io_counters", lambda: None)
     assert sample_metrics()["net_kbps"] == 0.0
+
+
+def test_parse_scan_line_with_syslog_header_needs_kernel_tag():
+    line = "Nov  4 13:22:11 web01 nexus-scan " + SCAN % ("203.0.113.9", "23")
+    assert parse_scan_line(line) is None
+    assert parse_scan_line("2026-11-04T13:22:11+0300 web01 nexus-scan " + SCAN % ("203.0.113.9", "23")) is None
+
+
+def test_rotation_to_a_new_file_reads_from_zero(tmp_path):
+    p = tmp_path / "a.log"
+    p.write_text("")
+    t = FileTail(p)
+    t.read_lines()
+    os.rename(str(p), str(tmp_path / "a.1"))
+    p.write_text("fresh\n")
+    assert t.read_lines() == ["fresh"]
+
+
+def test_old_file_moved_over_the_path_is_not_replayed(tmp_path):
+    p, old = tmp_path / "a.log", tmp_path / "archive"
+    p.write_text("")
+    old.write_text("history\n")
+    past = time.time() - 3600
+    os.utime(str(old), (past, past))
+    t = FileTail(p)
+    t.read_lines()
+    os.rename(str(old), str(p))
+    assert t.read_lines() == []
+    append(p, b"live\n")
+    assert t.read_lines() == ["live"]
+
+
+def test_symlink_swap_to_an_existing_file_starts_at_its_end(tmp_path):
+    a, b, link = tmp_path / "a", tmp_path / "b", tmp_path / "link"
+    a.write_text("")
+    b.write_text("recent history\n")  # young mtime: only the symlink tells this apart from a rotation
+    link.symlink_to(a)
+    t = FileTail(link)
+    t.read_lines()
+    tmp = tmp_path / "tmplink"
+    tmp.symlink_to(b)
+    os.replace(str(tmp), str(link))
+    assert t.read_lines() == []
+    append(b, b"live\n")
+    assert t.read_lines() == ["live"]
+
+
+def ssh_collectors(tmp_path, q, now, journal=True, last=None):
+    return LogCollectors(q, ssh_logs=(tmp_path / "auth.log", tmp_path / "secure"), web_logs=(), kern_log=tmp_path / "k",
+                         journalctl="/bin/journalctl" if journal else None, clock=lambda: now[0],
+                         journal_last=lambda: last[0] if last else None)
+
+
+def make_old(path, age=2 * 86400):
+    path.write_text("history\n")
+    os.utime(str(path), (time.time() - age, time.time() - age))
+
+
+def ssh_sources(c):
+    return [t.path for s, t in c.files if s == "ssh"], [s for s, _ in c.journals if s == "ssh"]
+
+
+def test_stale_auth_log_loses_to_the_journal_and_selection_is_logged(tmp_path, caplog):
+    caplog.set_level(logging.INFO, "nexus_agent.collectors")
+    make_old(tmp_path / "auth.log")
+    c = ssh_collectors(tmp_path, LineQueue(10), [0.0])
+    assert ssh_sources(c) == ([], ["ssh"])
+    assert "ssh source: journal" in caplog.text
+
+
+def test_stale_file_used_only_when_no_journalctl(tmp_path, caplog):
+    caplog.set_level(logging.INFO, "nexus_agent.collectors")
+    make_old(tmp_path / "auth.log")
+    c = ssh_collectors(tmp_path, LineQueue(10), [0.0], journal=False)
+    assert ssh_sources(c) == ([str(tmp_path / "auth.log")], [])
+    assert "ssh source: file" in caplog.text
+
+
+def test_fresh_second_candidate_beats_stale_first(tmp_path):
+    make_old(tmp_path / "auth.log")
+    (tmp_path / "secure").write_text("")
+    c = ssh_collectors(tmp_path, LineQueue(10), [0.0])
+    assert ssh_sources(c) == ([str(tmp_path / "secure")], [])
+
+
+def test_silent_file_switches_to_fresher_journal_only_after_24h(tmp_path):
+    (tmp_path / "auth.log").write_text("")
+    now, last = [0.0], [time.time() + 5]
+    c = ssh_collectors(tmp_path, LineQueue(10), now, last=last)
+    now[0] = 86399
+    c.poll_files()
+    assert ssh_sources(c)[1] == []
+    now[0] = 86459
+    c.poll_files()
+    assert ssh_sources(c) == ([], ["ssh"])
+
+
+def test_silent_journal_switches_to_fresher_file_at_its_end(tmp_path):
+    make_old(tmp_path / "auth.log")
+    now, last = [0.0], [time.time() - 3 * 86400]
+    q = LineQueue(10)
+    c = ssh_collectors(tmp_path, q, now, last=last)
+    assert ssh_sources(c)[1] == ["ssh"]
+    journal = c.journals[0][1]
+    closed = []
+    journal.close = lambda: closed.append(1)
+    os.utime(str(tmp_path / "auth.log"))  # rsyslog came back
+    now[0] = 86400
+    c.poll_files()
+    assert ssh_sources(c) == ([str(tmp_path / "auth.log")], [])
+    assert closed == [1]
+    assert not list(q.drain(10))  # "history" is not read
+    append(tmp_path / "auth.log", b"live\n")
+    c.poll_files()
+    assert list(q.drain(10)) == [("ssh", "live")]
+
+
+def test_lines_keep_the_source_and_no_switch_when_current_is_freshest(tmp_path):
+    p = tmp_path / "auth.log"
+    p.write_text("")
+    now, last = [0.0], [time.time() - 86400]
+    q = LineQueue(10)
+    c = ssh_collectors(tmp_path, q, now, last=last)
+    now[0] = 80000
+    append(p, b"x\n")
+    c.poll_files()
+    assert c.ssh_idle_seconds() == 0
+    now[0] = 80000 + 86400
+    assert c.ssh_idle_seconds() == 86400
+    c.poll_files()
+    assert ssh_sources(c)[0] == [str(p)]  # file mtime is newer than the journal's last entry
+
+
+def test_journal_lines_count_as_ssh_activity(tmp_path):
+    now = [0.0]
+    q = LineQueue(10)
+    c = ssh_collectors(tmp_path, q, now)
+    now[0] = 500
+    c._sink("ssh")("x\n")
+    assert c.ssh_idle_seconds() == 0
+    now[0] = 600
+    c._sink("scan")("y\n")
+    assert c.ssh_idle_seconds() == 100
+
+
+def test_journal_close_ends_only_that_tail(tmp_path):
+    binary = fake_journal(tmp_path, "exec sleep 30\n")
+    stop = threading.Event()
+    tail = JournalTail((), binary=binary)
+    th = threading.Thread(target=tail.run, args=(lambda l: None, stop), daemon=True)
+    th.start()
+    assert wait_for(lambda: tail._proc is not None)
+    tail.close()
+    th.join(5)
+    assert not th.is_alive() and not stop.is_set()
+
+
+def test_journal_run_survives_a_sink_error(tmp_path):
+    binary = fake_journal(tmp_path, 'echo line\n')
+    calls, stop = [], threading.Event()
+
+    def sink(line):
+        calls.append(line)
+        raise RuntimeError("boom")
+
+    tail = JournalTail((), binary=binary, backoff=0.01)
+    th = threading.Thread(target=tail.run, args=(sink, stop), daemon=True)
+    th.start()
+    assert wait_for(lambda: len(calls) >= 2)
+    stop.set()
+    th.join(5)
+
+
+def test_poll_thread_is_restarted_when_dead(tmp_path, caplog):
+    c = make_collectors(LineQueue(10), ())
+    stop = threading.Event()
+    assert c.ensure_poll_alive(stop) is False  # never started: nothing to restart
+    c._poll_loop = lambda s: None
+    c.start(stop)
+    c._poll_thread.join(5)
+    assert c.ensure_poll_alive(stop) is True
+    assert "poll thread" in caplog.text
+    stop.set()
+    c.terminate()
+
+
+def test_poll_loop_survives_an_error(tmp_path, monkeypatch):
+    c = make_collectors(LineQueue(10), ())
+    calls = []
+
+    class Stop:
+        def wait(self, delay):
+            return len(calls) >= 2
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(c, "poll_files", boom)
+    c._poll_loop(Stop())
+    assert len(calls) == 2

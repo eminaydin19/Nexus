@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import time
 from pathlib import Path
 
 import pytest
 
-from nexus_agent.parsers import LogEvent, normalize_ip, parse_ssh_line, parse_web_line
+from nexus_agent.parsers import (
+    LogEvent, normalize_ip, parse_ssh_line, parse_web_line, ssh_line_is_stale, web_line_is_stale,
+)
 
 FIX = Path(__file__).parent / "fixtures"
 NOW = 1_700_000_000.0
@@ -213,3 +216,56 @@ def test_web_user_agent_kept_untruncated():
 def test_web_user_agent_absent_is_none():
     assert parse_web_line('198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1', 0).user_agent is None
     assert parse_web_line('198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1 "-" "-"', 0).user_agent is None
+
+
+
+def _syslog(age):
+    return time.strftime("%b %e %H:%M:%S", time.localtime(NOW - age))
+
+
+def _iso(age, fmt="%Y-%m-%dT%H:%M:%S+0000"):
+    return time.strftime(fmt, time.gmtime(NOW - age))
+
+
+SSH_TAIL = " web01 sshd[1]: Failed password for root from 203.0.113.9 port 22 ssh2"
+
+
+@pytest.mark.parametrize("age,stale", [(0, False), (599, False), (601, True), (86400, True), (-3600, False)])
+def test_ssh_line_age(age, stale):
+    assert ssh_line_is_stale(_syslog(age) + SSH_TAIL, NOW) is stale
+    assert ssh_line_is_stale(_iso(age) + SSH_TAIL, NOW) is stale
+
+
+@pytest.mark.parametrize("fmt", ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.123456+00:00", "%Y-%m-%dT%H:%M:%S+00:00"])
+def test_iso_variants(fmt):
+    assert ssh_line_is_stale(_iso(3600, fmt) + SSH_TAIL, NOW)
+    assert not ssh_line_is_stale(_iso(0, fmt) + SSH_TAIL, NOW)
+
+
+def test_iso_offset_is_honoured():
+    assert not ssh_line_is_stale(time.strftime("%Y-%m-%dT%H:%M:%S+0300", time.gmtime(NOW + 3 * 3600)) + SSH_TAIL, NOW)
+
+
+def test_syslog_from_last_december_read_in_january_is_stale_not_future():
+    jan = time.mktime((2024, 1, 1, 0, 5, 0, 0, 0, -1))
+    assert ssh_line_is_stale("Dec 31 23:00:00" + SSH_TAIL, jan)
+    assert not ssh_line_is_stale("Dec 31 23:59:00" + SSH_TAIL, jan)
+
+
+@pytest.mark.parametrize("line", ["sshd[1]: Failed password for root from 203.0.113.9 port 22 ssh2", "", "Foo 99 99:99:99 x",
+                                  "2026-99-99T99:99:99+0000 web01 sshd[1]: x"])
+def test_unparseable_timestamp_counts_as_now(line):
+    assert ssh_line_is_stale(line, NOW) is False
+
+
+@pytest.mark.parametrize("age,stale", [(0, False), (601, True)])
+def test_web_line_age(age, stale):
+    stamp = time.strftime("%d/%b/%Y:%H:%M:%S +0000", time.gmtime(NOW - age))
+    line = '203.0.113.9 - - [%s] "GET / HTTP/1.1" 200 5 "-" "ua"' % stamp
+    assert web_line_is_stale(line, NOW) is stale
+    assert parse_web_line(line, NOW).status == 200
+
+
+def test_web_line_without_usable_time_counts_as_now():
+    assert web_line_is_stale('203.0.113.9 - - [nope] "GET / HTTP/1.1" 200 5', NOW) is False
+    assert web_line_is_stale("junk", NOW) is False

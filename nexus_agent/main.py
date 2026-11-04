@@ -20,9 +20,13 @@ from .client import Client, ClientError, Command
 from .collectors import (
     WEB_LOGS, LineQueue, LogCollectors, read_connections, sample_connections, sample_metrics, web_peers,
 )
-from .config import AgentConfig, is_insecure, load_state, read_gateways, read_resolvers, resolve_host, save_state
-from .enforcer import BREAKER_TTL, MAX_TTL, MODES, Enforcer
-from .parsers import normalize_ip, parse_scan_line, parse_ssh_line, parse_web_line
+from .config import (
+    AgentConfig, is_insecure, load_ssh_ok, load_state, read_gateways, read_resolvers, resolve_host, save_state,
+)
+from .enforcer import MAX_TTL, MODES, Enforcer
+from .parsers import (
+    normalize_ip, parse_scan_line, parse_ssh_line, parse_web_line, ssh_line_is_stale, web_line_is_stale,
+)
 from .protect import Protector, _parse_nets
 from .rules import Decision, RuleEngine
 
@@ -47,18 +51,29 @@ CDN_ON_SHARE = 0.5
 CDN_OFF_SHARE = 0.1
 CDN_FIRST_REFRESH = 3600
 CDN_REFRESH = 86400
+NETWORK_REFRESH = 300
+NETWORK_RETRY = 60
+SSH_STATE_INTERVAL = 60
+SSH_SILENCE_WARN = 3600
 
 
 class Agent:
     def __init__(self, cfg: AgentConfig, client, protector: Protector, engine: RuleEngine, enforcer: Enforcer,
-                 can_enforce: Optional[bool] = None, collectors: Optional[LogCollectors] = None, clock=time.time):
+                 can_enforce: Optional[bool] = None, collectors: Optional[LogCollectors] = None, clock=time.time,
+                 mono=time.monotonic):
         self.cfg, self.client, self.protector, self.engine, self.enforcer = cfg, client, protector, engine, enforcer
-        self.collectors, self.clock = collectors, clock
+        self.collectors, self.clock, self.mono = collectors, clock, mono
         self.lines = LineQueue()
         self.events_dropped = 0
+        self.stale_lines = 0
         self._can_enforce = (sys.platform.startswith("linux") and shutil.which("nft") is not None
                              if can_enforce is None else can_enforce)
-        self._enforce_rejected = False
+        self._rejected_reason = None  # type: Optional[str]
+        self._await_sample = False
+        self._ssh_silence_warned = False
+        self._saved_ssh = []  # type: list
+        self._next_ssh_save = 0.0
+        self._send_thread = None  # type: Optional[threading.Thread]
         self._state_mode = "observe"
         self._allow = []  # type: List[str]
         self._listening = set()  # type: set
@@ -78,37 +93,53 @@ class Agent:
     def startup(self) -> None:
         mode, self._allow = load_state(self.cfg.state_dir) or ("observe", [])
         self.protector.set_allowlist(list(self.cfg.allowlist) + self._allow)
+        self.protector.import_ssh_ok(load_ssh_ok(self.cfg.state_dir))
+        self._saved_ssh = self.protector.export_ssh_ok()
+        self._next_ssh_save = self.mono() + SSH_STATE_INTERVAL
         # Before enforce: setup starts the scan log rule, and an unknown listening set would flag every open port.
         self._sample_connections()
-        self._next_conn = self.clock() + CONN_INTERVAL
+        self._next_conn = self.mono() + CONN_INTERVAL
         self._state_mode = self._clamp(mode)
-        self._apply_mode(self._state_mode)
+        self._request_mode(mode)
         if self.enforcer.mode != "enforce":
             self.enforcer.lift_leftovers()
 
     def _clamp(self, mode: str) -> str:
         return min(mode, self.cfg.max_mode, key=MODES.index)
 
+    def _request_mode(self, mode: str) -> None:
+        self._apply_mode(self._clamp(mode))
+        if mode == "enforce" and self.cfg.max_mode != "enforce":
+            self._rejected_reason = "max_mode"
+
     def _apply_mode(self, mode: str) -> None:
-        self._enforce_rejected = False
+        self._rejected_reason = None
+        self._await_sample = False
         if mode == "enforce" and not self._can_enforce:
-            self._enforce_rejected = True
+            self._rejected_reason = "no_nft"
+            mode = "observe"
+        elif mode == "enforce" and not self._listening:
+            # Until a sample succeeds every open port would look closed to the scan rule.
+            self._await_sample = True
             mode = "observe"
         ok = self.enforcer.set_mode(mode)
         if mode == "enforce":
             if ok and self.enforcer.capable:
                 self._push_listening()
             else:
-                self._enforce_rejected = True
-        elif not ok:
-            log.error("switching to %s could not lift kernel blocks", mode)
+                self._rejected_reason = "setup_failed"
 
     def _push_listening(self) -> None:
         if self._listening:
             self.enforcer.update_listening(self._listening)
 
     def _persist(self) -> None:
-        save_state(self.cfg.state_dir, self._state_mode, self._allow)
+        self._saved_ssh = self.protector.export_ssh_ok()
+        save_state(self.cfg.state_dir, self._state_mode, self._allow, self._saved_ssh)
+
+    def _save_ssh_if_changed(self) -> None:
+        if self.protector.export_ssh_ok() != self._saved_ssh:
+            self._persist()
 
     # -- commands -----------------------------------------------------------
 
@@ -148,11 +179,16 @@ class Agent:
         self.protector.set_allowlist(list(self.cfg.allowlist) + items)
         self._persist()
         nets = _parse_nets(items, "allowlist")
+        blocks = self.enforcer.active(limit=None, strict=True)
+        if blocks is None:
+            return False  # an unread kernel may still hold a block on an allowed customer, so central must retry
         done = True
-        for block in self.enforcer.active(limit=None):
+        for block in blocks:
             if self._now_allowed(block.ip, nets):
-                done = self.enforcer.remove(block.ip) and done
-                self.engine.forget(block.ip)
+                if self.enforcer.remove(block.ip):
+                    self.engine.forget(block.ip)
+                else:
+                    done = False
         return done
 
     def _now_allowed(self, ip: str, nets: list) -> bool:
@@ -168,18 +204,22 @@ class Agent:
         mode = payload["mode"]
         if mode not in MODES:
             raise ValueError("invalid mode")
-        self._apply_mode(self._clamp(mode))
-        self._state_mode = self.enforcer.mode
+        self._request_mode(mode)
+        self._state_mode = "enforce" if self._await_sample else self.enforcer.mode
         self._persist()
         return True
 
     # -- tick ---------------------------------------------------------------
 
     def tick(self) -> None:
+        self.enforcer.retry_lift()
         while self._commands:
             self.handle_command(self._commands.popleft())
         self._process_lines()
-        now = self.clock()
+        now = self.mono()
+        if now >= self._next_ssh_save:
+            self._next_ssh_save = now + SSH_STATE_INTERVAL
+            self._save_ssh_if_changed()
         if now >= self._next_conn:
             self._next_conn = now + CONN_INTERVAL
             per_ip, syn_recv = self._sample_connections()
@@ -191,12 +231,17 @@ class Agent:
         now = self.clock()
         off = self.enforcer.mode == "off"
         for source, line in self.lines.drain(MAX_LINES_PER_TICK):
-            # Off means no detection: engine state built now would suppress real decisions after switching back.
-            if off:
-                continue
             if source == "ssh":
+                if ssh_line_is_stale(line, now):
+                    self.stale_lines += 1
+                    continue
                 event = parse_ssh_line(line, now)
+            elif off:
+                continue
             elif source == "web":
+                if web_line_is_stale(line, now):
+                    self.stale_lines += 1
+                    continue
                 event = parse_web_line(line, now)
             else:
                 event = None
@@ -204,8 +249,14 @@ class Agent:
                 # An empty set means the sample failed, not that every port is closed.
                 if hit and self._listening and hit[1] not in self._listening:
                     self._apply(self.engine.feed_scan(hit[0], hit[1]))
-            if event is not None:
+            if event is None:
+                continue
+            # Off means no detection: engine state built now would suppress real decisions after switching back.
+            # A login still has to reach the Protector, or the customer loses recent-SSH trust while off.
+            if not off:
                 self._apply(self.engine.feed(event))
+            elif event.kind == "ssh_ok":
+                self.protector.note_ssh_ok(event.ip)
 
     def _sample_connections(self):
         conns = read_connections()
@@ -215,8 +266,23 @@ class Agent:
         self.protector.set_active_ssh(active_ssh)
         self._listening = listening
         self._push_listening()
+        if self._await_sample:
+            self._apply_mode("enforce")
+        self._warn_if_ssh_silent(active_ssh)
         self._update_behind_cdn(web_peers(self.cfg.rules.web_ports, conns))
         return per_ip, syn_recv
+
+    def _warn_if_ssh_silent(self, active_ssh: set) -> None:
+        idle = getattr(self.collectors, "ssh_idle_seconds", None)
+        if idle is None:
+            return
+        silent = idle() >= SSH_SILENCE_WARN
+        if silent and active_ssh and not self._ssh_silence_warned:
+            log.warning("ssh sessions are active but the ssh log source produced no line for an hour; "
+                        "ssh detection and recent-ssh protection may be blind")
+            self._ssh_silence_warned = True
+        elif not silent:
+            self._ssh_silence_warned = False
 
     def _update_behind_cdn(self, peers: set) -> None:
         if len(peers) < CDN_MIN_PEERS:
@@ -238,10 +304,11 @@ class Agent:
                 log.error("cannot apply %s for %r: %s", d.rule, d.ip, exc)
                 self._push(self._event(d, d.action, d.ports, d.ttl, False, False))
                 continue
-            if d.action in ("block_port", "block_all") and self.enforcer.breaker_open:
-                self._push(self._event(d, "rate_limit", (), min(d.ttl, BREAKER_TTL), res.simulated, res.ok))
+            ttl = res.ttl or d.ttl
+            if res.detail.startswith("breaker"):
+                self._push(self._event(d, "rate_limit", (), ttl, res.simulated, res.ok))
             else:
-                self._push(self._event(d, d.action, d.ports, d.ttl, res.simulated, res.ok))
+                self._push(self._event(d, d.action, d.ports, ttl, res.simulated, res.ok))
             self._note_breaker()
 
     def _event(self, d: Decision, action: str, ports, ttl, simulated: bool, ok: bool) -> dict:
@@ -265,7 +332,7 @@ class Agent:
             log.warning("circuit breaker open: new blocks are downgraded to rate limits")
             self._push({"rule": "breaker", "ip": "0.0.0.0", "action": "alert", "ports": [], "ttl": 0,
                         "evidence": "too many new blocks; downgrading to rate limit",
-                        "simulated": self.enforcer.mode == "observe", "ok": True, "ts": self.clock()})
+                        "simulated": False, "ok": True, "ts": self.clock()})
         self._breaker_was = now_open
 
     def _push(self, event: dict) -> None:
@@ -328,7 +395,7 @@ class Agent:
             active_blocks=[dataclasses.asdict(b) for b in self.enforcer.active()],
             version=__version__,
             capabilities={
-                "enforce": self._can_enforce and not self._enforce_rejected,
+                "enforce": self._can_enforce and self._rejected_reason != "setup_failed",
                 "platform": sys.platform,
             },
             config=self._config(),
@@ -344,11 +411,15 @@ class Agent:
         return {
             "max_mode": self.cfg.max_mode,
             "mode": self.enforcer.mode,
-            "enforce_rejected": self._enforce_rejected,
+            "enforce_rejected": self._rejected_reason is not None,
+            "enforce_rejected_reason": self._rejected_reason,
+            "enforce_waiting_sample": self._await_sample,
+            "lift_pending": self.enforcer.lift_pending,
             "breaker_open": self._breaker_was,
             "behind_cdn": self._behind_cdn,
             "events_dropped": self.events_dropped,
             "lines_dropped": self.lines.dropped,
+            "stale_lines": self.stale_lines,
             "suppressed": dict(self.engine.suppressed),
             "rules": rules,
         }
@@ -359,7 +430,11 @@ class Agent:
         # Its own thread: a blackholed central stalls a send for up to 20s, and detection must not wait for that.
         delay = SEND_INTERVAL
         while not stop.wait(delay):
-            delay = self.send_once()
+            try:
+                delay = self.send_once()
+            except Exception:
+                log.exception("send loop failed")
+                delay = SEND_INTERVAL
 
     def _cdn_loop(self, stop) -> None:
         delay = CDN_FIRST_REFRESH
@@ -370,20 +445,49 @@ class Agent:
                 log.exception("CDN range refresh failed")
             delay = CDN_REFRESH
 
+    def _refresh_network(self) -> bool:
+        """False when any lookup came back empty, which is a reason to retry soon."""
+        central, gateway, resolvers = resolve_host(urlsplit(self.cfg.url).hostname), read_gateways(), read_resolvers()
+        self.protector.update_network(central, gateway, resolvers)
+        return bool(central and gateway and resolvers)
+
+    def _network_loop(self, stop) -> None:
+        delay = NETWORK_REFRESH
+        while not stop.wait(delay):
+            try:
+                delay = NETWORK_REFRESH if self._refresh_network() else NETWORK_RETRY
+            except Exception:
+                log.exception("network refresh failed")
+                delay = NETWORK_RETRY
+
+    def _start_send(self, stop: threading.Event) -> None:
+        self._send_thread = threading.Thread(target=self._send_loop, args=(stop,), daemon=True, name="nexus-send")
+        self._send_thread.start()
+
+    def _check_threads(self, stop: threading.Event) -> None:
+        if self._send_thread is not None and not self._send_thread.is_alive():
+            log.error("send thread died; restarting")
+            self._start_send(stop)
+        if self.collectors is not None:
+            self.collectors.ensure_poll_alive(stop)
+
     def run(self, stop: threading.Event) -> None:
         if self.collectors is not None:
             self.collectors.start(stop)
-        for target, name in ((self._send_loop, "nexus-send"), (self._cdn_loop, "nexus-cdn")):
+        self._start_send(stop)
+        for target, name in ((self._cdn_loop, "nexus-cdn"), (self._network_loop, "nexus-net")):
             threading.Thread(target=target, args=(stop,), daemon=True, name=name).start()
         try:
             while not stop.wait(TICK):
                 try:
+                    self._check_threads(stop)
                     self.tick()
                 except Exception:
                     log.exception("tick failed")
         finally:
             if self.collectors is not None:
                 self.collectors.terminate()
+            self._save_ssh_if_changed()
 
 
 def build_agent(cfg: AgentConfig) -> Agent:
@@ -416,8 +520,12 @@ def _run() -> int:
 
 
 def _enroll(args: argparse.Namespace) -> int:
+    # Env first: argv is visible to every local user in ps.
+    token = os.environ.get("NEXUS_ENROLL_TOKEN") or args.token
+    if not token:
+        raise SystemExit("nexus-agent: set NEXUS_ENROLL_TOKEN or pass --token")
     try:
-        node_id, api_key = Client.enroll(args.url, args.token, socket.gethostname(),
+        node_id, api_key = Client.enroll(args.url, token, socket.gethostname(),
                                          allow_insecure=args.insecure or is_insecure(os.environ))
     except (ValueError, ClientError) as exc:
         raise SystemExit("nexus-agent: %s" % exc)
@@ -431,7 +539,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("run", help="run the agent (default)")
     enroll = sub.add_parser("enroll", help="exchange a one-time token for a key; prints JSON")
     enroll.add_argument("--url", required=True)
-    enroll.add_argument("--token", required=True)
+    enroll.add_argument("--token")
     enroll.add_argument("--insecure", action="store_true")
     sub.add_parser("uninstall", help="delete the nftables table")
     args = parser.parse_args(argv)
@@ -439,5 +547,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "enroll":
         return _enroll(args)
     if args.command == "uninstall":
+        if shutil.which("nft") is None:
+            print("nft not found; no firewall table to remove")
+            return 0
         return 0 if Enforcer("observe").teardown() else 1
     return _run()

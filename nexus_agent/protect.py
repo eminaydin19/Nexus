@@ -150,6 +150,32 @@ class Protector:
             if len(self._ssh_ok) < MAX_SSH_IPS:
                 self._ssh_ok[ip] = now + SSH_OK_TTL
 
+    def export_ssh_ok(self) -> List[list]:
+        now = self._clock()
+        with self._lock:
+            return sorted([ip, exp] for ip, exp in self._ssh_ok.items() if exp > now)
+
+    def import_ssh_ok(self, items) -> None:
+        now = self._clock()
+        with self._lock:
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, list) or len(item) != 2:
+                    continue
+                ip, exp = normalize_ip(item[0]), item[1]
+                if (ip is None or isinstance(exp, bool) or not isinstance(exp, (int, float))
+                        or not now < exp <= now + SSH_OK_TTL or len(self._ssh_ok) >= MAX_SSH_IPS):
+                    continue
+                self._ssh_ok[ip] = float(exp)
+
+    def update_network(self, central_ip=None, gateway=None, resolvers=None) -> None:
+        # An empty answer is a failed lookup, and forgetting the old address would make it blockable.
+        if central_ip:
+            self._central = _ip_set(central_ip)
+        if gateway:
+            self._gateway = _ip_set(gateway)
+        if resolvers:
+            self._resolvers = _ip_set(resolvers)
+
     def is_cdn(self, ip: str) -> bool:
         ip = normalize_ip(ip)
         return ip is not None and self._cdn.find(ip) is not None

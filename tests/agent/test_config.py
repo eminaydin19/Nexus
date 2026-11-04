@@ -6,7 +6,7 @@ import os
 import pytest
 
 from nexus_agent.config import (
-    AgentConfig, load_state, read_gateways, read_resolvers, resolve_host, save_state,
+    AgentConfig, load_ssh_ok, load_state, read_gateways, read_resolvers, resolve_host, save_state,
 )
 
 BASE = {"NEXUS_URL": "https://c.example", "NEXUS_API_KEY": "k"}
@@ -142,4 +142,32 @@ def test_missing_state(tmp_path):
 
 def test_state_file_format(tmp_path):
     save_state(tmp_path, "off", ["192.0.2.0/24"])
-    assert json.loads((tmp_path / "state.json").read_text()) == {"mode": "off", "allowlist": ["192.0.2.0/24"]}
+    assert json.loads((tmp_path / "state.json").read_text()) == {"mode": "off", "allowlist": ["192.0.2.0/24"], "ssh_ok": []}
+
+
+def test_sshd_include_globs_are_followed(tmp_path):
+    d = tmp_path / "sshd_config.d"
+    d.mkdir()
+    (d / "10-a.conf").write_text("Port 2222\n")
+    (d / "20-b.conf").write_text("Include %s\nPort 2200\n" % (tmp_path / "sshd_config"))  # a loop must end
+    (d / "skip.txt").write_text("Port 9999\n")
+    assert cfg(tmp_path, sshd="Include sshd_config.d/*.conf\n").rules.ssh_ports == (22, 2200, 2222)
+
+
+def test_sshd_absolute_include_with_several_patterns(tmp_path):
+    a = tmp_path / "a.conf"
+    a.write_text("Port 2201\n")
+    b = tmp_path / "b.conf"
+    b.write_text("Port 2202\n")
+    assert cfg(tmp_path, sshd='include "%s" %s\n' % (a, b)).rules.ssh_ports == (22, 2201, 2202)
+
+
+def test_ssh_ok_state_roundtrip_and_tolerance(tmp_path):
+    save_state(tmp_path, "observe", [], [["203.0.113.9", 5.0]])
+    assert load_ssh_ok(tmp_path) == [["203.0.113.9", 5.0]]
+    assert load_state(tmp_path) == ("observe", [])
+    (tmp_path / "state.json").write_text('{"mode": "observe", "allowlist": [], "ssh_ok": "x"}')
+    assert load_ssh_ok(tmp_path) == []
+    assert load_state(tmp_path) == ("observe", [])
+    (tmp_path / "state.json").write_text("{broken")
+    assert load_ssh_ok(tmp_path) == []

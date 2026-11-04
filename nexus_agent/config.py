@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import glob
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ log = logging.getLogger("nexus_agent.config")
 
 STATE_FILE = "state.json"
 _SSHD_PORT = re.compile(r"\s*port\s+(\d+)\s*(?:#.*)?$", re.I)
+_SSHD_INCLUDE = re.compile(r"\s*include\s+(.+)$", re.I)
 
 
 def _csv(raw: Optional[str]) -> Tuple[str, ...]:
@@ -36,13 +38,28 @@ def _ports(name: str, raw: Optional[str]) -> Tuple[int, ...]:
     return tuple(out)
 
 
-def _sshd_ports(path: str) -> Tuple[int, ...]:
+def _sshd_ports(path: str, seen: Optional[set] = None) -> Tuple[int, ...]:
+    seen = set() if seen is None else seen
+    real = os.path.realpath(path)
+    if real in seen:
+        return ()
+    seen.add(real)
+    ports = []  # type: List[int]
     try:
         with open(path, errors="replace") as f:
-            found = (_SSHD_PORT.match(line) for line in f)
-            return tuple(p for p in (int(m.group(1)) for m in found if m) if 0 < p < 65536)
+            for line in f:
+                m = _SSHD_PORT.match(line)
+                if m and 0 < int(m.group(1)) < 65536:
+                    ports.append(int(m.group(1)))
+                inc = _SSHD_INCLUDE.match(line.split("#", 1)[0].rstrip())
+                for pattern in inc.group(1).split() if inc else ():
+                    # sshd resolves relative includes against /etc/ssh, the main config's directory.
+                    pattern = os.path.join(os.path.dirname(real), pattern.strip(chr(34)))
+                    for found in sorted(glob.glob(pattern)):
+                        ports.extend(_sshd_ports(found, seen))
     except OSError:
-        return ()
+        pass
+    return tuple(ports)
 
 
 @dataclass
@@ -158,14 +175,22 @@ def load_state(state_dir) -> Optional[Tuple[str, List[str]]]:
     return mode, allow
 
 
-def save_state(state_dir, mode: str, allowlist: List[str]) -> bool:
+def load_ssh_ok(state_dir) -> list:
+    try:
+        items = json.loads((Path(state_dir) / STATE_FILE).read_text()).get("ssh_ok")
+    except (OSError, ValueError, AttributeError):
+        return []
+    return items if isinstance(items, list) else []
+
+
+def save_state(state_dir, mode: str, allowlist: List[str], ssh_ok: Optional[list] = None) -> bool:
     tmp = None
     try:
         directory = Path(state_dir)
         directory.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".state-")
         with os.fdopen(fd, "w") as f:
-            json.dump({"mode": mode, "allowlist": allowlist}, f)
+            json.dump({"mode": mode, "allowlist": allowlist, "ssh_ok": ssh_ok or []}, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, str(directory / STATE_FILE))

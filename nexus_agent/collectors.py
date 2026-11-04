@@ -16,6 +16,10 @@ log = logging.getLogger("nexus_agent.collectors")
 
 MAX_READ = 4 * 1024 * 1024
 RECHECK_SECONDS = 60
+SSH_SILENCE = 86400
+SSH_FRESH = 86400
+# Coarse filesystem clocks can date a brand new file slightly before the poll that preceded it.
+MTIME_SLACK = 2
 POLL_SECONDS = 1
 MAX_NET_KBPS = 1e9
 
@@ -25,11 +29,11 @@ KERN_LOG = "/var/log/kern.log"
 # short-iso, not cat: the ssh parser anchors on the "sshd[pid]:" header that -o cat removes.
 SSH_JOURNAL = ("-u", "ssh", "-u", "sshd", "-n", "0", "-f", "-o", "short-iso")
 KERNEL_JOURNAL = ("-k", "-n", "0", "-f", "-o", "short-iso")
+SSH_JOURNAL_LAST = ("-u", "ssh", "-u", "sshd", "-n", "1", "-o", "short-unix", "--no-pager", "-q")
 
 
 class FileTail:
-    def __init__(self, path, recheck: float = RECHECK_SECONDS, clock: Callable[[], float] = time.monotonic,
-                 from_start: bool = False):
+    def __init__(self, path, recheck: float = RECHECK_SECONDS, clock: Callable[[], float] = time.monotonic):
         self.path = str(path)
         self._recheck, self._clock = recheck, clock
         self._f = None
@@ -38,9 +42,11 @@ class FileTail:
         self._skip = False
         self._next = 0.0
         self._noted = False
-        self._open(at_end=not from_start)
+        self._seen = time.time()  # wall clock, to compare with file mtimes
+        self._open()
 
-    def _open(self, at_end: bool) -> None:
+    def _open(self, at_end: bool = True) -> None:
+        """Only a rotation seen by a live tail reads from 0: anything else at the path may be history, not news."""
         try:
             f = open(self.path, "rb", buffering=0)
         except OSError as exc:
@@ -61,7 +67,7 @@ class FileTail:
         if self._f is None:
             if self._clock() < self._next:
                 return []
-            self._open(at_end=False)
+            self._open()
             if self._f is None:
                 return []
         try:
@@ -69,6 +75,8 @@ class FileTail:
         except OSError:
             st = None
         rotated = st is not None and (st.st_dev, st.st_ino) != self._id
+        if st is not None and not rotated:
+            self._seen = time.time()
         if st is not None and not rotated and st.st_size < self._f.tell():  # copytruncate
             self._f.seek(0)
             self._buf, self._skip = b"", False
@@ -79,10 +87,14 @@ class FileTail:
                 lines.append(self._buf.decode("utf-8", "replace"))
             self._f.close()
             self._f = None
-            self._open(at_end=False)
+            self._open(at_end=not self._is_new_file(st))
             if self._f is not None:
                 lines += self._split(self._f.read(MAX_READ) or b"")
         return lines
+
+    def _is_new_file(self, st: os.stat_result) -> bool:
+        # A swapped symlink or an older file moved into place is existing content, whatever its inode says.
+        return not os.path.islink(self.path) and st.st_mtime >= self._seen - MTIME_SLACK
 
     def _split(self, chunk: bytes) -> List[str]:
         parts = (self._buf + chunk).split(b"\n")
@@ -104,6 +116,11 @@ class JournalTail:
         self._argv = [binary] + list(args)
         self._backoff, self._max_backoff = backoff, max_backoff
         self._proc = None  # type: Optional[subprocess.Popen]
+        self._closed = threading.Event()
+
+    def close(self) -> None:
+        self._closed.set()
+        self.terminate()
 
     def terminate(self) -> None:
         proc = self._proc
@@ -112,22 +129,33 @@ class JournalTail:
 
     def run(self, sink: Callable[[str], None], stop: threading.Event) -> None:
         delay = self._backoff
-        while not stop.is_set():
+        while not stop.is_set() and not self._closed.is_set():
             started = time.monotonic()
             try:
-                self._proc = subprocess.Popen(self._argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            except OSError as exc:
-                log.warning("cannot start %s: %s", self._argv[0], exc)
-            else:
-                self._pump(self._proc, sink)
-                rc = self._proc.wait()
-                if not stop.is_set():
-                    log.warning("%s exited with %s; restarting", self._argv[0], rc)
+                self._run_once(sink, stop)
+            except Exception:
+                log.exception("following %s failed", self._argv[0])
             if time.monotonic() - started >= self._max_backoff:
                 delay = self._backoff
             if stop.wait(delay):
                 return
             delay = min(delay * 2, self._max_backoff)
+
+    def _run_once(self, sink: Callable[[str], None], stop: threading.Event) -> None:
+        try:
+            self._proc = subprocess.Popen(self._argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log.warning("cannot start %s: %s", self._argv[0], exc)
+            return
+        try:
+            self._pump(self._proc, sink)
+        except Exception:
+            self._proc.kill()
+            self._proc.wait()
+            raise
+        rc = self._proc.wait()
+        if not stop.is_set() and not self._closed.is_set():
+            log.warning("%s exited with %s; restarting", self._argv[0], rc)
 
     @staticmethod
     def _pump(proc: subprocess.Popen, sink: Callable[[str], None]) -> None:
@@ -162,26 +190,40 @@ class LineQueue:
                 return
 
 
+def _mtime(path: str) -> Optional[float]:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _journal_last_line(binary: Optional[str]) -> Optional[float]:
+    if not binary:
+        return None
+    try:
+        out = subprocess.run([binary] + list(SSH_JOURNAL_LAST), capture_output=True, text=True, timeout=10).stdout
+        return float(out.split()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
 class LogCollectors:
     """Per source, exactly one reader: a file and a journal for the same source would double count failed logins."""
 
     def __init__(self, lines: LineQueue, ssh_logs: Iterable = SSH_LOGS, web_logs: Iterable = WEB_LOGS,
-                 kern_log=KERN_LOG, journalctl: Optional[str] = None, clock: Callable[[], float] = time.monotonic):
-        self._lines, self._clock = lines, clock
+                 kern_log=KERN_LOG, journalctl: Optional[str] = None, clock: Callable[[], float] = time.monotonic,
+                 journal_last: Optional[Callable[[], Optional[float]]] = None):
+        self._lines, self._clock, self._journalctl = lines, clock, journalctl
+        self._journal_last = journal_last or (lambda: _journal_last_line(journalctl))
         self.files = []  # type: List[Tuple[str, FileTail]]
         self.journals = []  # type: List[Tuple[str, JournalTail]]
-        self._pending_ssh = []  # type: List[str]
+        self._stop = None  # type: Optional[threading.Event]
+        self._poll_thread = None  # type: Optional[threading.Thread]
+        self._ssh_logs = [str(p) for p in ssh_logs]
+        self._ssh = None  # type: Optional[Tuple[str, Optional[str]]]
+        self._ssh_last_line = clock()
         self._next_ssh = clock() + RECHECK_SECONDS
-
-        ssh_logs = [str(p) for p in ssh_logs]
-        present = [p for p in ssh_logs if os.path.exists(p)]
-        if present:
-            self.files.append(("ssh", FileTail(present[0], clock=clock)))
-        elif journalctl:
-            self.journals.append(("ssh", JournalTail(SSH_JOURNAL, binary=journalctl)))
-        elif ssh_logs:
-            log.info("no ssh log found (%s); rechecking every %ds", ", ".join(ssh_logs), RECHECK_SECONDS)
-            self._pending_ssh = ssh_logs
+        self._select_ssh()
 
         for path in {os.path.realpath(str(p)): str(p) for p in web_logs}.values():
             self.files.append(("web", FileTail(path, clock=clock)))
@@ -191,29 +233,102 @@ class LogCollectors:
         else:
             self.files.append(("scan", FileTail(kern_log, clock=clock)))
 
+    def _select_ssh(self) -> None:
+        times = {p: _mtime(p) for p in self._ssh_logs}
+        cutoff = time.time() - SSH_FRESH
+        fresh = [p for p, t in times.items() if t is not None and t > cutoff]
+        existing = [p for p, t in times.items() if t is not None]
+        if fresh:
+            self._use_ssh(("file", fresh[0]))
+        elif self._journalctl:
+            self._use_ssh(("journal", None))
+        elif existing:
+            self._use_ssh(("file", existing[0]))
+        else:
+            log.info("ssh source: none yet (%s); rechecking every %ds", ", ".join(self._ssh_logs), RECHECK_SECONDS)
+
+    def _use_ssh(self, source: Tuple[str, Optional[str]]) -> None:
+        for name, tail in self.journals:
+            if name == "ssh":
+                tail.close()
+        self.journals = [j for j in self.journals if j[0] != "ssh"]
+        self.files = [f for f in self.files if f[0] != "ssh"]
+        kind, path = source
+        if kind == "file":
+            self.files.append(("ssh", FileTail(path, clock=self._clock)))
+        else:
+            journal = JournalTail(SSH_JOURNAL, binary=self._journalctl)
+            self.journals.append(("ssh", journal))
+            if self._stop is not None:
+                self._start_journal("ssh", journal)
+        log.info("ssh source: %s%s", kind, " " + path if path else "")
+        self._ssh = source
+        self._ssh_last_line = self._clock()
+
+    def _recheck_ssh(self) -> None:
+        now = self._clock()
+        if now < self._next_ssh:
+            return
+        self._next_ssh = now + RECHECK_SECONDS
+        if self._ssh is not None and now - self._ssh_last_line < SSH_SILENCE:
+            return
+        times = {("file", p): _mtime(p) for p in self._ssh_logs}  # type: Dict[Tuple[str, Optional[str]], Optional[float]]
+        if self._journalctl:
+            times[("journal", None)] = self._journal_last()
+        known = {k: t for k, t in times.items() if t is not None}
+        if not known:
+            return
+        best = max(known, key=lambda k: known[k])
+        if best != self._ssh and known[best] > known.get(self._ssh, float("-inf")):
+            self._use_ssh(best)
+
+    def ssh_idle_seconds(self) -> float:
+        return self._clock() - self._ssh_last_line
+
+    def _sink(self, source: str) -> Callable[[str], None]:
+        def sink(line: str) -> None:
+            if source == "ssh":
+                self._ssh_last_line = self._clock()
+            self._lines.put(source, line)
+        return sink
+
     def poll_files(self) -> None:
-        if self._pending_ssh and self._clock() >= self._next_ssh:
-            self._next_ssh = self._clock() + RECHECK_SECONDS
-            present = [p for p in self._pending_ssh if os.path.exists(p)]
-            if present:
-                self.files.append(("ssh", FileTail(present[0], clock=self._clock, from_start=True)))
-                self._pending_ssh = []
+        self._recheck_ssh()
         for source, tail in self.files:
             try:
+                sink = self._sink(source)
                 for line in tail.read_lines():
-                    self._lines.put(source, line)
+                    sink(line)
             except Exception:
                 log.exception("reading %s failed", tail.path)
 
-    def _poll_loop(self, stop: threading.Event) -> None:
+    def _poll_loop(self, stop) -> None:
         while not stop.wait(POLL_SECONDS):
-            self.poll_files()
+            try:
+                self.poll_files()
+            except Exception:
+                log.exception("polling logs failed")
+
+    def _start_poll(self, stop: threading.Event) -> None:
+        self._poll_thread = threading.Thread(target=self._poll_loop, args=(stop,), daemon=True, name="nexus-files")
+        self._poll_thread.start()
+
+    def _start_journal(self, source: str, tail: JournalTail) -> None:
+        threading.Thread(target=tail.run, args=(self._sink(source), self._stop), daemon=True,
+                         name="nexus-journal-" + source).start()
 
     def start(self, stop: threading.Event) -> None:
-        threading.Thread(target=self._poll_loop, args=(stop,), daemon=True, name="nexus-files").start()
+        self._stop = stop
+        self._start_poll(stop)
         for source, tail in self.journals:
-            sink = (lambda s: lambda line: self._lines.put(s, line))(source)
-            threading.Thread(target=tail.run, args=(sink, stop), daemon=True, name="nexus-journal-" + source).start()
+            self._start_journal(source, tail)
+
+    def ensure_poll_alive(self, stop: threading.Event) -> bool:
+        if self._poll_thread is None or self._poll_thread.is_alive():
+            return False
+        log.error("log poll thread died; restarting")
+        self._start_poll(stop)
+        return True
 
     def terminate(self) -> None:
         for _, tail in self.journals:
@@ -266,13 +381,14 @@ def sample_connections(ssh_ports: Iterable[int] = (22,), conns: Optional[list] =
             continue
         if c.status == psutil.CONN_SYN_RECV:
             syn_recv += 1
+            continue  # the source of a half-open socket can be spoofed
         ip = normalize_ip(c.raddr.ip)
         if ip is None:
             continue
         # A local port we do not listen on means we dialled out; that peer is not flooding us.
         if c.laddr.port in listening:
             per_ip[ip] = per_ip.get(ip, 0) + 1
-        if c.status == psutil.CONN_ESTABLISHED and c.laddr.port in ssh_ports:
+        if c.laddr.port in ssh_ports:
             active_ssh.add(ip)
     return per_ip, syn_recv, active_ssh, listening
 

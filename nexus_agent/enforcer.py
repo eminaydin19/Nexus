@@ -38,6 +38,7 @@ class ApplyResult:
     ok: bool
     simulated: bool
     detail: str = ""
+    ttl: int = field(default=0, compare=False)  # what was really applied, after caps and any breaker downgrade
 
 
 @dataclass
@@ -119,6 +120,7 @@ class Enforcer:
         self.max_new_per_5m = max_new_per_5m
         self.max_active = max_active
         self.capable = False
+        self._lift_pending = False
         self._open = False
         self._events: Deque[float] = deque()
         self._live: Dict[Key, Tuple[float, str]] = {}
@@ -199,7 +201,7 @@ class Enforcer:
             if not ok and "No such file" in out:
                 ok = True
             if ok:
-                self.capable, self._listening, self._open = False, None, False
+                self.capable, self._listening, self._open, self._lift_pending = False, None, False, False
                 self._live.clear()
                 self._events.clear()
             else:
@@ -271,6 +273,7 @@ class Enforcer:
                 result = ApplyResult(True, True, detail or "observe")
             else:
                 result = self._write(keys, addr, ttl, d.rule, now, detail)
+            result.ttl = ttl
             if result.ok and is_new and action != "rate_limit":
                 self._events.append(now)
             return result
@@ -295,7 +298,8 @@ class Enforcer:
         else:
             ok, rc, out = self._exec(["nft", "add", "element", "inet", TABLE, setname, items])
         if not ok:
-            return ApplyResult(False, False, out.strip()[:200] or "nft exit %d" % rc)
+            error = out.strip()[:200] or "nft exit %d" % rc
+            return ApplyResult(False, False, "%s: %s" % (detail, error) if detail else error)
         for k in todo:
             self._live[k] = (now + ttl, rule)
         return ApplyResult(True, False, detail)
@@ -309,12 +313,16 @@ class Enforcer:
         name = _SET_FOR[action] + fam
         return [(name, addr, p) for p in ports] if action == "block_port" else [(name, addr, 0)]
 
-    def active(self, limit: Optional[int] = MAX_ACTIVE_REPORT) -> List[BlockIn]:
+    def active(self, limit: Optional[int] = MAX_ACTIVE_REPORT, strict: bool = False) -> Optional[List[BlockIn]]:
+        """With strict, None means the kernel could not be read; otherwise that reads as no kernel blocks."""
         with self._lock:
             self._prune()
             now = self._clock()
+            kernel = self._read_kernel()
+            if kernel is None and strict:
+                return None
             rows = [(s, a, p, now + e, self._live.get((s, a, p), (0, "unknown"))[1], False)
-                    for s, a, p, e in self._read_kernel() or []]
+                    for s, a, p, e in kernel or []]
             if self.mode == "observe":
                 rows += [(s, a, p, v[0], v[1], True) for (s, a, p), v in self._sim.items()]
             grouped: Dict[Tuple[str, str, bool], BlockIn] = {}
@@ -369,30 +377,47 @@ class Enforcer:
             self._listening = wanted
             return True
 
-    def _flush_blocks(self) -> bool:
+    def _flush_blocks(self, quiet: bool = False) -> bool:
         script = "".join("flush set inet %s %s\n" % (TABLE, n) for n in BLOCK_SETS + ("meter4", "meter6"))
         rc, out = self._run(["nft", "-f", "-"], script)
         if rc == 127 or (rc != 0 and "No such file" in out):
             return True
         if rc != 0:
-            log.error("cannot lift kernel blocks (%s): %s", rc, out.strip())
+            if not quiet:
+                log.error("cannot lift kernel blocks (%s): %s", rc, out.strip())
             return False
         return True
+
+    def _lift(self) -> bool:
+        ok = self._flush_blocks(quiet=self._lift_pending)
+        if ok:
+            self._live.clear()
+            if self._lift_pending:
+                log.info("kernel blocks lifted after an earlier failure")
+        self._lift_pending = not ok
+        return ok
+
+    @property
+    def lift_pending(self) -> bool:
+        return self._lift_pending
+
+    def retry_lift(self) -> None:
+        with self._lock:
+            if self._lift_pending:
+                self._lift()
 
     def lift_leftovers(self) -> bool:
         """Drop blocks a previous run left in the kernel, without creating the table or enabling anything."""
         with self._lock:
-            ok = self._flush_blocks()
-            if ok:
-                self._live.clear()
-            return ok
+            return self._lift()
 
     def set_mode(self, mode: str) -> bool:
         if mode not in MODES:
             raise ValueError("invalid mode: %r" % (mode,))
         with self._lock:
             if mode == self.mode and (mode != "enforce" or self.capable):
-                return True
+                self.retry_lift()
+                return not self._lift_pending
             ok = True
             if mode == "enforce":
                 if not self.setup():
@@ -400,11 +425,10 @@ class Enforcer:
                     mode, ok = "observe", False
                 else:
                     self._sim.clear()
-            elif self.mode == "enforce":
+                    self._lift_pending = False
+            elif self.mode == "enforce" or self._lift_pending:
                 # Leaving enforce must lift blocks: a flipped-off switch that keeps dropping customers is worse than a miss.
-                ok = self._flush_blocks()
-                if ok:
-                    self._live.clear()
+                ok = self._lift()
             self._events.clear()
             self._open = False
             self.mode = mode

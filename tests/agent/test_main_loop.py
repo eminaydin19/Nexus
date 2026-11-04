@@ -22,7 +22,7 @@ from nexus_agent.protect import Protector
 from nexus_agent.rules import Decision, RuleConfig, RuleEngine
 
 IP = "203.0.113.9"
-SSH_FAIL = "Nov  4 13:22:11 web01 sshd[1234]: Failed password for root from %s port 4242 ssh2\n"
+SSH_FAIL = "sshd[1234]: Failed password for root from %s port 4242 ssh2\n"
 Addr = namedtuple("Addr", "ip port")
 Conn = namedtuple("Conn", "laddr raddr status")
 
@@ -50,14 +50,17 @@ class FakeNft:
 
     def __init__(self, clock):
         self.clock, self.elems, self.calls, self.setup_fails, self.flushes = clock, {}, [], self.start_failing, 0
+        self.list_fails, self.flush_fails = False, False
 
     def __call__(self, argv, input_text=None):
         self.calls.append((list(argv), input_text))
         if argv[:2] == ["nft", "-j"]:
-            return 0, self._list()
+            return (124, "timeout") if self.list_fails else (0, self._list())
         text = input_text if argv[:3] == ["nft", "-f", "-"] else " ".join(argv[1:])
         if self.setup_fails and "add table" in text:
             return 1, "Operation not permitted"
+        if self.flush_fails and "flush set inet nexus port4" in text:
+            return 1, "Error: busy"
         for line in text.splitlines():
             self._line(line)
         return 0, ""
@@ -123,7 +126,7 @@ class Rig:
         if mode != "observe":
             save_state(tmp_path, mode, [])
         self.agent = Agent(self.cfg, self.client, self.protector, self.engine, self.enforcer,
-                           can_enforce=can_enforce, clock=self.clock)
+                           can_enforce=can_enforce, clock=self.clock, mono=self.clock)
         self.agent.startup()
 
     def ssh_fails(self, ip=IP, n=10):
@@ -879,6 +882,7 @@ def test_enroll_failure_exits_nonzero_without_token(monkeypatch):
 
 def test_uninstall_tears_down(monkeypatch):
     calls = []
+    monkeypatch.setattr(agent_main.shutil, "which", lambda name: "/usr/sbin/nft")
     monkeypatch.setattr(Enforcer, "teardown", lambda self: calls.append(1) or True)
     assert main(["uninstall"]) == 0
     assert calls == [1]
@@ -913,3 +917,328 @@ def test_sigterm_exits_cleanly_without_teardown_and_never_logs_the_key(tmp_path)
     assert "super-secret-key" not in text
     assert "central" in text  # the failed send was logged
     assert "delete table" not in (trace.read_text() if trace.exists() else "")
+
+
+# -- fix round 1 --------------------------------------------------------------
+
+
+def test_allowlist_not_acked_when_kernel_read_fails_then_lifts_on_redelivery(enforcing):
+    enforcing.block()
+    enforcing.nft.list_fails = True
+    enforcing.agent.handle_command(Command(1, "allowlist", {"ips": [IP]}))
+    assert ("port4", IP, 22) in enforcing.nft.elems
+    assert enforcing.send()["acked_commands"] == []
+    enforcing.nft.list_fails = False
+    enforcing.agent.handle_command(Command(1, "allowlist", {"ips": [IP]}))
+    assert not enforcing.nft.elems
+    assert enforcing.send()["acked_commands"] == [1]
+
+
+def test_allowlist_not_acked_when_a_removal_fails_and_engine_state_stays(enforcing, monkeypatch):
+    enforcing.block()
+    forgot = []
+    monkeypatch.setattr(enforcing.enforcer, "remove", lambda ip: False)
+    monkeypatch.setattr(enforcing.engine, "forget", forgot.append)
+    enforcing.agent.handle_command(Command(1, "allowlist", {"ips": [IP]}))
+    assert enforcing.send()["acked_commands"] == [] and forgot == []
+
+
+def test_unblock_not_acked_when_real_kernel_read_fails(enforcing):
+    enforcing.block()
+    enforcing.nft.list_fails = True
+    enforcing.agent.handle_command(Command(1, "unblock", {"ip": IP}))
+    assert enforcing.send()["acked_commands"] == []
+    enforcing.nft.list_fails = False
+    enforcing.agent.handle_command(Command(1, "unblock", {"ip": IP}))
+    assert not enforcing.nft.elems
+
+
+def test_failed_lift_is_reported_and_next_tick_clears_the_block(enforcing, caplog):
+    enforcing.block()
+    enforcing.nft.flush_fails = True
+    enforcing.agent.handle_command(Command(1, "mode", {"mode": "off"}))
+    assert enforcing.enforcer.mode == "off" and enforcing.nft.elems
+    assert enforcing.send()["config"]["lift_pending"] is True
+    enforcing.agent.tick()
+    assert enforcing.nft.elems
+    enforcing.nft.flush_fails = False
+    enforcing.agent.tick()
+    assert not enforcing.nft.elems
+    assert enforcing.send()["config"]["lift_pending"] is False
+
+
+def test_old_failed_logins_never_reach_detection(enforcing):
+    old = time.strftime("%b %e %H:%M:%S", time.localtime(enforcing.clock() - 3600))
+    for _ in range(10):
+        enforcing.agent.lines.put("ssh", old + " web01 " + SSH_FAIL % IP)
+    enforcing.agent.tick()
+    assert not enforcing.nft.elems and not enforcing.agent._events
+    assert enforcing.send()["config"]["stale_lines"] == 10
+
+
+def test_current_timestamped_failed_logins_do_reach_detection(enforcing):
+    cur = time.strftime("%b %e %H:%M:%S", time.localtime(enforcing.clock()))
+    for _ in range(10):
+        enforcing.agent.lines.put("ssh", cur + " web01 " + SSH_FAIL % IP)
+    enforcing.agent.tick()
+    assert ("port4", IP, 22) in enforcing.nft.elems
+
+
+def test_old_web_lines_are_dropped_too(rig, monkeypatch):
+    fed = []
+    monkeypatch.setattr(rig.engine, "feed", lambda e: fed.append(e) or [])
+    fmt = '203.0.113.9 - - [%s] "GET /x HTTP/1.1" 404 5 "-" "ua"\n'
+    rig.agent.lines.put("web", fmt % time.strftime("%d/%b/%Y:%H:%M:%S +0000", time.gmtime(rig.clock() - 3600)))
+    rig.agent.lines.put("web", fmt % time.strftime("%d/%b/%Y:%H:%M:%S +0000", time.gmtime(rig.clock())))
+    rig.agent.tick()
+    assert len(fed) == 1
+
+
+class Idle:
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def ssh_idle_seconds(self):
+        return self.seconds
+
+
+def test_warns_once_when_ssh_sessions_exist_but_the_source_is_silent(rig, monkeypatch, caplog):
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22), est(22, "198.51.100.7")])
+    rig.agent.collectors = Idle(3601)
+    for _ in range(3):
+        rig.clock.t += 5
+        rig.agent.tick()
+    assert sum("no line" in r.message for r in caplog.records) == 1
+
+
+def test_no_silence_warning_without_sessions_or_within_the_hour(rig, monkeypatch, caplog):
+    rig.agent.collectors = Idle(99999)
+    rig.clock.t += 5
+    rig.agent.tick()
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22), est(22, "198.51.100.7")])
+    rig.agent.collectors = Idle(3599)
+    rig.clock.t += 5
+    rig.agent.tick()
+    assert "no line" not in caplog.text
+
+
+ACCEPTED = "sshd[1]: Accepted publickey for root from %s port 4242 ssh2\n"
+
+
+def test_accepted_line_through_agent_reaches_protector(rig, monkeypatch):
+    seen = []
+    real = rig.protector.note_ssh_ok
+    monkeypatch.setattr(rig.protector, "note_ssh_ok", lambda ip: seen.append(ip) or real(ip))
+    rig.agent.lines.put("ssh", ACCEPTED % IP)
+    rig.agent.tick()
+    assert seen == [IP] and rig.protector.reason(IP) == "recent-ssh"
+
+
+def test_accepted_line_in_off_mode_feeds_only_the_protector(tmp_path, monkeypatch):
+    rig = Rig(tmp_path, mode="off")
+    fed = []
+    monkeypatch.setattr(rig.engine, "feed", lambda e: fed.append(e) or [])
+    rig.agent.lines.put("ssh", ACCEPTED % IP)
+    rig.agent.lines.put("ssh", SSH_FAIL % "203.0.113.77")
+    rig.agent.tick()
+    assert rig.protector.reason(IP) == "recent-ssh"
+    assert fed == []
+
+
+def test_recent_ssh_survives_restart_and_write_is_throttled(tmp_path, monkeypatch):
+    rig = Rig(tmp_path)
+    writes = []
+    real = agent_main.save_state
+    monkeypatch.setattr(agent_main, "save_state", lambda *a: writes.append(a) or real(*a))
+    rig.agent.lines.put("ssh", ACCEPTED % IP)
+    rig.agent.tick()
+    assert writes == []  # within the 60s throttle
+    rig.clock.t += 60
+    rig.agent.tick()
+    assert len(writes) == 1
+    rig.clock.t += 60
+    rig.agent.tick()
+    assert len(writes) == 1  # unchanged
+    assert Rig(tmp_path).protector.reason(IP) == "recent-ssh"
+
+
+def test_recent_ssh_past_24h_is_pruned_on_load(tmp_path):
+    rig = Rig(tmp_path)
+    save_state(tmp_path, "observe", [], [[IP, rig.clock() - 1]])
+    assert Rig(tmp_path).protector.reason(IP) is None
+
+
+def test_no_state_write_when_nothing_changed(rig):
+    rig.clock.t += 120
+    rig.agent.tick()
+    assert load_state(rig.cfg.state_dir) is None
+
+
+def test_enforce_waits_for_a_successful_sample(tmp_path, monkeypatch):
+    def deny(kind):
+        raise psutil.AccessDenied()
+
+    save_state(tmp_path, "enforce", [])
+    monkeypatch.setattr(psutil, "net_connections", deny)
+    rig = Rig(tmp_path)
+    assert rig.enforcer.mode == "observe"
+    assert not any("add table" in s for s in rig.nft.scripts())
+    assert rig.send()["config"]["enforce_waiting_sample"] is True
+    assert load_state(tmp_path)[0] == "enforce"
+    rig.clock.t += 5
+    rig.agent.tick()
+    assert rig.enforcer.mode == "observe"
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22)])
+    rig.clock.t += 5
+    rig.agent.tick()
+    assert rig.enforcer.mode == "enforce"
+    assert rig.send()["config"]["enforce_waiting_sample"] is False
+    assert any("listening { 22 }" in s for s in rig.nft.scripts())
+
+
+def test_enforce_command_also_waits_for_a_sample_and_later_mode_cancels(tmp_path, monkeypatch):
+    def deny(kind):
+        raise psutil.AccessDenied()
+
+    monkeypatch.setattr(psutil, "net_connections", deny)
+    rig = Rig(tmp_path)
+    rig.agent.handle_command(Command(1, "mode", {"mode": "enforce"}))
+    assert rig.enforcer.mode == "observe" and load_state(tmp_path)[0] == "enforce"
+    rig.agent.handle_command(Command(2, "mode", {"mode": "observe"}))
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22)])
+    rig.clock.t += 5
+    rig.agent.tick()
+    assert rig.enforcer.mode == "observe"
+
+
+def test_spoofable_syn_recv_does_not_count_toward_conn_flood(enforcing, monkeypatch):
+    syn = Conn(Addr("198.51.100.1", 80), Addr(IP, 50000), "SYN_RECV")
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(80)] + [syn] * 300)
+    enforcing.clock.t += 5
+    enforcing.agent.tick()
+    assert not enforcing.nft.elems
+
+
+def test_network_refresh_updates_and_keeps_old_on_empty(rig, monkeypatch):
+    monkeypatch.setattr(agent_main, "read_gateways", lambda: ["192.0.2.2"])
+    monkeypatch.setattr(agent_main, "read_resolvers", lambda: ["192.0.2.3"])
+    monkeypatch.setattr(agent_main, "resolve_host", lambda host: ["192.0.2.1"] if host == "c.example" else [])
+    assert rig.agent._refresh_network() is True
+    assert rig.protector.reason("192.0.2.1") == "central"
+    monkeypatch.setattr(agent_main, "resolve_host", lambda host: [])
+    assert rig.agent._refresh_network() is False
+    assert rig.protector.reason("192.0.2.1") == "central"
+
+
+def test_network_loop_retries_empty_sooner_and_survives_errors(rig, monkeypatch):
+    results = iter([False, True, RuntimeError("x")])
+    waits = []
+
+    class Stop:
+        def wait(self, delay):
+            waits.append(delay)
+            return len(waits) > 3
+
+    def refresh():
+        r = next(results)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    monkeypatch.setattr(rig.agent, "_refresh_network", refresh)
+    rig.agent._network_loop(Stop())
+    assert waits == [300, 60, 300, 60]
+
+
+def test_breaker_event_is_not_simulated_in_observe(tmp_path):
+    rig = Rig(tmp_path, max_new=1)
+    rig.agent._apply([Decision("r", "203.0.113.%d" % n, "block_port", (22,), 3600, "e") for n in (1, 2)])
+    breaker = [e for e in rig.agent._events if e["rule"] == "breaker"]
+    assert len(breaker) == 1 and breaker[0]["simulated"] is False
+    down = [e for e in rig.agent._events if e["rule"] == "r"][1]
+    assert down["action"] == "rate_limit" and down["ttl"] == 600 and down["simulated"] is True
+
+
+def test_real_alert_decision_in_observe_is_not_simulated(rig):
+    for port in range(1000, 1020):
+        rig.agent.lines.put("scan", scan(IP, port))
+    rig.agent.tick()
+    e = rig.agent._events[-1]
+    assert (e["rule"], e["action"], e["simulated"], e["ok"]) == ("port_scan", "alert", False, True)
+
+
+def test_failed_downgraded_write_reports_rate_limit(tmp_path, monkeypatch):
+    rig = Rig(tmp_path, mode="enforce", max_new=1)
+    rig.agent._apply([Decision("r", "203.0.113.1", "block_port", (22,), 3600, "e")])
+    real = rig.nft.__call__
+    monkeypatch.setattr(rig.enforcer, "_run", lambda argv, input_text=None: (1, "Error: x") if "limit4" in " ".join(argv) else real(argv, input_text))
+    rig.agent._apply([Decision("r", "203.0.113.2", "block_port", (22,), 3600, "e")])
+    e = [e for e in rig.agent._events if e["rule"] == "r"][-1]
+    assert (e["action"], e["ttl"], e["ok"]) == ("rate_limit", 600, False)
+
+
+def test_clamped_enforce_is_reported_with_reason_and_capability_stays(tmp_path):
+    rig = Rig(tmp_path, max_mode="observe")
+    rig.agent.handle_command(Command(1, "mode", {"mode": "enforce"}))
+    p = rig.send()
+    assert p["config"]["enforce_rejected"] is True and p["config"]["enforce_rejected_reason"] == "max_mode"
+    assert p["capabilities"]["enforce"] is True
+    rig.agent.handle_command(Command(2, "mode", {"mode": "observe"}))
+    cfg = rig.send()["config"]
+    assert cfg["enforce_rejected"] is False and cfg["enforce_rejected_reason"] is None
+
+
+def test_persisted_enforce_clamped_at_startup_is_reported(tmp_path):
+    save_state(tmp_path, "enforce", [])
+    assert Rig(tmp_path, max_mode="observe").send()["config"]["enforce_rejected_reason"] == "max_mode"
+
+
+def test_send_loop_survives_error(rig, monkeypatch):
+    calls = []
+
+    class Stop:
+        def wait(self, delay):
+            return len(calls) >= 2
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(rig.agent, "send_once", boom)
+    rig.agent._send_loop(Stop())
+    assert len(calls) == 2
+
+
+def test_dead_send_thread_is_restarted_and_logged(rig, monkeypatch, caplog):
+    stop = threading.Event()
+    rig.agent.collectors = None
+    rig.agent._send_thread = threading.Thread(target=lambda: None)
+    rig.agent._send_thread.start()
+    rig.agent._send_thread.join()
+    rig.agent._check_threads(stop)
+    assert rig.agent._send_thread.is_alive()
+    assert "send thread" in caplog.text
+    stop.set()
+    rig.agent._send_thread.join(5)
+
+
+def test_enroll_prefers_env_token_and_requires_one(monkeypatch, capsys):
+    seen = {}
+    monkeypatch.setattr(agent_main.Client, "enroll",
+                        staticmethod(lambda url, token, host, allow_insecure=False: seen.update(t=token) or ("n", "k")))
+    monkeypatch.setenv("NEXUS_ENROLL_TOKEN", "env-tok")
+    assert main(["enroll", "--url", "https://c.example"]) == 0
+    assert seen["t"] == "env-tok"
+    assert main(["enroll", "--url", "https://c.example", "--token", "arg-tok"]) == 0
+    assert seen["t"] == "env-tok"
+    monkeypatch.delenv("NEXUS_ENROLL_TOKEN")
+    with pytest.raises(SystemExit) as exc:
+        main(["enroll", "--url", "https://c.example"])
+    assert "NEXUS_ENROLL_TOKEN" in str(exc.value.code)
+
+
+def test_uninstall_without_nft_exits_zero_with_message(monkeypatch, capsys):
+    monkeypatch.setattr(agent_main.shutil, "which", lambda name: None)
+    monkeypatch.setattr(Enforcer, "teardown", lambda self: pytest.fail("no nft to call"))
+    assert main(["uninstall"]) == 0
+    assert "nft" in capsys.readouterr().out

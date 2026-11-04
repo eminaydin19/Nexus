@@ -551,3 +551,55 @@ def test_active_limit_none_returns_everything():
         enf.apply(dec("block_all", ip="198.18.%d.%d" % (n // 256, n % 256), ports=()))
     assert len(enf.active()) == 1000
     assert len(enf.active(limit=None)) == 1100
+
+
+def test_failed_lift_stays_pending_until_a_retry_succeeds(caplog):
+    enf, _, _ = make(runner=FakeRunner({"flush set": (1, "Error: busy")}))
+    assert enf.set_mode("off") is False and enf.lift_pending
+    enf.retry_lift()
+    assert enf.set_mode("off") is False and enf.lift_pending
+    assert sum("cannot lift" in r.message for r in caplog.records) == 1
+    enf._run = FakeRunner()
+    assert enf.set_mode("off") is True and not enf.lift_pending
+
+
+def test_retry_lift_clears_and_logs_once(caplog):
+    caplog.set_level("INFO", "nexus_agent.enforcer")
+    enf, _, _ = make(runner=FakeRunner({"flush set": (1, "Error: busy")}))
+    enf.set_mode("observe")
+    enf._run = recovered = FakeRunner()
+    enf.retry_lift()
+    assert not enf.lift_pending
+    assert any("flush set" in (i or "") for i in recovered.inputs)
+    recovered.calls.clear()
+    enf.retry_lift()
+    assert recovered.calls == []
+    assert sum("lifted" in r.message for r in caplog.records) == 1
+
+
+def test_failed_startup_lift_is_pending_and_enforce_clears_it():
+    enf, _, _ = make("observe", FakeRunner({"flush set": (1, "Error: busy")}))
+    assert enf.lift_leftovers() is False and enf.lift_pending
+    enf._run = FakeRunner()
+    assert enf.set_mode("enforce") and not enf.lift_pending
+
+
+def test_active_strict_reports_unreadable_kernel():
+    enf, _, _ = make("observe", FakeRunner({"list table": (124, "timeout")}))
+    assert enf.active() == []
+    assert enf.active(limit=None, strict=True) is None
+
+
+def test_apply_reports_real_ttl_and_detail():
+    enf, _, _ = make("observe", max_new_per_5m=1)
+    assert enf.apply(dec(ip="203.0.113.1", ttl=90000)).ttl == 86400
+    res = enf.apply(dec(ip="203.0.113.2", ttl=3600))
+    assert res.detail.startswith("breaker") and res.ttl == 600
+
+
+def test_failed_downgraded_write_keeps_breaker_in_detail():
+    enf, runner, _ = make("enforce", max_new_per_5m=1)
+    enf.apply(dec(ip="203.0.113.1"))
+    runner.responses["limit4"] = (1, "Error: nope")
+    res = enf.apply(dec(ip="203.0.113.2"))
+    assert not res.ok and res.detail.startswith("breaker") and res.ttl == 600

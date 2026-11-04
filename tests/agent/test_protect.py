@@ -310,3 +310,36 @@ def test_cdn_refresh_rejects_invalid_or_tiny(p, monkeypatch, url, bad):
 def test_cdn_refresh_without_requests_returns_false(p, monkeypatch):
     monkeypatch.setitem(sys.modules, "requests", None)
     assert p.refresh_cdn_ranges() is False
+
+
+def test_ssh_ok_export_import_roundtrip_and_prune():
+    now = [1_700_000_000.0]
+    a = Protector(clock=lambda: now[0])
+    a.note_ssh_ok("203.0.113.9")
+    items = a.export_ssh_ok()
+    assert items == [["203.0.113.9", now[0] + 86400]]
+    b = Protector(clock=lambda: now[0])
+    b.import_ssh_ok(items)
+    assert b.reason("203.0.113.9") == "recent-ssh"
+    now[0] += 86401
+    assert b.export_ssh_ok() == []
+
+
+def test_ssh_ok_import_refuses_junk_and_far_future():
+    now = 1_700_000_000.0
+    p = Protector(clock=lambda: now)
+    p.import_ssh_ok([
+        ["203.0.113.1", now + 10 ** 7], ["203.0.113.2", now - 1], ["bad", now + 5], ["203.0.113.3", "x"],
+        ["203.0.113.4", True], "junk", ["203.0.113.5"], ["::ffff:203.0.113.6", now + 5],
+    ])
+    assert p.export_ssh_ok() == [["203.0.113.6", now + 5]]
+    p.import_ssh_ok("junk")
+    assert p.export_ssh_ok() == [["203.0.113.6", now + 5]]
+
+
+def test_update_network_replaces_and_keeps_old_value_on_empty():
+    p = Protector(central_ip=["192.0.2.1"], gateway=["192.0.2.2"], resolvers=["192.0.2.3"])
+    p.update_network(central_ip=[], gateway=["192.0.2.12"], resolvers=None)
+    assert p.reason("192.0.2.1") == "central"
+    assert p.reason("192.0.2.12") == "gateway" and p.reason("192.0.2.2") is None
+    assert p.reason("192.0.2.3") == "resolver"

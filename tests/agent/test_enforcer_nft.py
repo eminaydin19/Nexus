@@ -412,3 +412,18 @@ def test_lift_leftovers_clears_a_previous_runs_blocks_without_enabling(net):
     assert second.lift_leftovers()
     assert second.mode == "observe" and not second.capable
     assert net.connect(SRV4, 8080, CLI4)
+
+
+def test_failed_lift_retried_after_nft_recovers_really_lifts(net):
+    net.start_server(8080)
+    enf = net.enforcer()
+    assert enf.setup()
+    assert enf.apply(dec("block_all", ports=())).ok
+    real = enf._run
+    enf._run = lambda argv, input_text=None: (1, "Error: busy") if "flush set" in (input_text or "") else real(argv, input_text)
+    assert enf.set_mode("off") is False and enf.lift_pending
+    assert not net.connect(SRV4, 8080, CLI4)
+    enf._run = real
+    enf.retry_lift()
+    assert not enf.lift_pending
+    assert net.connect(SRV4, 8080, CLI4)
