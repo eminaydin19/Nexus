@@ -25,7 +25,7 @@ Hedef: Herkesin kendi Linux sunucularına kurabildiği, saldırganı kanıtla bu
 | SSH şifre deneme | `auth.log`, `secure`, journald | Yalnızca SSH portunda IP engeli |
 | Web login deneme | Web erişim logu | Yalnızca web portlarında IP engeli |
 | Açık taraması (`/.env`, `/.git/config` gibi) | Web erişim logu | Yalnızca web portlarında IP engeli |
-| Port taraması | Agent'ın nftables log kuralı | Tarayan IP'ye tüm portlarda kısa engel |
+| Port taraması | Agent'ın nftables log kuralı | Alarm. Aynı IP'den el sıkışmayla kanıtlı kötü davranış da varsa tüm portlarda kısa engel |
 | Bilinen web saldırı kalıpları (SQL injection, path traversal) | Web erişim logundaki URL | Yalnızca web portlarında IP engeli |
 | Küçük ve orta DDoS (tek IP veya az sayıda IP) | IP başına bağlantı sayısı, SYN-RECV sayısı | Hız sınırı, tam engel yok |
 | Büyük veya çok dağıtık DDoS | Trafik ve bağlantı sıçraması | Alarm ve Cloudflare önerisi, engel yok |
@@ -101,10 +101,11 @@ Bu bölüm tasarımın zorunlu parçasıdır. Her kuralın testi olmalıdır.
 **Engelin dar tutulması:**
 - Engel yalnızca saldırının geldiği porta uygulanır. Port taraması tek istisnadır, kısa süreli olur.
 - Tam engel için log kanıtı gerekir. Skor veya trafik hacmi tek başına engel sebebi olmaz.
+- Kapalı porta gelen SYN paketinin kaynağı sahte olabilir, bu yüzden tek başına kanıt sayılmaz. Tam engel için aynı IP'den tamamlanmış bağlantı gerektiren bir kanıt (SSH denemesi, web taraması, saldırı kalıbı, login denemesi) gerekir.
 - Hacim temelli tepki yalnızca hız sınırıdır. NAT arkasındaki müşteriler aynı IP'yi paylaşabilir.
 - IPv6'da engel `/64` bloğuna uygulanır.
 
-**Güvenilir IP:** Web'e başarılı login yapan veya son 1 saatte en az 20 başarılı (`2xx`/`3xx`) sayfa isteği yapıp hiç tarama izine rastlanmayan IP için eşikler 3 katına çıkar. Giriş yapmış müşteri şifresini birkaç kez yanlış yazınca engellenmez.
+**Güvenilir IP:** Son 1 saatte en az 20 başarılı (`2xx`/`3xx`) sayfa isteği yapıp hiç tarama izine rastlanmayan IP için web kurallarının ve `conn_flood` eşiği 3 katına çıkar. WordPress'te başarılı login (`/wp-login.php`'ye POST ve `302`) da güven sağlar. Diğer sitelerde durum kodu login'i kanıtlamaz, bu yüzden sayılmaz. SSH kurallarına web güveni uygulanmaz.
 
 **Süre:** Engeller her zaman sürelidir ve süre kernelde tutulur (nftables set `timeout`). Agent çökse bile engel kendiliğinden biter. Tekrarlayan saldırıda süre katlanır, üst sınır 24 saattir.
 
@@ -125,7 +126,7 @@ Eşikler 5 dakikalık kayan pencerede ve ayarlanabilirdir. Başlangıç değerle
 | `ssh_bruteforce` | 10 başarısız giriş | 1 saat |
 | `web_login_bruteforce` | Login yollarına 30 `401`/`403` | 15 dakika |
 | `web_probe` | Tarama listesinden 10 farklı yol ve `4xx` yanıt | 30 dakika |
-| `web_exploit` | 3 farklı saldırı kalıbı | 1 saat |
+| `web_exploit` | En az 2 ayrı istekte 3 farklı saldırı kalıbı | 1 saat |
 | `port_scan` | 60 saniyede 20 farklı kapalı port | 15 dakika |
 | `conn_flood` | IP başına 200 eşzamanlı bağlantı | Hız sınırı, 10 dakika |
 | `distributed_flood` | SYN-RECV > 500 veya yeni bağlantıda ani sıçrama | Yalnızca alarm |
