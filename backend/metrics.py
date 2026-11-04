@@ -51,7 +51,6 @@ def render(pipeline) -> str:
     nodes = list(pipeline.latest.values())
     family("nexus_nodes", "gauge", "Nodes currently known to Nexus.", [({}, len(nodes))])
     family("nexus_model_ready", "gauge", "1 when a trained model is loaded.", [({}, 1 if pipeline.ensemble.ready else 0)])
-    family("nexus_ws_clients", "gauge", "Connected dashboard websocket clients.", [({}, len(pipeline.clients))])
 
     for metric, help_text in (
         ("cpu_pct", "Latest CPU utilisation percent."),

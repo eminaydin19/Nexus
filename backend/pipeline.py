@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import time
 from datetime import timedelta
@@ -18,7 +17,6 @@ log = logging.getLogger(__name__)
 
 STORE_SPACING_SECONDS = 30.0
 PRUNE_INTERVAL_SECONDS = 3600.0
-SEND_TIMEOUT_SECONDS = 5.0
 
 
 def recent_anomalies(limit: int, node: str | None = None) -> list[dict]:
@@ -55,7 +53,6 @@ class Pipeline:
         self.ensemble = ensemble
         self.notifier = notifier
         self.latest: dict[str, dict] = {}
-        self.clients: set = set()
         self.last_poll: float | None = None
         self.last_error: str | None = None
         self._last_stored: dict[str, float] = {}
@@ -68,7 +65,6 @@ class Pipeline:
             "source": self.source.name,
             "interval": self.source.interval,
             "nodes": len(self.latest),
-            "clients": len(self.clients),
             "last_poll": self.last_poll,
             "last_error": self.last_error,
             "server_time": time.time(),
@@ -114,7 +110,6 @@ class Pipeline:
         payloads, anomalies = await asyncio.to_thread(self._score_and_store, snapshots)
         for payload in payloads:
             self.latest[payload["node"]] = payload
-        await self.broadcast({"type": "update", "nodes": payloads, "anomalies": anomalies})
         for anomaly in anomalies:
             counters.inc("nexus_anomalies_total", severity=anomaly["severity"])
             if anomaly["severity"] == "critical":
@@ -199,16 +194,3 @@ class Pipeline:
         db.query(Anomaly).filter(Anomaly.ts < cutoff).delete(synchronize_session=False)
         db.query(SecurityEvent).filter(SecurityEvent.ts < cutoff).delete(synchronize_session=False)
         db.commit()
-
-    async def broadcast(self, message: dict) -> None:
-        if not self.clients:
-            return
-        text = json.dumps(message)
-        dead = []
-        for ws in list(self.clients):
-            try:
-                await asyncio.wait_for(ws.send_text(text), SEND_TIMEOUT_SECONDS)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.clients.discard(ws)

@@ -4,6 +4,7 @@ import time
 from collections import deque
 from urllib.parse import urlsplit
 
+from starlette.datastructures import MutableHeaders
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -20,6 +21,33 @@ def client_ip(scope: Scope, trust_proxy: bool = False) -> str:
             return parts[-1]
     client = scope.get("client")
     return client[0] if client else "unknown"
+
+
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
+
+
+class SecurityHeadersMiddleware:
+    """Attacker text from logs reaches the panel, so a rendering mistake must still be unable to execute."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+                headers["X-Content-Type-Options"] = "nosniff"
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
 
 
 class RateLimitMiddleware:
@@ -98,12 +126,8 @@ class BasicAuthMiddleware:
         return user_ok and password_ok
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] not in ("http", "websocket") or scope["path"] in self._exempt or self._authorized(scope):
+        if scope["type"] != "http" or scope["path"] in self._exempt or self._authorized(scope):
             await self.app(scope, receive, send)
-            return
-        if scope["type"] == "websocket":
-            await receive()
-            await send({"type": "websocket.close", "code": 1008})
             return
         response = Response("Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Nexus"'})
         await response(scope, receive, send)

@@ -10,5 +10,9 @@ if [ "${1:-}" = "--e2e" ]; then
     shift
     exec tests/e2e/run.sh "$@"
 fi
+if [ "${1:-}" = "--panel" ]; then
+    shift
+    exec tests/e2e/panel.sh "$@"
+fi
 docker build -q -f Dockerfile.test -t nexus-test . >/dev/null
 docker run --rm -v "$PWD":/app -w /app nexus-test "$@"

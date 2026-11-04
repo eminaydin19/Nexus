@@ -7,3 +7,4 @@ data/
 *.db
 .env
 !nexus_agent/data/
+.panel-out/

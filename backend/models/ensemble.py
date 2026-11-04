@@ -70,9 +70,6 @@ class Ensemble:
             return self.threshold_override
         return float(self.bundle["threshold"]) if self.bundle else 0.0
 
-    def set_weights(self, weights: dict[str, float]) -> None:
-        self.weights = self._normalize(weights)
-
     def load(self, path: Path) -> bool:
         if not path.exists():
             return False

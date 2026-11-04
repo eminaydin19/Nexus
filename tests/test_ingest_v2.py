@@ -96,14 +96,9 @@ def test_unknown_node_and_bad_ip(client):
     assert client.post(f"/api/agents/{node}/unblock", json={"ip": "x"}).status_code == 400
 
 
-def test_events_stored_filtered_and_broadcast(client):
+def test_events_stored_and_filtered(client):
     node, key = make_node(client)
-    with client.websocket_connect("/ws") as ws:
-        ws.receive_json()
-        ingest(client, key, events=[EVENT, {**EVENT, "rule": "port_scan", "action": "alert", "simulated": True}])
-        msgs = [ws.receive_json(), ws.receive_json()]
-    ev = next(m for m in msgs if m["type"] == "events")
-    assert ev["node"] == node and len(ev["events"]) == 2
+    ingest(client, key, events=[EVENT, {**EVENT, "rule": "port_scan", "action": "alert", "simulated": True}])
     rows = client.get("/api/events", params={"node": node}).json()["events"]
     assert {r["rule"] for r in rows} == {"ssh_bruteforce", "port_scan"}
     sim = client.get("/api/events", params={"node": node, "simulated": True}).json()["events"]

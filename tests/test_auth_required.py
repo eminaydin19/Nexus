@@ -9,7 +9,6 @@ from fastapi.testclient import TestClient
 from backend.config import Settings
 from backend.security import OriginCheckMiddleware
 
-W = {"iforest": 0.25, "lstm": 0.45, "vae": 0.3, "transformer": 0.3}
 AUTH = {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
 
 
@@ -41,7 +40,7 @@ def test_app_refuses_to_start_without_password():
 
 @pytest.mark.parametrize(
     "method,path",
-    [("POST", "/api/retrain"), ("POST", "/api/weights"), ("GET", "/api/agents"), ("GET", "/metrics")],
+    [("POST", "/api/retrain"), ("POST", "/api/agents/tokens"), ("GET", "/api/agents"), ("GET", "/metrics")],
 )
 def test_admin_routes_require_auth(client, method, path):
     assert client.request(method, path).status_code == 401
@@ -57,13 +56,13 @@ def test_exempt_paths_stay_open(client):
 
 
 def test_cross_origin_post_rejected(authed):
-    r = authed.post("/api/weights", json=W, headers={"Origin": "https://evil.example"})
+    r = authed.post("/api/agents/tokens", json={}, headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
 
 
 def test_same_origin_and_originless_post_pass(authed):
-    assert authed.post("/api/weights", json=W, headers={"Origin": "http://testserver"}).status_code == 200
-    assert authed.post("/api/weights", json=W).status_code == 200
+    assert authed.post("/api/agents/tokens", json={}, headers={"Origin": "http://testserver"}).status_code == 200
+    assert authed.post("/api/agents/tokens", json={}).status_code == 200
 
 
 def test_cross_origin_get_is_not_blocked(authed):

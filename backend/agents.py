@@ -12,7 +12,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend.commands import enqueue
-from backend.db import Agent, EnrollToken, SessionLocal
+from backend.config import settings
+from backend.db import Agent, AgentCommand, EnrollToken, SessionLocal
 from backend.metrics import counters
 
 MODES = ("off", "observe", "enforce")
@@ -20,6 +21,8 @@ MAX_ALLOWLIST = 1000
 NODE_ID_PATTERN = r"^[A-Za-z0-9._:@-]+$"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:@-]")
 _ENROLL_ATTEMPTS = 5
+# Three of the agent's SEND_INTERVAL (5 s), so one lost report does not call a server offline.
+OFFLINE_AFTER_SECONDS = 15
 
 
 class InvalidToken(Exception):
@@ -102,6 +105,33 @@ def touch(db: Session, agent: Agent) -> None:
     db.commit()
 
 
+def pending_by_node(db: Session) -> dict[str, list[dict]]:
+    rows = db.query(AgentCommand).filter(AgentCommand.acked_at.is_(None)).order_by(AgentCommand.id)
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r.node_id, []).append({"id": r.id, "type": r.type, "payload": r.payload, "created_at": r.created_at})
+    return out
+
+
+def _status(agent: Agent, now: float) -> str:
+    if agent.revoked_at is not None:
+        return "revoked"
+    if agent.last_seen is None:
+        return "never"
+    return "online" if now - agent.last_seen <= OFFLINE_AFTER_SECONDS else "offline"
+
+
+def server_view(agent: Agent, now: float, pending_commands: dict[str, list[dict]]) -> dict:
+    """agent.mode is what was requested; config.mode is what the agent says it is really doing."""
+    reported = (agent.config or {}).get("mode")
+    return {
+        **agent.as_dict(),
+        "status": _status(agent, now),
+        "reported_mode": reported if reported in MODES else agent.mode,
+        "pending": pending_commands.get(agent.node_id, []),
+    }
+
+
 def _db():
     with SessionLocal() as db:
         yield db
@@ -145,12 +175,13 @@ def enroll_agent(body: EnrollRequest, db: Session = Depends(_db)):
 
 @router.post("/tokens")
 def create_token(body: TokenRequest, db: Session = Depends(_db)):
-    return {"token": create_enroll_token(db, body.name), "expires_in": 86400}
+    return {"token": create_enroll_token(db, body.name), "expires_in": 86400, "public_url": settings.public_url}
 
 
 @router.get("")
 def list_agents(db: Session = Depends(_db)):
-    return {"agents": [a.as_dict() for a in db.query(Agent).order_by(Agent.created_at)]}
+    now, commands = time.time(), pending_by_node(db)
+    return {"agents": [server_view(a, now, commands) for a in db.query(Agent).order_by(Agent.created_at)]}
 
 
 @router.delete("/{node_id}")

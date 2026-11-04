@@ -13,15 +13,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import torch
-from fastapi import (
-    Depends,
-    FastAPI,
-    HTTPException,
-    Query,
-    Response,
-    WebSocket,
-    WebSocketDisconnect,
-)
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -33,12 +25,14 @@ from backend.config import settings
 from backend.db import ActiveBlock, Agent, SecurityEvent, SessionLocal, init_db
 from backend.ingestion import build_source
 from backend.models.ensemble import Ensemble
+from backend.panel import router as panel_router
 from backend.pipeline import Pipeline, metric_history, recent_anomalies
 from backend.schema import NodeSnapshot
 from backend.security import (
     BasicAuthMiddleware,
     OriginCheckMiddleware,
     RateLimitMiddleware,
+    SecurityHeadersMiddleware,
 )
 from training.train import NotEnoughDataError, load_db, train
 
@@ -58,21 +52,6 @@ def _ships_with_agent(path: Path) -> bool:
         and path.suffix in AGENT_FILE_SUFFIXES
         and not any(part in AGENT_EXCLUDED_DIRS or part.startswith(".") for part in parts)
     )
-
-
-def recent_events(limit: int, node=None, rule=None, action=None, simulated=None) -> list[dict]:
-    with SessionLocal() as db:
-        query = db.query(SecurityEvent)
-        for column, value in (
-            (SecurityEvent.node_id, node),
-            (SecurityEvent.rule, rule),
-            (SecurityEvent.action, action),
-            (SecurityEvent.simulated, simulated),
-        ):
-            if value is not None:
-                query = query.filter(column == value)
-        rows = query.order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit)
-        return [row.as_dict() for row in rows]
 
 
 RETRAIN_CHECK_SECONDS = 3600
@@ -102,7 +81,6 @@ async def _continuous_learning() -> None:
                 continue
             bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_auto")
             pipeline.ensemble.install_bundle(bundle)
-            await pipeline.broadcast({"type": "retrain_complete", "status": "success"})
             log.info("Autonomous learning cycle complete. Models updated.")
         except NotEnoughDataError as e:
             log.info("Continuous learning skipped: %s", e)
@@ -158,7 +136,8 @@ async def lifespan(app: FastAPI):
                 await background
 
 
-app = FastAPI(title="Nexus", version="2.0.0", lifespan=lifespan)
+# The API docs pages load scripts from a CDN, which the panel's Content-Security-Policy forbids.
+app = FastAPI(title="Nexus", version="2.0.0", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 # Middleware order: the last one added is outermost, so requests hit the rate limiter first.
 
@@ -182,18 +161,14 @@ app.add_middleware(
     trust_proxy=settings.trust_proxy_headers,
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
+
 app.include_router(agents_router)
+app.include_router(panel_router)
 
 
 def _pipeline() -> Pipeline:
     return app.state.pipeline
-
-
-class Weights(BaseModel):
-    iforest: float = Field(ge=0)
-    lstm: float = Field(ge=0)
-    vae: float = Field(ge=0)
-    transformer: float = Field(default=0.30, ge=0)
 
 
 MAX_CLOCK_SKEW_SECONDS = 86400
@@ -350,15 +325,6 @@ async def model_info():
     return _pipeline().ensemble.info()
 
 
-@app.post("/api/weights")
-async def set_weights(body: Weights):
-    try:
-        _pipeline().ensemble.set_weights(body.model_dump())
-    except ValueError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    return {"weights": _pipeline().ensemble.weights}
-
-
 @app.post("/api/retrain")
 async def trigger_retrain():
     try:
@@ -367,7 +333,6 @@ async def trigger_retrain():
             raise HTTPException(400, "Not enough data to retrain.")
         bundle = await asyncio.to_thread(train, data, 12, 40, 500, 42, "online_manual")
         _pipeline().ensemble.install_bundle(bundle)
-        await _pipeline().broadcast({"type": "retrain_complete", "status": "success"})
         return {"status": "ok", "message": "Models successfully retrained and hot-swapped."}
     except Exception as e:
         log.exception("Manual retrain failed")
@@ -388,64 +353,14 @@ async def ingest_metrics(payload: IngestPayload, agent: Agent = Depends(require_
     )
     pipeline = _pipeline()
     await pipeline.handle([snap])
-    if events:
-        await pipeline.broadcast({"type": "events", "node": node_id, "events": events})
-        for event in filter(_slack_worthy, events):
-            await pipeline.notifier.notify_event(event)
+    for event in filter(_slack_worthy, events):
+        await pipeline.notifier.notify_event(event)
     return {"status": "ok", "commands": commands, "acked": bool(payload.acked_commands)}
-
-
-@app.get("/api/events")
-async def events(
-    node: str | None = None,
-    rule: str | None = None,
-    action: str | None = None,
-    simulated: bool | None = None,
-    limit: int = Query(100, ge=1, le=500),
-):
-    return {"events": await asyncio.to_thread(recent_events, limit, node, rule, action, simulated)}
-
-
-def _all_blocks() -> list[dict]:
-    with SessionLocal() as db:
-        return [b.as_dict() for b in db.query(ActiveBlock).order_by(ActiveBlock.node_id, ActiveBlock.until)]
-
-
-@app.get("/api/blocks")
-async def blocks():
-    return {"blocks": await asyncio.to_thread(_all_blocks)}
 
 
 @app.get("/metrics")
 async def prometheus_metrics():
     return Response(prom.render(_pipeline()), media_type=prom.CONTENT_TYPE)
-
-
-@app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    pipeline = _pipeline()
-    await ws.accept()
-    pipeline.clients.add(ws)
-    try:
-        history = await asyncio.to_thread(recent_anomalies, 50)
-        recent = await asyncio.to_thread(recent_events, 20)
-        await ws.send_text(
-            json.dumps(
-                {
-                    "type": "snapshot",
-                    "nodes": list(pipeline.latest.values()),
-                    "anomalies": history,
-                    "health": pipeline.health(),
-                    "events": recent,
-                }
-            )
-        )
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        pipeline.clients.discard(ws)
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
