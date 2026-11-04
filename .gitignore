@@ -6,3 +6,4 @@ venv/
 data/
 *.db
 .env
+!nexus_agent/data/
