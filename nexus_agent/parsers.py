@@ -47,6 +47,7 @@ class LogEvent:
     path: Optional[str] = None
     status: Optional[int] = None
     raw: str = ""
+    user_agent: Optional[str] = None  # raw is truncated, so the agent string is kept separately
 
 
 def normalize_ip(s: str) -> Optional[str]:
@@ -101,4 +102,5 @@ def parse_web_line(line: str, now: float) -> Optional[LogEvent]:
         return None
     req = _REQUEST.match(m.group(2))
     method, path = (req.group(1), req.group(2)) if req else (None, None)
-    return LogEvent("web", ip, now, method, path, int(m.group(3)), line[:MAX_RAW])
+    ua = m.group(5)
+    return LogEvent("web", ip, now, method, path, int(m.group(3)), line[:MAX_RAW], None if ua in (None, "-") else ua)

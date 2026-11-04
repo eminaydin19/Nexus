@@ -201,3 +201,15 @@ def test_xff_never_read():
 
 def test_dataclass_type():
     assert dataclasses.is_dataclass(LogEvent)
+
+
+def test_web_user_agent_kept_untruncated():
+    ua = "Mozilla/5.0 " + "x" * 400
+    line = '198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1 "-" "%s"' % ua
+    ev = parse_web_line(line, 0)
+    assert ev.user_agent == ua and len(ev.raw) == 300
+
+
+def test_web_user_agent_absent_is_none():
+    assert parse_web_line('198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1', 0).user_agent is None
+    assert parse_web_line('198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1 "-" "-"', 0).user_agent is None
