@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import ipaddress
+import json
+import logging
+import subprocess
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Deque, Dict, Iterable, List, Optional, Tuple
+
+from .rules import Decision
+
+log = logging.getLogger("nexus_agent.enforcer")
+
+Runner = Callable[..., Tuple[int, str]]
+
+TABLE = "nexus"
+CHAIN = "prerouting"
+MODES = ("off", "observe", "enforce")
+MAX_TTL = 86400
+BREAKER_TTL = 600
+BREAKER_WINDOW = 300
+MAX_ACTIVE_REPORT = 1000  # ingest limit on active_blocks
+MAX_PORTS_REPORT = 16  # BlockIn.ports limit
+V6_MASK = "ffff:ffff:ffff:ffff::"
+BLOCK_SETS = ("port4", "port6", "all4", "all6", "limit4", "limit6")
+_SET_FOR = {"block_port": "port", "block_all": "all", "rate_limit": "limit"}
+
+# (set, address text, port or 0) -> (until, rule)
+Key = Tuple[str, str, int]
+
+
+@dataclass
+class ApplyResult:
+    ok: bool
+    simulated: bool
+    detail: str = ""
+
+
+@dataclass
+class BlockIn:
+    ip: str
+    rule: str
+    ports: List[int]
+    until: float
+    simulated: bool = False
+
+
+def run_command(argv: List[str], input_text: Optional[str] = None, timeout: float = 10) -> Tuple[int, str]:
+    try:
+        p = subprocess.run(argv, input=input_text, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return 127, ""
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+    # stderr only on failure: nft warnings must not corrupt the JSON that callers parse.
+    return p.returncode, p.stdout if p.returncode == 0 else p.stdout + p.stderr
+
+
+def _address(ip: str) -> Tuple[str, str]:
+    """Return ("4"|"6", text); IPv6 collapses to its /64 network address."""
+    if not isinstance(ip, str) or "%" in ip:
+        raise ValueError("invalid ip: %r" % (ip,))
+    addr = ipaddress.ip_address(ip)
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.version == 4:
+        return "4", str(addr)
+    return "6", str(ipaddress.IPv6Network((addr, 64), strict=False).network_address)
+
+
+def _port(p: object) -> int:
+    if isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= 65535:
+        raise ValueError("invalid port: %r" % (p,))
+    return p
+
+
+def _setup_script(with_rules: bool) -> str:
+    lines = ["add table inet nexus"]
+    for fam, t in (("4", "ipv4_addr"), ("6", "ipv6_addr")):
+        lines.append("add set inet nexus port%s { type %s . inet_service; flags timeout; }" % (fam, t))
+        for name in ("all", "limit"):
+            lines.append("add set inet nexus %s%s { type %s; flags timeout; }" % (name, fam, t))
+        lines.append("add set inet nexus meter%s { type %s; flags dynamic,timeout; timeout 1m; size 65535; }" % (fam, t))
+    lines.append("add set inet nexus listening { type inet_service; }")
+    lines.append("add chain inet nexus prerouting { type filter hook prerouting priority -150; policy accept; }")
+    if with_rules:
+        s6 = "ip6 saddr & ffff:ffff:ffff:ffff::"
+        rate = "limit rate over 50/second"
+        lines += [
+            "add rule inet nexus prerouting ip saddr . tcp dport @port4 drop",
+            "add rule inet nexus prerouting %s . tcp dport @port6 drop" % s6,
+            "add rule inet nexus prerouting ip saddr @all4 drop",
+            "add rule inet nexus prerouting %s @all6 drop" % s6,
+            "add rule inet nexus prerouting ip saddr @limit4 ct state new "
+            "update @meter4 { ip saddr %s } drop" % rate,
+            "add rule inet nexus prerouting %s @limit6 ct state new "
+            "update @meter6 { %s %s } drop" % (s6, s6, rate),
+            'add rule inet nexus prerouting ct state new tcp flags syn tcp dport != @listening '
+            'limit rate 50/second log prefix "nexus-scan "',
+        ]
+    return "\n".join(lines) + "\n"
+
+
+class Enforcer:
+    def __init__(self, mode: str = "observe", runner: Optional[Runner] = None,
+                 clock: Callable[[], float] = time.time, max_new_per_5m: int = 50, max_active: int = 2000):
+        if mode not in MODES:
+            raise ValueError("invalid mode: %r" % (mode,))
+        self.mode = mode
+        self._run = runner or run_command
+        self._clock = clock
+        self.max_new_per_5m = max_new_per_5m
+        self.max_active = max_active
+        self.capable = False
+        self._open = False
+        self._events: Deque[float] = deque()
+        self._live: Dict[Key, Tuple[float, str]] = {}
+        self._sim: Dict[Key, Tuple[float, str]] = {}
+        self._listening: Optional[frozenset] = None
+        self._lock = threading.RLock()
+
+    # -- breaker -----------------------------------------------------------
+
+    def _cur(self) -> Dict[Key, Tuple[float, str]]:
+        return self._sim if self.mode == "observe" else self._live
+
+    def _prune(self) -> None:
+        now = self._clock()
+        while self._events and self._events[0] <= now - BREAKER_WINDOW:
+            self._events.popleft()
+        for d in (self._live, self._sim):
+            for k in [k for k, v in d.items() if v[0] <= now]:
+                del d[k]
+
+    def _full_active(self) -> int:
+        return sum(1 for k in self._cur() if not k[0].startswith("limit"))
+
+    @property
+    def breaker_open(self) -> bool:
+        with self._lock:
+            if self._open:
+                self._prune()
+                if len(self._events) < self.max_new_per_5m and self._full_active() < self.max_active:
+                    self._open = False
+            return self._open
+
+    # -- kernel ------------------------------------------------------------
+
+    def _exec(self, argv: List[str], input_text: Optional[str] = None) -> Tuple[bool, int, str]:
+        rc, out = self._run(argv, input_text)
+        return rc == 0 or "File exists" in out, rc, out
+
+    def setup(self) -> bool:
+        with self._lock:
+            rc, out = self._run(["nft", "-j", "list", "chain", "inet", TABLE, CHAIN])
+            if rc == 127:
+                self.capable = False
+                log.error("nft not found; firewall enforcement unavailable")
+                return False
+            has_rules = False
+            if rc == 0:
+                try:
+                    has_rules = any("rule" in e for e in json.loads(out).get("nftables", []))
+                except (ValueError, AttributeError):
+                    log.error("unreadable chain listing; assuming rules absent")
+            rc, out = self._run(["nft", "-f", "-"], _setup_script(not has_rules))
+            if rc != 0:
+                self.capable = False
+                log.error("nft setup failed (%s): %s", rc, out.strip())
+                return False
+            self.capable = True
+            self._listening = None
+            rows = self._read_kernel()
+            if rows is not None:
+                now = self._clock()
+                self._live = {
+                    (s, a, p): (now + exp, self._live.get((s, a, p), (0, "unknown"))[1]) for s, a, p, exp in rows
+                }
+            return True
+
+    def teardown(self) -> bool:
+        # Only for --uninstall: on agent stop the blocks must stay and expire in the kernel.
+        with self._lock:
+            ok, rc, out = self._exec(["nft", "delete", "table", "inet", TABLE])
+            if not ok and "No such file" in out:
+                ok = True
+            if ok:
+                self.capable, self._listening, self._open = False, None, False
+                self._live.clear()
+                self._events.clear()
+            else:
+                log.error("nft teardown failed (%s): %s", rc, out.strip())
+            return ok
+
+    def _read_kernel(self) -> Optional[List[Tuple[str, str, int, float]]]:
+        rc, out = self._run(["nft", "-j", "list", "table", "inet", TABLE])
+        if rc != 0:
+            log.warning("cannot list table inet %s (%s)", TABLE, rc)
+            return None
+        rows = []
+        try:
+            for item in json.loads(out).get("nftables", []):
+                s = item.get("set")
+                if not s or s.get("name") not in BLOCK_SETS:
+                    continue
+                for el in s.get("elem", []):
+                    el = el.get("elem", el) if isinstance(el, dict) else el
+                    val = el.get("val") if isinstance(el, dict) else el
+                    expires = float(el.get("expires", 0)) if isinstance(el, dict) else 0.0
+                    if isinstance(val, dict):
+                        addr, port = val["concat"]
+                    else:
+                        addr, port = val, 0
+                    rows.append((s["name"], str(ipaddress.ip_address(addr)), int(port), expires))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            log.error("unparseable nft output for table inet %s", TABLE)
+            return None
+        return rows
+
+    # -- public API --------------------------------------------------------
+
+    def apply(self, d: Decision) -> ApplyResult:
+        if d.action == "alert":
+            return ApplyResult(True, False, "alert")
+        if d.action not in _SET_FOR:
+            raise ValueError("unknown action: %r" % (d.action,))
+        fam, addr = _address(d.ip)
+        if isinstance(d.ttl, bool) or not isinstance(d.ttl, int) or d.ttl <= 0:
+            raise ValueError("invalid ttl: %r" % (d.ttl,))
+        ttl = min(d.ttl, MAX_TTL)
+        ports = sorted({_port(p) for p in d.ports})
+        if d.action == "block_port" and not ports:
+            raise ValueError("block_port needs at least one port")
+        with self._lock:
+            if self.mode == "off":
+                return ApplyResult(False, False, "off")
+            action, detail = d.action, ""
+            self._prune()
+            if action != "rate_limit":
+                keys = self._keys(action, fam, addr, ports)
+                is_new = any(k not in self._cur() for k in keys)
+                if self.breaker_open or (is_new and (
+                        len(self._events) + 1 > self.max_new_per_5m
+                        or self._full_active() + len(keys) > self.max_active)):
+                    self._open = True
+                    action, detail, ttl, ports = "rate_limit", "breaker: rate_limit", min(ttl, BREAKER_TTL), []
+            keys = self._keys(action, fam, addr, ports)
+            until = self._clock() + ttl
+            if self.mode == "observe":
+                is_new = any(k not in self._sim for k in keys)
+                self._sim.update({k: (until, d.rule) for k in keys})
+                ok, simulated, detail = True, True, detail or "observe"
+            else:
+                is_new = any(k not in self._live for k in keys)
+                elems = ", ".join(
+                    "%s . %d timeout %ds" % (addr, k[2], ttl) if k[2] else "%s timeout %ds" % (addr, ttl) for k in keys
+                )
+                ok, rc, out = self._exec(["nft", "add", "element", "inet", TABLE, keys[0][0], "{ %s }" % elems])
+                simulated = False
+                if not ok:
+                    return ApplyResult(False, False, out.strip()[:200] or "nft exit %d" % rc)
+                self._live.update({k: (until, d.rule) for k in keys})
+            if is_new and action != "rate_limit":
+                self._events.append(self._clock())
+            return ApplyResult(ok, simulated, detail)
+
+    @staticmethod
+    def _keys(action: str, fam: str, addr: str, ports: Iterable[int]) -> List[Key]:
+        name = _SET_FOR[action] + fam
+        return [(name, addr, p) for p in ports] if action == "block_port" else [(name, addr, 0)]
+
+    def active(self) -> List[BlockIn]:
+        with self._lock:
+            self._prune()
+            if self.mode == "observe":
+                now = self._clock()
+                rows = [(s, a, p, v[0] - now, v[1]) for (s, a, p), v in self._sim.items()]
+                simulated = True
+            elif self.mode == "enforce":
+                kernel = self._read_kernel() or []
+                now = self._clock()
+                rows = [(s, a, p, e, self._live.get((s, a, p), (0, "unknown"))[1]) for s, a, p, e in kernel]
+                simulated = False
+            else:
+                return []
+            grouped: Dict[Tuple[str, str], BlockIn] = {}
+            for s, a, p, exp, rule in rows:
+                b = grouped.setdefault((s, a), BlockIn(a, rule, [], now + exp, simulated))
+                b.until = max(b.until, now + exp)
+                if p and p not in b.ports:
+                    b.ports.append(p)
+            out = list(grouped.values())
+            for b in out:
+                b.ports = sorted(b.ports)[:MAX_PORTS_REPORT]
+            out.sort(key=lambda b: b.until, reverse=True)
+            return out[:MAX_ACTIVE_REPORT]
+
+    def remove(self, ip: str) -> bool:
+        fam, addr = _address(ip)
+        with self._lock:
+            for d in (self._sim, self._live):
+                for k in [k for k in d if k[1] == addr]:
+                    del d[k]
+            if self.mode != "enforce":
+                return True
+            rows = self._read_kernel()
+            if rows is None:
+                return False
+            ok = True
+            for s, a, p, _ in rows:
+                if a != addr or not s.endswith(fam):
+                    continue
+                elem = "%s . %d" % (a, p) if s.startswith("port") else a
+                done, rc, out = self._exec(["nft", "delete", "element", "inet", TABLE, s, "{ %s }" % elem])
+                if not done and "No such file" not in out:
+                    log.error("remove %s from %s failed (%s): %s", elem, s, rc, out.strip())
+                    ok = False
+            return ok
+
+    def update_listening(self, ports: Iterable[int]) -> bool:
+        wanted = frozenset(_port(p) for p in ports)
+        with self._lock:
+            if self.mode != "enforce" or wanted == self._listening:
+                return True
+            script = "flush set inet nexus listening\n"
+            if wanted:
+                script += "add element inet nexus listening { %s }\n" % ", ".join(map(str, sorted(wanted)))
+            rc, out = self._run(["nft", "-f", "-"], script)
+            if rc != 0:
+                log.error("update listening failed (%s): %s", rc, out.strip())
+                return False
+            self._listening = wanted
+            return True
+
+    def set_mode(self, mode: str) -> bool:
+        if mode not in MODES:
+            raise ValueError("invalid mode: %r" % (mode,))
+        with self._lock:
+            if mode == "enforce" and not self.setup():
+                log.error("cannot enforce; falling back to observe")
+                self.mode = "observe"
+                return False
+            # Leaving enforce keeps kernel elements on purpose: they expire on their own timeouts.
+            self.mode = mode
+            return True
