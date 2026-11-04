@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 # Create /etc/nexus-agent.env (chmod 600) containing:
 #   NEXUS_URL=https://nexus.example.com/api/ingest
-#   NEXUS_API_KEY=<INGEST_API_KEY>
+#   NEXUS_API_KEY=<per-server key from enrollment>
 #   NEXUS_NODE_ID=web-1
 EnvironmentFile=/etc/nexus-agent.env
 ExecStart=/opt/nexus-agent/venv/bin/python /opt/nexus-agent/agent.py --interval 5

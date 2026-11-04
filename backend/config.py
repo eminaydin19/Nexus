@@ -37,8 +37,6 @@ class Settings(BaseSettings):
     dashboard_user: str = ""
     dashboard_password: str = ""
 
-    # Shared secret agents must send in the X-API-Key header (or Bearer token) to /api/ingest.
-    ingest_api_key: str = ""
     # Per-client request budget per minute (0 disables rate limiting).
     rate_limit_per_minute: int = 300
     # Honour X-Forwarded-For. Only enable behind a trusted reverse proxy (e.g. Caddy).

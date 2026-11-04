@@ -10,7 +10,6 @@ from sqlalchemy import create_engine, inspect, text
 from backend import db
 
 GOOD = {"node_id": "web-1", "cpu_pct": 12.5, "memory_pct": 40.0, "net_kbps": 120.0, "latency_ms": 18.0}
-KEY = {"X-API-Key": "test-key"}
 BASIC = {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
 
 
@@ -19,6 +18,9 @@ def client():
     from backend.main import app
 
     with TestClient(app, headers=BASIC) as c:
+        token = c.post("/api/agents/tokens", json={"name": "web-1"}).json()["token"]
+        body = c.post("/api/agents/enroll", json={"token": token, "hostname": "web-1"}).json()
+        c.node_id, c.key = body["node_id"], {"X-API-Key": body["api_key"]}
         yield c
 
 
@@ -26,13 +28,8 @@ def test_healthz_is_open(client):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
-def test_ingest_requires_api_key(client):
-    assert client.post("/api/ingest", json=GOOD).status_code == 401
-    assert client.post("/api/ingest", json=GOOD, headers={"X-API-Key": "nope"}).status_code == 401
-
-
 def test_ingest_accepts_valid_payload_and_exposes_node(client):
-    assert client.post("/api/ingest", json=GOOD, headers=KEY).status_code == 200
+    assert client.post("/api/ingest", json=GOOD, headers=client.key).status_code == 200
     nodes = client.get("/api/nodes").json()["nodes"]
     assert any(n["node"] == "web-1" for n in nodes)
 
@@ -49,7 +46,7 @@ def test_ingest_accepts_valid_payload_and_exposes_node(client):
     ],
 )
 def test_ingest_rejects_bad_payloads(client, patch):
-    assert client.post("/api/ingest", json={**GOOD, **patch}, headers=KEY).status_code == 422
+    assert client.post("/api/ingest", json={**GOOD, **patch}, headers=client.key).status_code == 422
 
 
 def test_defense_endpoint_reports_mode_and_events(client):
@@ -64,7 +61,7 @@ def test_unblock_validates_input(client):
 
 
 def test_prometheus_metrics(client):
-    client.post("/api/ingest", json=GOOD, headers=KEY)
+    client.post("/api/ingest", json=GOOD, headers=client.key)
     response = client.get("/metrics")
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/plain")

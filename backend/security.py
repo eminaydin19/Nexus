@@ -22,32 +22,6 @@ def client_ip(scope: Scope, trust_proxy: bool = False) -> str:
     return client[0] if client else "unknown"
 
 
-class ApiKeyMiddleware:
-    """Requires a shared secret on machine-to-machine endpoints (X-API-Key or Bearer)."""
-
-    def __init__(self, app: ASGIApp, api_key: str, protected_paths: tuple[str, ...] = ("/api/ingest",)):
-        self.app = app
-        self._key = api_key.encode()
-        self._paths = protected_paths
-
-    def _authorized(self, scope: Scope) -> bool:
-        headers = dict(scope["headers"])
-        supplied = headers.get(b"x-api-key", b"")
-        if not supplied:
-            scheme, _, token = headers.get(b"authorization", b"").decode("latin-1").partition(" ")
-            if scheme.lower() == "bearer":
-                supplied = token.encode()
-        return secrets.compare_digest(supplied, self._key)
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"] in self._paths and not self._authorized(scope):
-            counters.inc("nexus_auth_failures_total")
-            response = JSONResponse({"detail": "invalid or missing API key"}, status_code=401)
-            await response(scope, receive, send)
-            return
-        await self.app(scope, receive, send)
-
-
 class RateLimitMiddleware:
     """Sliding-window limiter keyed by client IP. In-memory, so single-process only."""
 

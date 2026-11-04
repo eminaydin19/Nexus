@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 from fastapi import (
+    Depends,
     FastAPI,
     HTTPException,
     Query,
@@ -20,16 +21,16 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend import metrics as prom
+from backend.agents import require_agent, router as agents_router, touch
 from backend.alerting import SlackNotifier
-from backend.config import Settings, settings
-from backend.db import DefenseEvent, SessionLocal, init_db
+from backend.config import settings
+from backend.db import Agent, DefenseEvent, SessionLocal, init_db
 from backend.defense import ActiveDefender, SafeModeMiddleware
 from backend.ingestion import build_source
 from backend.models.ensemble import Ensemble
 from backend.pipeline import Pipeline, metric_history, recent_anomalies
 from backend.schema import NodeSnapshot
 from backend.security import (
-    ApiKeyMiddleware,
     BasicAuthMiddleware,
     OriginCheckMiddleware,
     RateLimitMiddleware,
@@ -166,8 +167,6 @@ async def lifespan(app: FastAPI):
 
     log.info("ingestion source: %s (every %ss)", source.name, source.interval)
     log.info("active defense: mode=%s firewall=%s", defender_instance.mode, defender_instance.firewall)
-    if not settings.ingest_api_key:
-        log.warning("INGEST_API_KEY is not set: /api/ingest accepts unauthenticated telemetry")
     task = asyncio.create_task(pipeline.run())
     housekeeping = asyncio.create_task(_housekeeping())
     continuous = asyncio.create_task(_continuous_learning())
@@ -187,20 +186,17 @@ app = FastAPI(title="Nexus", version="2.0.0", lifespan=lifespan)
 # Middleware order: the last one added is outermost, so requests hit the rate limiter first.
 app.add_middleware(SafeModeMiddleware, defender=defender_instance)
 
-if settings.ingest_api_key:
-    app.add_middleware(ApiKeyMiddleware, api_key=settings.ingest_api_key)
 
-def basic_exempt_paths(cfg: Settings) -> tuple[str, ...]:
-    # Ingest is only exempt while the API key middleware guards it; without a key it needs Basic auth.
-    ingest = ("/api/ingest",) if cfg.ingest_api_key else ()
-    return ("/healthz", *ingest, "/api/agents/enroll", "/install-agent.sh")
+def basic_exempt_paths() -> tuple[str, ...]:
+    # These authenticate with an agent key or enroll token instead of dashboard credentials.
+    return ("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh")
 
 
 app.add_middleware(
     BasicAuthMiddleware,
     username=settings.dashboard_user,
     password=settings.dashboard_password,
-    exempt_paths=basic_exempt_paths(settings),
+    exempt_paths=basic_exempt_paths(),
 )
 app.add_middleware(OriginCheckMiddleware, trust_proxy=settings.trust_proxy_headers)
 
@@ -209,6 +205,8 @@ app.add_middleware(
     per_minute=settings.rate_limit_per_minute,
     trust_proxy=settings.trust_proxy_headers,
 )
+
+app.include_router(agents_router)
 
 
 def _pipeline() -> Pipeline:
@@ -229,6 +227,11 @@ class IngestPayload(BaseModel):
     memory_pct: float = Field(ge=0, le=100)
     net_kbps: float = Field(ge=0, le=1e9)
     latency_ms: float = Field(ge=0, le=1e7)
+
+
+def _touch_agent(node_id: str) -> None:
+    with SessionLocal() as db:
+        touch(db, db.get(Agent, node_id))
 
 
 @app.get("/healthz")
@@ -286,7 +289,10 @@ async def trigger_retrain():
 
 
 @app.post("/api/ingest")
-async def ingest_metrics(payload: IngestPayload, request: Request):
+async def ingest_metrics(payload: IngestPayload, request: Request, agent: Agent = Depends(require_agent)):
+    if payload.node_id != agent.node_id:
+        raise HTTPException(403, "API key does not belong to this node")
+    await asyncio.to_thread(_touch_agent, agent.node_id)
     snap = NodeSnapshot(
         node_id=payload.node_id,
         timestamp=payload.timestamp or time.time(),

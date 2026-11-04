@@ -129,6 +129,50 @@ class DefenseEvent(Base):
         }
 
 
+class Agent(Base):
+    __tablename__ = "agents"
+
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[float] = mapped_column(Float)
+    first_seen: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_seen: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), default="observe")
+    max_mode: Mapped[str] = mapped_column(String(16), default="observe")
+    version: Mapped[str] = mapped_column(String(32), default="")
+    capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    allowlist: Mapped[list] = mapped_column(JSON, default=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "revoked_at": self.revoked_at,
+            "mode": self.mode,
+            "max_mode": self.max_mode,
+            "version": self.version,
+            "capabilities": self.capabilities,
+            "config": self.config,
+            "allowlist": self.allowlist,
+        }
+
+
+class EnrollToken(Base):
+    __tablename__ = "enroll_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float)
+    used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 # Columns added after the first release: (table, column, DDL type).
 _ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON"), ("anomalies", "transformer_score", "FLOAT")]
 

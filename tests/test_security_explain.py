@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from backend.explain import contributions
-from backend.security import ApiKeyMiddleware, RateLimitMiddleware, client_ip
+from backend.security import RateLimitMiddleware, client_ip
 
 
 def _app(*layers):
@@ -13,19 +13,6 @@ def _app(*layers):
     app.post("/api/ingest")(lambda: {"ok": True})
     app.get("/api/nodes")(lambda: {"ok": True})
     return app
-
-
-def test_api_key_required_for_ingest():
-    client = TestClient(_app((ApiKeyMiddleware, {"api_key": "s3cret"})))
-    assert client.post("/api/ingest").status_code == 401
-    assert client.post("/api/ingest", headers={"X-API-Key": "wrong"}).status_code == 401
-    assert client.post("/api/ingest", headers={"X-API-Key": "s3cret"}).status_code == 200
-    assert client.post("/api/ingest", headers={"Authorization": "Bearer s3cret"}).status_code == 200
-
-
-def test_api_key_does_not_touch_other_paths():
-    client = TestClient(_app((ApiKeyMiddleware, {"api_key": "s3cret"})))
-    assert client.get("/api/nodes").status_code == 200
 
 
 def test_rate_limit_returns_429_with_retry_after():

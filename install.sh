@@ -40,13 +40,9 @@ AWS_REGION=${AWS_REGION:-eu-central-1}
 # 3. Create .env file
 echo "[+] .env dosyası oluşturuluyor..."
 
-# Generate a random API key for the ingest endpoint
-RANDOM_API_KEY=$(openssl rand -hex 16)
-
 cat <<EOF > .env
 # --- NEXUS AYARLARI ---
 HTTP_BIND=80
-INGEST_API_KEY=$RANDOM_API_KEY
 INGESTION_SOURCE=cloudwatch
 
 # --- AWS CLOUDWATCH AYARLARI ---
@@ -75,5 +71,4 @@ echo " KURULUM TAMAMLANDI! 🚀 "
 echo "=============================================="
 echo "- Arayüze erişmek için tarayıcıda sunucunun IP adresine gidin: http://$(curl -s ifconfig.me)"
 echo "- Sistem sadece gerçek AWS CloudWatch verilerini kullanacak şekilde ayarlandı."
-echo "- Güvenlik API Anahtarı (Agent'lar için): $RANDOM_API_KEY"
 echo "=============================================="
