@@ -1,0 +1,10 @@
+Nov  4 10:00:01 web1 sshd[1201]: Failed password for root from 203.0.113.9 port 51022 ssh2
+Nov  4 10:00:03 web1 sshd[1203]: Failed password for invalid user admin from 203.0.113.9 port 51030 ssh2
+Nov  4 10:00:05 web1 sshd[1205]: Invalid user oracle from 198.51.100.23 port 40112
+Nov  4 10:00:07 web1 sshd[1207]: Failed publickey for deploy from 198.51.100.23 port 40120 ssh2: RSA SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG
+Nov  4 10:00:09 web1 sshd[1209]: Connection closed by authenticating user root 203.0.113.9 port 51044 [preauth]
+Nov  4 10:00:11 web1 sshd[1211]: Failed password for root from 2001:db8::5 port 51050 ssh2
+Nov  4 10:00:13 web1 sshd[1213]: Accepted publickey for deploy from 192.0.2.10 port 50000 ssh2: ED25519 SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG
+Nov  4 10:00:15 web1 sshd[1215]: pam_unix(sshd:auth): authentication failure; logname= uid=0 euid=0 tty=ssh ruser= rhost=203.0.113.9  user=root
+Nov  4 10:00:17 web1 CRON[1300]: pam_unix(cron:session): session opened for user root(uid=0) by (uid=0)
+Nov  4 10:00:19 web1 sshd[1217]: Received disconnect from 203.0.113.9 port 51022:11: Bye Bye [preauth]

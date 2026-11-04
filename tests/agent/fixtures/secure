@@ -1,0 +1,5 @@
+2026-11-04T10:00:01.123456+00:00 db1 sshd-session[2201]: Failed password for root from 203.0.113.44 port 33022 ssh2
+2026-11-04T10:00:02.223456+00:00 db1 sshd-session[2202]: Accepted password for backup from 192.0.2.77 port 33100 ssh2
+2026-11-04T10:00:03.323456+00:00 db1 sshd-session[2203]: Accepted keyboard-interactive/pam for admin from 192.0.2.77 port 33102 ssh2
+2026-11-04T10:00:04.423456+00:00 db1 sshd-session[2204]: Invalid user test from 198.51.100.200 port 60001
+2026-11-04T10:00:05.523456+00:00 db1 systemd[1]: Started Session 42 of User root.
