@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 MAX_LINE = 16 * 1024
 MAX_RAW = 300
@@ -36,6 +36,14 @@ _WEB = re.compile(
     r"(?: " + _QUOTED + " " + _QUOTED + r")?\Z"
 )
 _REQUEST = re.compile(r"([A-Z]+) (\S+)(?: HTTP/\d(?:\.\d)?)?\Z")
+
+# Anchored like the sshd header: a local `logger` line carries its own tag instead of "kernel:", so it cannot pose as a scan.
+_SCAN_HEAD = re.compile(
+    r"(?:(?:[A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ )?"
+    r"(?:kernel: (?:\[ *\d+\.\d+\] )?)?nexus-scan "
+)
+_SCAN_SRC = re.compile(r" SRC=(\S+)")
+_SCAN_DPT = re.compile(r" DPT=(\d{1,5})(?: |\Z)")
 
 
 @dataclass(frozen=True)
@@ -104,3 +112,19 @@ def parse_web_line(line: str, now: float) -> Optional[LogEvent]:
     method, path = (req.group(1), req.group(2)) if req else (None, None)
     ua = m.group(5)
     return LogEvent("web", ip, now, method, path, int(m.group(3)), line[:MAX_RAW], None if ua in (None, "-") else ua)
+
+
+def parse_scan_line(line: str) -> Optional[Tuple[str, int]]:
+    line = _prepare(line)
+    if line is None:
+        return None
+    head = _SCAN_HEAD.match(line)
+    if head is None:
+        return None
+    src, dpt = _SCAN_SRC.search(line, head.end() - 1), _SCAN_DPT.search(line, head.end() - 1)
+    if src is None or dpt is None:
+        return None
+    ip, port = normalize_ip(src.group(1)), int(dpt.group(1))
+    if ip is None or not 1 <= port <= 65535:
+        return None
+    return ip, port

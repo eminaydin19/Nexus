@@ -309,7 +309,7 @@ class Enforcer:
         name = _SET_FOR[action] + fam
         return [(name, addr, p) for p in ports] if action == "block_port" else [(name, addr, 0)]
 
-    def active(self) -> List[BlockIn]:
+    def active(self, limit: Optional[int] = MAX_ACTIVE_REPORT) -> List[BlockIn]:
         with self._lock:
             self._prune()
             now = self._clock()
@@ -327,7 +327,7 @@ class Enforcer:
             for b in out:
                 b.ports = sorted(b.ports)[:MAX_PORTS_REPORT]
             out.sort(key=lambda b: b.until, reverse=True)
-            return out[:MAX_ACTIVE_REPORT]
+            return out[:limit]
 
     def remove(self, ip: str) -> bool:
         fam, addr = _address(ip)
@@ -379,10 +379,20 @@ class Enforcer:
             return False
         return True
 
+    def lift_leftovers(self) -> bool:
+        """Drop blocks a previous run left in the kernel, without creating the table or enabling anything."""
+        with self._lock:
+            ok = self._flush_blocks()
+            if ok:
+                self._live.clear()
+            return ok
+
     def set_mode(self, mode: str) -> bool:
         if mode not in MODES:
             raise ValueError("invalid mode: %r" % (mode,))
         with self._lock:
+            if mode == self.mode and (mode != "enforce" or self.capable):
+                return True
             ok = True
             if mode == "enforce":
                 if not self.setup():

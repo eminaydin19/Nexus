@@ -501,3 +501,53 @@ def test_breaker_downgrade_does_not_shorten_existing_limit():
     enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}), max_new_per_5m=0)
     res = enf.apply(dec(ttl=3600))
     assert res.detail == "breaker: rate_limit" and writes(runner) == []
+
+
+def test_set_mode_unchanged_is_a_noop_keeping_breaker_state():
+    enf, runner, _ = make("observe", max_new_per_5m=1)
+    enf.apply(dec(ip="203.0.113.1"))
+    enf.apply(dec(ip="203.0.113.2"))
+    assert enf.breaker_open
+    assert enf.set_mode("observe") is True and enf.breaker_open
+    assert runner.calls == []
+
+
+def test_set_mode_enforce_unchanged_keeps_kernel_and_breaker():
+    enf, runner, _ = make("observe", max_new_per_5m=1)
+    assert enf.set_mode("enforce")
+    enf.apply(dec(ip="203.0.113.1"))
+    enf.apply(dec(ip="203.0.113.2"))
+    assert enf.breaker_open
+    n = len(runner.calls)
+    assert enf.set_mode("enforce") is True and enf.breaker_open
+    assert len(runner.calls) == n
+
+
+def test_set_mode_enforce_still_runs_setup_when_not_capable():
+    enf, runner, _ = make("enforce")
+    assert not enf.capable
+    assert enf.set_mode("enforce") is True and enf.capable
+    assert any("add table" in (i or "") for i in runner.inputs)
+
+
+def test_lift_leftovers_flushes_without_enabling():
+    enf, runner, _ = make("observe")
+    assert enf.lift_leftovers() is True
+    assert enf.mode == "observe" and not enf.capable
+    script = next(i for i in runner.inputs if i)
+    assert all("flush set inet nexus %s\n" % n in script for n in ("port4", "all6", "limit4", "meter6"))
+    assert "add " not in script
+
+
+def test_lift_leftovers_without_nft_or_table_is_fine():
+    assert make("observe", FakeRunner({"flush": (127, "")}))[0].lift_leftovers() is True
+    assert make("observe", FakeRunner({"flush": NO_TABLE}))[0].lift_leftovers() is True
+    assert make("observe", FakeRunner({"flush": (1, "denied")}))[0].lift_leftovers() is False
+
+
+def test_active_limit_none_returns_everything():
+    enf, _, clock = make("observe", max_new_per_5m=10 ** 6, max_active=10 ** 6)
+    for n in range(1100):
+        enf.apply(dec("block_all", ip="198.18.%d.%d" % (n // 256, n % 256), ports=()))
+    assert len(enf.active()) == 1000
+    assert len(enf.active(limit=None)) == 1100

@@ -400,3 +400,15 @@ def test_scan_log_rule_inbound_only(net):
     assert not scan_logged(net, lambda: ns_run(SRV, sys.executable, "-c", CLIENT, "127.0.0.1", "8080", "127.0.0.1"))
     assert enf.update_listening([8080])
     assert not scan_logged(net, lambda: net.connect(SRV4, 8080, CLI4))
+
+
+def test_lift_leftovers_clears_a_previous_runs_blocks_without_enabling(net):
+    net.start_server(8080)
+    first = net.enforcer()
+    assert first.setup()
+    assert first.apply(dec("block_all", ports=())).ok
+    assert not net.connect(SRV4, 8080, CLI4)
+    second = net.enforcer("observe")
+    assert second.lift_leftovers()
+    assert second.mode == "observe" and not second.capable
+    assert net.connect(SRV4, 8080, CLI4)
