@@ -268,19 +268,6 @@ def _apply_ingest(node_id: str, payload: IngestPayload, now: float) -> tuple[lis
         return [r.as_dict() for r in rows], pending(db, node_id)
 
 
-def _slack_shape(node_id: str, event: dict, payload: IngestPayload) -> dict:
-    return {
-        "node": node_id,
-        "severity": "critical",
-        "culprit": event["rule"],
-        "scores": {"ensemble": 1.0},
-        "cpu_pct": payload.cpu_pct,
-        "memory_pct": payload.memory_pct,
-        "net_kbps": payload.net_kbps,
-        "latency_ms": payload.latency_ms,
-    }
-
-
 def _slack_worthy(event: dict) -> bool:
     if event["action"] == "alert":
         return event["rule"] == "distributed_flood"
@@ -358,7 +345,7 @@ async def ingest_metrics(payload: IngestPayload, agent: Agent = Depends(require_
     if events:
         await pipeline.broadcast({"type": "events", "node": node_id, "events": events})
         for event in filter(_slack_worthy, events):
-            await pipeline.notifier.notify(_slack_shape(node_id, event, payload))
+            await pipeline.notifier.notify_event(event)
     return {"status": "ok", "commands": commands, "acked": bool(payload.acked_commands)}
 
 

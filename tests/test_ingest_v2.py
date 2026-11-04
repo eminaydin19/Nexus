@@ -211,16 +211,62 @@ def test_critical_events_forwarded_to_slack(client, monkeypatch):
     node, key = make_node(client)
     sent = []
 
-    async def fake(anomaly):
-        sent.append(anomaly)
+    async def fake(event):
+        sent.append(event)
         return True
 
-    monkeypatch.setattr(client.app.state.pipeline.notifier, "notify", fake)
+    monkeypatch.setattr(client.app.state.pipeline.notifier, "notify_event", fake)
     ingest(client, key, events=[
         {**EVENT, "simulated": True},
         {**EVENT, "action": "alert", "rule": "other"},
         {**EVENT, "action": "alert", "rule": "distributed_flood"},
         {**EVENT, "action": "rate_limit", "rule": "http_flood"},
     ])
-    assert [a["culprit"] for a in sent] == ["distributed_flood", "http_flood"]
-    assert all(a["node"] == node and a["severity"] == "critical" for a in sent)
+    assert [e["rule"] for e in sent] == ["distributed_flood", "http_flood"]
+    assert all(e["node_id"] == node for e in sent)
+
+
+def _real_notifier(monkeypatch):
+    import asyncio
+
+    from backend.alerting import SlackNotifier
+
+    texts = []
+
+    async def post(self, text):
+        texts.append(text)
+        return True
+
+    monkeypatch.setattr(SlackNotifier, "_post", post)
+    return SlackNotifier("http://slack.invalid", 900), texts, asyncio.run
+
+
+def _ev(rule, **kw):
+    return {"node_id": "n", "rule": rule, "action": "block_port", "ip": "203.0.113.9", "ports": [22], "ttl": 300,
+            "evidence": "x", **kw}
+
+
+def test_event_cooldown_is_per_node_and_rule(monkeypatch):
+    n, texts, run = _real_notifier(monkeypatch)
+    assert run(n.notify_event(_ev("ssh_bruteforce")))
+    assert run(n.notify_event(_ev("distributed_flood", action="alert")))
+    assert not run(n.notify_event(_ev("ssh_bruteforce")))
+    anomaly = {"node": "n", "severity": "critical", "culprit": "cpu", "scores": {"ensemble": 0.9},
+               "cpu_pct": 1, "memory_pct": 1, "net_kbps": 1, "latency_ms": 1}
+    assert run(n.notify(anomaly))
+    assert len(texts) == 3
+
+
+def test_event_slack_text_has_no_score_and_escapes_evidence(monkeypatch):
+    n, texts, run = _real_notifier(monkeypatch)
+    run(n.notify_event(_ev("r", evidence="<!channel> a&b")))
+    assert "Score" not in texts[0]
+    assert "&lt;!channel&gt; a&amp;b" in texts[0] and "<!channel>" not in texts[0]
+
+
+def test_invalid_max_mode_ignored(client):
+    node, key = make_node(client)
+    ingest(client, key, config={"max_mode": "enforce"})
+    for bad in ("root", ["enforce"], 5, None):
+        assert ingest(client, key, config={"max_mode": bad}).status_code == 200
+    assert client.put(f"/api/agents/{node}/mode", json={"mode": "enforce"}).status_code == 200
