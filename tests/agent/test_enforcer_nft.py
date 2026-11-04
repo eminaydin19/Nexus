@@ -287,3 +287,116 @@ def test_rate_limit_is_per_ip_and_not_a_block(net):
     out = ns_run(CLI, sys.executable, "-c", FLOOD, CLI4, SRV4, CLI4B).stdout.split()
     # a shared limit would starve the second address while the first one floods
     assert 0 < int(out[0]) < 100 and out[1] == "True"
+
+
+def left(enf, ip):
+    return {(b.ip, b.kind): b.until - time.time() for b in enf.active()}[(ip, "block_all")]
+
+
+def test_leaving_enforce_really_lifts_blocks(net):
+    net.start_server(22, 8080)
+    enf = net.enforcer()
+    assert enf.setup()
+    assert enf.apply(dec("block_all", ports=())).ok
+    assert not net.connect(SRV4, 8080, CLI4)
+    assert enf.set_mode("observe")
+    assert net.connect(SRV4, 8080, CLI4) and enf.active() == []
+    assert enf.set_mode("enforce")
+    assert enf.apply(dec("block_all", ports=())).ok and not net.connect(SRV4, 8080, CLI4)
+    assert enf.set_mode("off")
+    assert net.connect(SRV4, 8080, CLI4)
+
+
+def test_remove_lifts_kernel_block_even_when_not_enforcing(net):
+    net.start_server(8080)
+    first = net.enforcer()
+    assert first.setup() and first.apply(dec("block_all", ports=())).ok
+    for mode in ("observe", "off"):
+        other = net.enforcer(mode)
+        assert [b.ip for b in other.active()] == [CLI4]
+        assert not net.connect(SRV4, 8080, CLI4)
+        assert other.remove(CLI4)
+        assert net.connect(SRV4, 8080, CLI4)
+        first.apply(dec("block_all", ports=()))
+
+
+def test_remove_without_table_is_success(net):
+    enf = net.enforcer("observe")
+    assert enf.remove(CLI4) is True and enf.active() == []
+
+
+def test_reapply_never_shortens_and_extends_when_longer(net):
+    enf = net.enforcer()
+    assert enf.setup()
+    enf.apply(dec("block_all", ports=(), ttl=86400))
+    enf.apply(dec("block_all", ports=(), ttl=5))
+    assert left(enf, CLI4) > 86000
+    enf.remove(CLI4)
+    enf.apply(dec("block_all", ports=(), ttl=30))
+    enf.apply(dec("block_all", ports=(), ttl=3600))
+    assert 3500 < left(enf, CLI4) <= 3600
+    enf.apply(dec(ports=(22, 80), ttl=100))
+    enf.apply(dec(ports=(22, 80, 443), ttl=300))
+    ports = {b.kind: b for b in enf.active()}["block_port"]
+    assert ports.ports == [22, 80, 443] and 200 < ports.until - time.time() <= 300
+
+
+def test_breaker_downgrade_keeps_longer_limit(net):
+    enf = net.enforcer(max_new_per_5m=0)
+    assert enf.setup()
+    enf.apply(dec("rate_limit", ports=(), ttl=3000))
+    assert enf.apply(dec(ttl=3600)).detail == "breaker: rate_limit"
+    row = [b for b in enf.active() if b.kind == "rate_limit"][0]
+    assert row.until - time.time() > 2900
+
+
+def test_active_kinds_and_merged_ports(net):
+    enf = net.enforcer()
+    assert enf.setup()
+    enf.apply(dec(ports=(22, 80)))
+    enf.apply(dec("block_all", ports=()))
+    enf.apply(dec("rate_limit", ports=()))
+    assert sorted((b.kind, b.ports) for b in enf.active()) == [
+        ("block_all", []), ("block_port", [22, 80]), ("rate_limit", [])]
+
+
+def test_setup_refuses_to_duplicate_rules_when_listing_fails(net):
+    enf = net.enforcer()
+    assert enf.setup()
+    n = len(json.loads(net.nft("-j", "list", "chain", "inet", "nexus", "prerouting").stdout)["nftables"])
+
+    def flaky(argv, input_text=None):
+        if "chain" in argv:
+            return 124, "timeout"
+        return net.runner(argv, input_text)
+    assert Enforcer("enforce", flaky, time.time).setup() is False
+    assert len(json.loads(net.nft("-j", "list", "chain", "inet", "nexus", "prerouting").stdout)["nftables"]) == n
+
+
+def scan_logged(net, action):
+    ns_run(SRV, "nft", "-f", "-", input_text=(
+        "add table inet nxtrace\n"
+        "add chain inet nxtrace pre { type filter hook prerouting priority -300; policy accept; }\n"
+        "add rule inet nxtrace pre tcp dport 8080 meta nftrace set 1\n"))
+    mon = subprocess.Popen(["ip", "netns", "exec", SRV, "nft", "monitor", "trace"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        time.sleep(0.5)
+        action()
+        time.sleep(0.5)
+    finally:
+        mon.terminate()
+    return "nexus-scan" in mon.communicate()[0]
+
+
+def test_scan_log_rule_inbound_only(net):
+    net.start_server(8080)
+    ns_run(SRV, "sysctl", "-qw", "net.ipv4.ip_forward=1")
+    sh("ip", "-n", CLI, "route", "add", "10.77.0.0/24", "via", SRV4)
+    enf = net.enforcer()
+    assert enf.setup()
+    assert scan_logged(net, lambda: net.connect(SRV4, 8080, CLI4))
+    assert not scan_logged(net, lambda: net.connect("10.77.0.5", 8080, CLI4))
+    assert not scan_logged(net, lambda: ns_run(SRV, sys.executable, "-c", CLIENT, "127.0.0.1", "8080", "127.0.0.1"))
+    assert enf.update_listening([8080])
+    assert not scan_logged(net, lambda: net.connect(SRV4, 8080, CLI4))

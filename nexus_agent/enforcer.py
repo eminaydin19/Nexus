@@ -26,6 +26,7 @@ MAX_ACTIVE_REPORT = 1000  # ingest limit on active_blocks
 MAX_PORTS_REPORT = 16  # BlockIn.ports limit
 V6_MASK = "ffff:ffff:ffff:ffff::"
 BLOCK_SETS = ("port4", "port6", "all4", "all6", "limit4", "limit6")
+_KIND = {"port": "block_port", "all": "block_all", "limit": "rate_limit"}
 _SET_FOR = {"block_port": "port", "block_all": "all", "rate_limit": "limit"}
 
 # (set, address text, port or 0) -> (until, rule)
@@ -46,6 +47,7 @@ class BlockIn:
     ports: List[int]
     until: float
     simulated: bool = False
+    kind: str = "block_all"
 
 
 def run_command(argv: List[str], input_text: Optional[str] = None, timeout: float = 10) -> Tuple[int, str]:
@@ -98,7 +100,9 @@ def _setup_script(with_rules: bool) -> str:
             "update @meter4 { ip saddr %s } drop" % rate,
             "add rule inet nexus prerouting %s @limit6 ct state new "
             "update @meter6 { %s %s } drop" % (s6, s6, rate),
-            'add rule inet nexus prerouting ct state new tcp flags syn tcp dport != @listening '
+            # Only SYNs addressed to this host from outside: forwarded and loopback traffic is not a scan of us.
+            'add rule inet nexus prerouting fib daddr type local iif != "lo" ct state new tcp flags syn '
+            'tcp dport != @listening '
             'limit rate 50/second log prefix "nexus-scan "',
         ]
     return "\n".join(lines) + "\n"
@@ -164,8 +168,15 @@ class Enforcer:
             if rc == 0:
                 try:
                     has_rules = any("rule" in e for e in json.loads(out).get("nftables", []))
-                except (ValueError, AttributeError):
-                    log.error("unreadable chain listing; assuming rules absent")
+                except (ValueError, AttributeError, TypeError):
+                    log.error("unreadable chain listing; refusing to add rules blindly")
+                    self.capable = False
+                    return False
+            elif "No such file" not in out:
+                # Adding rules without knowing the chain is empty would duplicate them.
+                log.error("cannot inspect chain (%s): %s", rc, out.strip())
+                self.capable = False
+                return False
             rc, out = self._run(["nft", "-f", "-"], _setup_script(not has_rules))
             if rc != 0:
                 self.capable = False
@@ -195,10 +206,14 @@ class Enforcer:
                 log.error("nft teardown failed (%s): %s", rc, out.strip())
             return ok
 
-    def _read_kernel(self) -> Optional[List[Tuple[str, str, int, float]]]:
-        rc, out = self._run(["nft", "-j", "list", "table", "inet", TABLE])
+    def _read_kernel(self, set_name: Optional[str] = None) -> Optional[List[Tuple[str, str, int, float]]]:
+        """Block elements as (set, addr, port, seconds left); [] when nft or the table is absent, None on error."""
+        what = ["set", "inet", TABLE, set_name] if set_name else ["table", "inet", TABLE]
+        rc, out = self._run(["nft", "-j", "list"] + what)
+        if rc == 127 or (rc != 0 and "No such file" in out):
+            return []
         if rc != 0:
-            log.warning("cannot list table inet %s (%s)", TABLE, rc)
+            log.warning("cannot list %s (%s): %s", " ".join(what), rc, out.strip())
             return None
         rows = []
         try:
@@ -248,24 +263,46 @@ class Enforcer:
                     self._open = True
                     action, detail, ttl, ports = "rate_limit", "breaker: rate_limit", min(ttl, BREAKER_TTL), []
             keys = self._keys(action, fam, addr, ports)
-            until = self._clock() + ttl
+            is_new = any(k not in self._cur() for k in keys)
+            now = self._clock()
             if self.mode == "observe":
-                is_new = any(k not in self._sim for k in keys)
-                self._sim.update({k: (until, d.rule) for k in keys})
-                ok, simulated, detail = True, True, detail or "observe"
+                for k in keys:
+                    self._sim[k] = (max(now + ttl, self._sim.get(k, (0, ""))[0]), d.rule)
+                result = ApplyResult(True, True, detail or "observe")
             else:
-                is_new = any(k not in self._live for k in keys)
-                elems = ", ".join(
-                    "%s . %d timeout %ds" % (addr, k[2], ttl) if k[2] else "%s timeout %ds" % (addr, ttl) for k in keys
-                )
-                ok, rc, out = self._exec(["nft", "add", "element", "inet", TABLE, keys[0][0], "{ %s }" % elems])
-                simulated = False
-                if not ok:
-                    return ApplyResult(False, False, out.strip()[:200] or "nft exit %d" % rc)
-                self._live.update({k: (until, d.rule) for k in keys})
-            if is_new and action != "rate_limit":
-                self._events.append(self._clock())
-            return ApplyResult(ok, simulated, detail)
+                result = self._write(keys, addr, ttl, d.rule, now, detail)
+            if result.ok and is_new and action != "rate_limit":
+                self._events.append(now)
+            return result
+
+    def _write(self, keys: List[Key], addr: str, ttl: int, rule: str, now: float, detail: str) -> ApplyResult:
+        setname = keys[0][0]
+        left = {(a, p): e for _, a, p, e in self._read_kernel(setname) or []}
+        # nft reports whole seconds, so a block re-applied right away would otherwise be rewritten every time.
+        todo = [k for k in keys if left.get((k[1], k[2]), -1) < ttl - 1]
+        for k in keys:
+            if k not in todo and k not in self._live:
+                self._live[k] = (now + left[(k[1], k[2])], rule)
+        if not todo:
+            return ApplyResult(True, False, detail)  # a live block is never shortened
+        items = "{ %s }" % ", ".join(
+            "%s . %d timeout %ds" % (addr, k[2], ttl) if k[2] else "%s timeout %ds" % (addr, ttl) for k in todo)
+        replace = [k for k in todo if (k[1], k[2]) in left]
+        if replace:
+            # Delete + add in one transaction extends a timeout on every kernel; a plain re-add may keep the old one.
+            script = "".join("delete element inet %s %s { %s }\n" % (TABLE, setname, self._elem(k)) for k in replace)
+            ok, rc, out = self._exec(["nft", "-f", "-"], script + "add element inet %s %s %s\n" % (TABLE, setname, items))
+        else:
+            ok, rc, out = self._exec(["nft", "add", "element", "inet", TABLE, setname, items])
+        if not ok:
+            return ApplyResult(False, False, out.strip()[:200] or "nft exit %d" % rc)
+        for k in todo:
+            self._live[k] = (now + ttl, rule)
+        return ApplyResult(True, False, detail)
+
+    @staticmethod
+    def _elem(k: Key) -> str:
+        return "%s . %d" % (k[1], k[2]) if k[2] else k[1]
 
     @staticmethod
     def _keys(action: str, fam: str, addr: str, ports: Iterable[int]) -> List[Key]:
@@ -275,21 +312,15 @@ class Enforcer:
     def active(self) -> List[BlockIn]:
         with self._lock:
             self._prune()
+            now = self._clock()
+            rows = [(s, a, p, now + e, self._live.get((s, a, p), (0, "unknown"))[1], False)
+                    for s, a, p, e in self._read_kernel() or []]
             if self.mode == "observe":
-                now = self._clock()
-                rows = [(s, a, p, v[0] - now, v[1]) for (s, a, p), v in self._sim.items()]
-                simulated = True
-            elif self.mode == "enforce":
-                kernel = self._read_kernel() or []
-                now = self._clock()
-                rows = [(s, a, p, e, self._live.get((s, a, p), (0, "unknown"))[1]) for s, a, p, e in kernel]
-                simulated = False
-            else:
-                return []
-            grouped: Dict[Tuple[str, str], BlockIn] = {}
-            for s, a, p, exp, rule in rows:
-                b = grouped.setdefault((s, a), BlockIn(a, rule, [], now + exp, simulated))
-                b.until = max(b.until, now + exp)
+                rows += [(s, a, p, v[0], v[1], True) for (s, a, p), v in self._sim.items()]
+            grouped: Dict[Tuple[str, str, bool], BlockIn] = {}
+            for s, a, p, until, rule, simulated in rows:
+                b = grouped.setdefault((s, a, simulated), BlockIn(a, rule, [], until, simulated, _KIND[s[:-1]]))
+                b.until = max(b.until, until)
                 if p and p not in b.ports:
                     b.ports.append(p)
             out = list(grouped.values())
@@ -301,24 +332,27 @@ class Enforcer:
     def remove(self, ip: str) -> bool:
         fam, addr = _address(ip)
         with self._lock:
-            for d in (self._sim, self._live):
-                for k in [k for k in d if k[1] == addr]:
-                    del d[k]
-            if self.mode != "enforce":
-                return True
+            # Every mode reads the kernel: blocks outlive a mode change and must stay removable.
             rows = self._read_kernel()
             if rows is None:
                 return False
-            ok = True
-            for s, a, p, _ in rows:
-                if a != addr or not s.endswith(fam):
-                    continue
-                elem = "%s . %d" % (a, p) if s.startswith("port") else a
-                done, rc, out = self._exec(["nft", "delete", "element", "inet", TABLE, s, "{ %s }" % elem])
-                if not done and "No such file" not in out:
-                    log.error("remove %s from %s failed (%s): %s", elem, s, rc, out.strip())
-                    ok = False
-            return ok
+            targets = [(s, a, p) for s, a, p, _ in rows if a == addr and s.endswith(fam)]
+            if targets:
+                script = "".join("delete element inet %s %s { %s }\n" % (TABLE, s, self._elem((s, a, p)))
+                                 for s, a, p in targets)
+                rc, out = self._run(["nft", "-f", "-"], script)
+                if rc != 0:
+                    # An element may have expired since the listing and aborted the whole transaction; go one by one.
+                    for s, a, p in targets:
+                        done, rc, out = self._exec(
+                            ["nft", "delete", "element", "inet", TABLE, s, "{ %s }" % self._elem((s, a, p))])
+                        if not done and "No such file" not in out:
+                            log.error("remove %s from %s failed (%s): %s", a, s, rc, out.strip())
+                            return False
+            for d in (self._sim, self._live):
+                for k in [k for k in d if k[1] == addr]:
+                    del d[k]
+            return True
 
     def update_listening(self, ports: Iterable[int]) -> bool:
         wanted = frozenset(_port(p) for p in ports)
@@ -335,14 +369,33 @@ class Enforcer:
             self._listening = wanted
             return True
 
+    def _flush_blocks(self) -> bool:
+        script = "".join("flush set inet %s %s\n" % (TABLE, n) for n in BLOCK_SETS + ("meter4", "meter6"))
+        rc, out = self._run(["nft", "-f", "-"], script)
+        if rc == 127 or (rc != 0 and "No such file" in out):
+            return True
+        if rc != 0:
+            log.error("cannot lift kernel blocks (%s): %s", rc, out.strip())
+            return False
+        return True
+
     def set_mode(self, mode: str) -> bool:
         if mode not in MODES:
             raise ValueError("invalid mode: %r" % (mode,))
         with self._lock:
-            if mode == "enforce" and not self.setup():
-                log.error("cannot enforce; falling back to observe")
-                self.mode = "observe"
-                return False
-            # Leaving enforce keeps kernel elements on purpose: they expire on their own timeouts.
+            ok = True
+            if mode == "enforce":
+                if not self.setup():
+                    log.error("cannot enforce; falling back to observe")
+                    mode, ok = "observe", False
+                else:
+                    self._sim.clear()
+            elif self.mode == "enforce":
+                # Leaving enforce must lift blocks: a flipped-off switch that keeps dropping customers is worse than a miss.
+                ok = self._flush_blocks()
+                if ok:
+                    self._live.clear()
+            self._events.clear()
+            self._open = False
             self.mode = mode
-            return True
+            return ok

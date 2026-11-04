@@ -23,10 +23,19 @@ class FakeRunner:
     def __call__(self, argv, input_text=None):
         self.calls.append(list(argv))
         self.inputs.append(input_text)
+        hay = " ".join(argv) + " " + (input_text or "")
         for key, resp in self.responses.items():
-            if key in " ".join(argv):
+            if key in hay:
                 return resp
-        return 0, ""
+        return 0, EMPTY if argv[:3] == ["nft", "-j", "list"] else ""
+
+
+EMPTY = json.dumps({"nftables": []})
+NO_TABLE = (1, "Error: No such file or directory")
+
+
+def writes(runner):
+    return [c for c in runner.calls if "-j" not in c]
 
 
 def dec(action="block_port", ip="203.0.113.9", ports=(22,), ttl=3600, rule="ssh_bruteforce"):
@@ -73,8 +82,8 @@ def test_block_port_argv_exact():
 def test_block_port_one_element_per_port():
     enf, runner, _ = make()
     enf.apply(dec(ports=(80, 443, 80)))
-    assert runner.calls == [["nft", "add", "element", "inet", "nexus", "port4",
-                             "{ 203.0.113.9 . 80 timeout 3600s, 203.0.113.9 . 443 timeout 3600s }"]]
+    assert writes(runner) == [["nft", "add", "element", "inet", "nexus", "port4",
+                               "{ 203.0.113.9 . 80 timeout 3600s, 203.0.113.9 . 443 timeout 3600s }"]]
 
 
 def test_block_all_and_rate_limit_argv():
@@ -96,7 +105,7 @@ def test_ipv6_blocked_as_64():
 def test_ipv4_mapped_ipv6_uses_v4_set():
     enf, runner, _ = make()
     enf.apply(dec(ip="::ffff:203.0.113.9"))
-    assert runner.calls[0][5] == "port4"
+    assert writes(runner)[0][5] == "port4"
 
 
 @pytest.mark.parametrize("ip", ["", "not-an-ip", "1.2.3", "1.2.3.4/24", "fe80::1%eth0", "1.2.3.4; reboot", " 1.2.3.4"])
@@ -118,7 +127,7 @@ def test_invalid_block_raises(kw):
 def test_ttl_clamped_to_one_day():
     enf, runner, _ = make()
     enf.apply(dec(ttl=10**9))
-    assert runner.calls[0][-1].endswith("timeout 86400s }")
+    assert writes(runner)[0][-1].endswith("timeout 86400s }")
 
 
 def test_file_exists_is_success():
@@ -141,7 +150,7 @@ def test_breaker_opens_after_50_in_5m():
     res = enf.apply(dec(ip="198.51.100.77", ttl=3600))
     assert res.ok and res.detail == "breaker: rate_limit"
     assert enf.breaker_open
-    assert runner.calls[-1] == ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.77 timeout 600s }"]
+    assert writes(runner)[-1] == ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.77 timeout 600s }"]
     assert not any("198.51.100.77" in " ".join(c) and "port4" in c for c in runner.calls)
 
 
@@ -228,7 +237,7 @@ def test_active_capped_keeps_longest_lived():
 
 
 def test_setup_single_atomic_transaction():
-    enf, runner, _ = make(runner=FakeRunner({"list chain": (1, "Error: No such file or directory")}))
+    enf, runner, _ = make(runner=FakeRunner({"list chain": NO_TABLE}))
     assert enf.setup() and enf.capable
     assert runner.calls.count(["nft", "-f", "-"]) == 1
     script = runner.inputs[runner.calls.index(["nft", "-f", "-"])]
@@ -252,6 +261,26 @@ def test_setup_idempotent_skips_rules_when_present():
     assert "add rule" not in script
 
 
+@pytest.mark.parametrize("resp", [(124, "timeout"), (1, "Error: Resource busy"), (0, "{garbage"), (0, "[]")])
+def test_setup_refuses_when_chain_unreadable(resp):
+    enf, runner, _ = make(runner=FakeRunner({"list chain": resp}))
+    assert enf.setup() is False and enf.capable is False
+    assert ["nft", "-f", "-"] not in runner.calls
+
+
+def test_setup_adds_rules_when_chain_listing_has_none():
+    enf, runner, _ = make(runner=FakeRunner({"list chain": (0, EMPTY)}))
+    assert enf.setup()
+    assert "add rule" in runner.inputs[runner.calls.index(["nft", "-f", "-"])]
+
+
+def test_scan_log_rule_only_for_inbound_local_syns():
+    enf, runner, _ = make(runner=FakeRunner({"list chain": NO_TABLE}))
+    enf.setup()
+    script = runner.inputs[runner.calls.index(["nft", "-f", "-"])]
+    assert 'fib daddr type local iif != "lo" ct state new tcp flags syn' in script
+
+
 def test_setup_nft_missing():
     enf, _, _ = make(runner=FakeRunner({"nft": (127, "")}))
     assert enf.setup() is False and enf.capable is False
@@ -259,7 +288,7 @@ def test_setup_nft_missing():
 
 def test_setup_seeds_active_count_from_kernel():
     out = table_json(("all4", [{"elem": {"val": "10.0.0.%d" % i, "expires": 99}} for i in range(1, 4)]))
-    enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out), "list chain": (1, "")}), max_active=3)
+    enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out), "list chain": NO_TABLE}), max_active=3)
     enf.setup()
     assert enf.apply(dec()).detail == "breaker: rate_limit"
 
@@ -274,11 +303,13 @@ def test_remove_deletes_from_all_known_sets():
     )
     enf, runner, _ = make(runner=FakeRunner({"-j list table": (0, out)}))
     assert enf.remove("203.0.113.9")
-    dels = [c for c in runner.calls if "delete" in c]
-    assert sorted(c[-1] for c in dels) == ["{ 203.0.113.9 . 22 }", "{ 203.0.113.9 . 80 }", "{ 203.0.113.9 }"]
-    runner.calls.clear()
+    assert sorted(runner.inputs[-1].splitlines()) == [
+        "delete element inet nexus all4 { 203.0.113.9 }",
+        "delete element inet nexus port4 { 203.0.113.9 . 22 }",
+        "delete element inet nexus port4 { 203.0.113.9 . 80 }"]
+    runner.calls.clear(), runner.inputs.clear()
     assert enf.remove("2001:db8:1:2:9::1")
-    assert [c[-2:] for c in runner.calls if "delete" in c] == [["all6", "{ 2001:db8:1:2:: }"]]
+    assert runner.inputs[-1] == "delete element inet nexus all6 { 2001:db8:1:2:: }\n"
 
 
 def test_remove_absent_is_true_and_failure_false():
@@ -286,15 +317,40 @@ def test_remove_absent_is_true_and_failure_false():
     assert enf.remove("203.0.113.9") is True
     out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 5}}]))
     enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out), "delete element": (1, "Error: boom")}))
+    enf.apply(dec("block_all", ports=()))
     assert enf.remove("203.0.113.9") is False
+    assert enf._live  # memory is cleared only after the kernel confirmed
     out_missing = FakeRunner({"-j list table": (0, out), "delete element": (1, "Error: No such file or directory")})
     assert make(runner=out_missing)[0].remove("203.0.113.9") is True
+
+
+@pytest.mark.parametrize("resp", [NO_TABLE, (127, "")])
+def test_remove_missing_table_or_nft_is_success(resp):
+    enf, _, _ = make(runner=FakeRunner({"-j list table": resp}))
+    assert enf.remove("203.0.113.9") is True
+
+
+def test_remove_uses_one_transaction():
+    out = table_json(("port4", [{"elem": {"val": {"concat": ["203.0.113.9", p]}, "expires": 5}} for p in (22, 80)]))
+    enf, runner, _ = make(runner=FakeRunner({"-j list table": (0, out)}))
+    assert enf.remove("203.0.113.9")
+    assert runner.calls[-1] == ["nft", "-f", "-"]
+    assert runner.inputs[-1] == ("delete element inet nexus port4 { 203.0.113.9 . 22 }\n"
+                                 "delete element inet nexus port4 { 203.0.113.9 . 80 }\n")
+
+
+@pytest.mark.parametrize("mode", ["observe", "off"])
+def test_remove_reads_kernel_in_every_mode(mode):
+    out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 500}}]))
+    enf, runner, _ = make(mode, runner=FakeRunner({"-j list table": (0, out)}))
+    assert enf.remove("203.0.113.9")
+    assert "delete element inet nexus all4 { 203.0.113.9 }" in runner.inputs[-1]
 
 
 def test_remove_observe_drops_simulated():
     enf, runner, _ = make("observe")
     enf.apply(dec())
-    assert enf.remove("203.0.113.9") and enf.active() == [] and runner.calls == []
+    assert enf.remove("203.0.113.9") and enf.active() == []
 
 
 def test_remove_invalid_ip_raises():
@@ -337,13 +393,44 @@ def test_teardown():
 
 
 def test_set_mode():
-    enf, runner, _ = make("observe", runner=FakeRunner({"list chain": (1, "")}))
+    enf, runner, _ = make("observe", runner=FakeRunner({"list chain": NO_TABLE}))
     assert enf.set_mode("enforce") and enf.mode == "enforce" and enf.capable
-    n = len(runner.calls)
     assert enf.set_mode("observe") and enf.mode == "observe"
-    assert len(runner.calls) == n
     with pytest.raises(ValueError):
         enf.set_mode("block")
+
+
+@pytest.mark.parametrize("target", ["observe", "off"])
+def test_leaving_enforce_flushes_all_block_sets_atomically(target):
+    enf, runner, _ = make(runner=FakeRunner({"list chain": NO_TABLE}))
+    enf.apply(dec())
+    runner.calls.clear(), runner.inputs.clear()
+    assert enf.set_mode(target) and enf.mode == target
+    assert runner.calls == [["nft", "-f", "-"]]
+    for n in ("port4", "port6", "all4", "all6", "limit4", "limit6", "meter4", "meter6"):
+        assert "flush set inet nexus %s\n" % n in runner.inputs[0]
+    assert "listening" not in runner.inputs[0] and "delete table" not in runner.inputs[0]
+
+
+def test_leaving_enforce_flush_failure_returns_false_but_changes_mode(caplog):
+    enf, _, _ = make(runner=FakeRunner({"flush set": (1, "Error: busy")}))
+    assert enf.set_mode("off") is False and enf.mode == "off"
+    assert "nexus" in caplog.text
+
+
+def test_leaving_enforce_with_no_table_is_fine():
+    enf, _, _ = make(runner=FakeRunner({"flush set": NO_TABLE}))
+    assert enf.set_mode("observe") is True
+
+
+def test_set_mode_resets_breaker_so_simulated_blocks_do_not_downgrade_real_ones():
+    enf, runner, _ = make("observe", runner=FakeRunner({"list chain": NO_TABLE}), max_new_per_5m=2)
+    for i in range(3):
+        enf.apply(dec(ip="203.0.113.%d" % (i + 1)))
+    assert enf.breaker_open
+    assert enf.set_mode("enforce")
+    assert not enf.breaker_open
+    assert enf.apply(dec(ip="203.0.113.50")).detail == ""
 
 
 def test_set_mode_enforce_failure_stays_observe(caplog):
@@ -357,3 +444,60 @@ def test_default_runner_maps_errors():
     assert run_command(["definitely-not-a-binary-xyz"])[0] == 127
     assert run_command(["sh", "-c", "sleep 5"], timeout=0.2)[0] == 124
     assert run_command(["cat"], "hi") == (0, "hi")
+
+
+def test_active_rows_have_kind_and_merge_per_ip_and_kind():
+    out = table_json(
+        ("port4", [{"elem": {"val": {"concat": ["203.0.113.9", p]}, "expires": 50}} for p in (80, 22)]),
+        ("all4", [{"elem": {"val": "203.0.113.9", "expires": 50}}]),
+        ("limit4", [{"elem": {"val": "198.51.100.1", "expires": 50}}]),
+    )
+    enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out)}))
+    got = sorted(((b.ip, b.kind, b.ports) for b in enf.active()))
+    assert got == [("198.51.100.1", "rate_limit", []), ("203.0.113.9", "block_all", []),
+                   ("203.0.113.9", "block_port", [22, 80])]
+
+
+@pytest.mark.parametrize("mode", ["off", "observe", "enforce"])
+def test_active_shows_kernel_rows_in_every_mode(mode):
+    out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 50}}]))
+    enf, _, _ = make(mode, runner=FakeRunner({"-j list table": (0, out)}))
+    assert [(b.ip, b.simulated) for b in enf.active()] == [("203.0.113.9", False)]
+
+
+def test_active_observe_adds_simulated():
+    out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 50}}]))
+    enf, _, _ = make("observe", runner=FakeRunner({"-j list table": (0, out)}))
+    enf.apply(dec(ip="198.51.100.4", ports=(22,)))
+    assert sorted((b.ip, b.simulated, b.kind) for b in enf.active()) == [
+        ("198.51.100.4", True, "block_port"), ("203.0.113.9", False, "block_all")]
+
+
+def test_reapply_never_shortens_live_block():
+    out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 80000}}]))
+    enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}))
+    res = enf.apply(dec("block_all", ports=(), ttl=5))
+    assert res.ok and writes(runner) == []
+
+
+def test_reapply_longer_replaces_atomically():
+    out = table_json(("all4", [{"elem": {"val": "203.0.113.9", "expires": 100}}]))
+    enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}))
+    assert enf.apply(dec("block_all", ports=(), ttl=3600)).ok
+    assert writes(runner) == [["nft", "-f", "-"]]
+    assert runner.inputs[-1] == ("delete element inet nexus all4 { 203.0.113.9 }\n"
+                                 "add element inet nexus all4 { 203.0.113.9 timeout 3600s }\n")
+
+
+def test_reapply_mixed_ports_only_touches_shorter_ones():
+    out = table_json(("port4", [{"elem": {"val": {"concat": ["203.0.113.9", 22]}, "expires": 9000}}]))
+    enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}))
+    enf.apply(dec(ports=(22, 80), ttl=3600))
+    assert writes(runner) == [["nft", "add", "element", "inet", "nexus", "port4", "{ 203.0.113.9 . 80 timeout 3600s }"]]
+
+
+def test_breaker_downgrade_does_not_shorten_existing_limit():
+    out = table_json(("limit4", [{"elem": {"val": "203.0.113.9", "expires": 599}}]))
+    enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}), max_new_per_5m=0)
+    res = enf.apply(dec(ttl=3600))
+    assert res.detail == "breaker: rate_limit" and writes(runner) == []

@@ -144,6 +144,7 @@ class ActiveBlock(Base):
     ports: Mapped[list] = mapped_column(JSON, default=list)
     until: Mapped[float] = mapped_column(Float)
     simulated: Mapped[bool] = mapped_column(Boolean, default=False)
+    kind: Mapped[str] = mapped_column(String(16), default="block_all", server_default="block_all")
 
     def as_dict(self) -> dict:
         return {
@@ -153,6 +154,7 @@ class ActiveBlock(Base):
             "ports": self.ports or [],
             "until": self.until,
             "simulated": self.simulated,
+            "kind": self.kind or "block_all",
         }
 
 
@@ -212,7 +214,11 @@ class EnrollToken(Base):
 
 
 # Columns added after the first release: (table, column, DDL type).
-_ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON"), ("anomalies", "transformer_score", "FLOAT")]
+_ADDITIVE_COLUMNS = [
+    ("anomalies", "contributions", "JSON"),
+    ("anomalies", "transformer_score", "FLOAT"),
+    ("active_blocks", "kind", "VARCHAR(16) DEFAULT 'block_all'"),
+]
 
 
 def _migrate() -> None:

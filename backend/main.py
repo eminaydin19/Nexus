@@ -217,6 +217,7 @@ class BlockIn(BaseModel):
     ports: list[Annotated[int, Field(ge=1, le=65535)]] = Field(default_factory=list, max_length=16)
     until: float
     simulated: bool = False
+    kind: Literal["block_port", "block_all", "rate_limit"] = "block_all"
 
     _valid_ip = field_validator("ip")(_canonical_ip)
 

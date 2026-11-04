@@ -141,6 +141,32 @@ def test_active_blocks_replace_previous_list(client):
     assert [b["ip"] for b in blocks] == ["203.0.113.22"]
 
 
+def test_active_block_kind_stored_defaulted_and_validated(client):
+    node, key = make_node(client)
+    block = {"ip": "203.0.113.30", "rule": "conn_flood", "ports": [], "until": time.time() + 60}
+    assert ingest(client, key, active_blocks=[{**block, "kind": "rate_limit"}, {**block, "ip": "203.0.113.31"}]).status_code == 200
+    kinds = {b["ip"]: b["kind"] for b in client.get("/api/blocks").json()["blocks"] if b["node_id"] == node}
+    assert kinds == {"203.0.113.30": "rate_limit", "203.0.113.31": "block_all"}
+    assert ingest(client, key, active_blocks=[{**block, "kind": "nope"}]).status_code == 422
+
+
+def test_kind_column_added_to_existing_table():
+    from sqlalchemy import create_engine, inspect, text
+    import backend.db as db
+    eng = create_engine("sqlite://")
+    with eng.begin() as c:
+        c.execute(text("CREATE TABLE active_blocks (id INTEGER PRIMARY KEY, ip VARCHAR(45))"))
+        c.execute(text("INSERT INTO active_blocks (ip) VALUES ('1.2.3.4')"))
+    old, db.engine = db.engine, eng
+    try:
+        db._migrate()
+    finally:
+        db.engine = old
+    assert "kind" in {c["name"] for c in inspect(eng).get_columns("active_blocks")}
+    with eng.begin() as c:
+        assert c.execute(text("SELECT kind FROM active_blocks")).scalar() == "block_all"
+
+
 def test_ingest_stores_agent_info(client):
     from backend.db import Agent
 
