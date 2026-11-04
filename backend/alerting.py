@@ -49,11 +49,12 @@ class SlackNotifier:
         # Keyed per (node, rule) so a routine block cannot mute a flood alert; the prefix keeps it apart from ML keys.
         if not self.enabled or not self._due(f"event:{event['node_id']}:{event['rule']}"):
             return False
-        ports = ",".join(map(str, event["ports"])) or "-"
+        e = {k: _escape(str(v)) for k, v in event.items() if k != "ports"}
+        ports = ",".join(_escape(str(p)) for p in event["ports"]) or "-"
         text = (
-            f":rotating_light: *{event['rule']}* on `{event['node_id']}`\n"
-            f"Action: *{event['action']}* | IP: `{event['ip']}` | Ports: {ports} | TTL: {event['ttl']}s\n"
-            f"Evidence: {_escape(event['evidence'])}"
+            f":rotating_light: *{e['rule']}* on `{e['node_id']}`\n"
+            f"Action: *{e['action']}* | IP: `{e['ip']}` | Ports: {ports} | TTL: {e['ttl']}s\n"
+            f"Evidence: {e['evidence']}"
         )
         return await self._post(text)
 

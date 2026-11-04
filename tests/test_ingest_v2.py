@@ -242,8 +242,11 @@ def _real_notifier(monkeypatch):
 
 
 def _ev(rule, **kw):
-    return {"node_id": "n", "rule": rule, "action": "block_port", "ip": "203.0.113.9", "ports": [22], "ttl": 300,
-            "evidence": "x", **kw}
+    from backend.db import SecurityEvent
+
+    base = SecurityEvent(node_id="n", ts=1.0, rule=rule, ip="203.0.113.9", action="block_port", ports=[22], ttl=300,
+                         evidence="x", simulated=False, ok=True)
+    return {**base.as_dict(), **kw}
 
 
 def test_event_cooldown_is_per_node_and_rule(monkeypatch):
@@ -270,3 +273,9 @@ def test_invalid_max_mode_ignored(client):
     for bad in ("root", ["enforce"], 5, None):
         assert ingest(client, key, config={"max_mode": bad}).status_code == 200
     assert client.put(f"/api/agents/{node}/mode", json={"mode": "enforce"}).status_code == 200
+
+
+def test_event_slack_text_escapes_every_field(monkeypatch):
+    n, texts, run = _real_notifier(monkeypatch)
+    run(n.notify_event(_ev("<!channel>", node_id="<!here>", action="<a>", ip="<i>", ports=["<p>"])))
+    assert "<" not in texts[0].replace(":rotating_light:", "") and "&lt;!channel&gt;" in texts[0]
