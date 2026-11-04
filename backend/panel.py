@@ -7,9 +7,10 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from backend.agents import MAX_ALLOWLIST, _agent_or_404, _db, pending_by_node, server_view
+from backend.agents import ALLOWLIST_LOCK, MAX_ALLOWLIST, _agent_or_404, _db, pending_by_node, server_view
 from backend.commands import enqueue
 from backend.db import ActiveBlock, Agent, Anomaly, SecurityEvent
 
@@ -18,6 +19,7 @@ DAY_SECONDS = 86400
 WATCH_DAYS = 7
 RECENT_LIMIT = 10
 MAX_WATCH_ITEMS = 200
+SERVER_WIDE_ADDRESSES = ("0.0.0.0", "::")
 
 router = APIRouter(prefix="/api")
 
@@ -33,6 +35,12 @@ def _network(ip: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
     return ipaddress.ip_network(f"{addr}/{64 if addr.version == 6 else 32}", strict=False)
 
 
+def _cover(ip: str) -> str:
+    """How an address is shown: IPv6 as the /64 a block on it actually covers."""
+    network = _network(ip)
+    return str(network) if network is not None and network.version == 6 else ip
+
+
 def _covered(network, allowlist: list[str]) -> bool:
     if network is None:
         return False
@@ -40,8 +48,9 @@ def _covered(network, allowlist: list[str]) -> bool:
     return any(e.version == network.version and network.subnet_of(e) for e in entries)
 
 
-def _live_agents(db: Session) -> list[Agent]:
-    return db.query(Agent).filter(Agent.revoked_at.is_(None)).order_by(Agent.created_at).all()
+def _live_agents(db: Session, for_update: bool = False) -> list[Agent]:
+    query = db.query(Agent).filter(Agent.revoked_at.is_(None)).order_by(Agent.created_at)
+    return (query.with_for_update() if for_update else query).all()
 
 
 def recent_events(db: Session, limit: int, node=None, rule=None, actions=None, simulated=None) -> list[dict]:
@@ -51,7 +60,8 @@ def recent_events(db: Session, limit: int, node=None, rule=None, actions=None, s
             query = query.filter(column == value)
     if actions:
         query = query.filter(SecurityEvent.action.in_(actions))
-    return [row.as_dict() for row in query.order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit)]
+    rows = query.order_by(SecurityEvent.ts.desc(), SecurityEvent.id.desc()).limit(limit)
+    return [{**row.as_dict(), "cover": _cover(row.ip)} for row in rows]
 
 
 @router.get("/events")
@@ -101,6 +111,7 @@ def blocks(simulated: bool | None = None, db: Session = Depends(_db)):
     for row in rows:
         row["evidence"] = evidence.get((row["node_id"], row["rule"], _network(row["ip"])), "")
         row["pending_removal"] = (row["node_id"], row["ip"]) in removals
+        row["cover"] = _cover(row["ip"])
     return {"blocks": rows}
 
 
@@ -122,43 +133,50 @@ def watch_summary(db: Session, agent: Agent, now: float, pending_commands: list[
         .group_by(SecurityEvent.ip, SecurityEvent.rule, SecurityEvent.action)
         .all()
     )
+    allowlist = agent.allowlist or []
+    covered = {g.ip: _covered(_network(g.ip), allowlist) for g in groups}
+    # What enforcing would newly do: allowlisted addresses are never blocked, and a server-wide row is not an address.
+    reviewable = [g for g in groups if not covered[g.ip] and g.ip not in SERVER_WIDE_ADDRESSES]
+    blocks = [g for g in reviewable if g.action in BLOCK_ACTIONS]
+    limits = [g for g in reviewable if g.action == "rate_limit"]
     by_rule: dict[str, int] = {}
-    for group in groups:
+    for group in reviewable:
         by_rule[group.rule] = by_rule.get(group.rule, 0) + group.count
 
-    newest = sorted(groups, key=lambda g: g.last_id, reverse=True)
     allowlist_pending = any(c["type"] == "allowlist" for c in pending_commands)
-    items = []
-    for group in newest:
-        covered = _covered(_network(group.ip), agent.allowlist or [])
-        if covered and not allowlist_pending:
-            continue
-        if len(items) < MAX_WATCH_ITEMS:
-            event = db.get(SecurityEvent, group.last_id)
-            items.append(
-                {
-                    "ip": group.ip,
-                    "rule": group.rule,
-                    "action": group.action,
-                    "count": group.count,
-                    "last_ts": event.ts,
-                    "ports": event.ports or [],
-                    "ttl": event.ttl,
-                    "evidence": event.evidence,
-                    "pending": covered,
-                }
-            )
+    newest = sorted(groups, key=lambda g: g.last_id, reverse=True)
+    visible = [g for g in newest if allowlist_pending or not covered[g.ip]]
+    listed = visible[:MAX_WATCH_ITEMS]
+    latest = {e.id: e for e in db.query(SecurityEvent).filter(SecurityEvent.id.in_([g.last_id for g in listed]))}
+    items = [
+        {
+            "ip": group.ip,
+            "cover": _cover(group.ip),
+            "rule": group.rule,
+            "action": group.action,
+            "count": group.count,
+            "last_ts": latest[group.last_id].ts,
+            "ports": latest[group.last_id].ports or [],
+            "ttl": latest[group.last_id].ttl,
+            "evidence": latest[group.last_id].evidence,
+            "pending": covered[group.ip],
+        }
+        for group in listed
+    ]
     first_seen = agent.first_seen
     return {
         "node_id": agent.node_id,
         "window_days": WATCH_DAYS,
-        "would_block": sum(g.count for g in groups if g.action in BLOCK_ACTIONS),
-        "would_slow": sum(g.count for g in groups if g.action == "rate_limit"),
-        "addresses": len({g.ip for g in groups}),
+        "would_block": sum(g.count for g in blocks),
+        "would_slow": sum(g.count for g in limits),
+        "addresses": len({g.ip for g in blocks}),
+        "limited_addresses": len({g.ip for g in limits}),
+        "waiting": len({g.ip for g in reviewable}),
         "by_rule": [{"rule": r, "count": n} for r, n in sorted(by_rule.items(), key=lambda kv: -kv[1])],
         "watched_days": int((now - first_seen) // DAY_SECONDS) if first_seen else 0,
         "ready": bool(first_seen and now - first_seen >= WATCH_DAYS * DAY_SECONDS),
         "items": items,
+        "items_total": len(visible),
     }
 
 
@@ -245,7 +263,7 @@ def overview(db: Session = Depends(_db)):
             "slowed": sum(b["kind"] == "rate_limit" for b in real),
             "simulated": len(blocks_now) - len(real),
         },
-        "watch_items": sum(len(w["items"]) for w in _watching(db, now, commands)),
+        "watch_items": sum(w["items_total"] for w in _watching(db, now, commands)),
         "attention": [a for s in servers for a in _attention(s, now)],
         "recent": recent[:RECENT_LIMIT],
         "servers": servers,
@@ -253,27 +271,91 @@ def overview(db: Session = Depends(_db)):
 
 
 class CustomerRequest(BaseModel):
-    ip: str = Field(max_length=45)
+    ip: str = Field(max_length=64)
+
+
+class CustomerRemoval(BaseModel):
+    entry: str = Field(max_length=64)
+
+
+def _customer_network(text: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    if "/" not in text:
+        network = _network(text)
+    else:
+        try:
+            network = ipaddress.ip_network(text, strict=False)
+        except ValueError:
+            return None
+        # An IPv6 block covers the whole /64, so anything narrower would leave the customer blockable through a neighbour.
+        if network.version == 6 and network.prefixlen > 64:
+            network = network.supernet(new_prefix=64)
+    return None if network is None or network.network_address.is_unspecified else network
+
+
+def _on_every_server(db: Session, change) -> tuple[list[str], list[str]]:
+    """One transaction under the allowlist lock; a savepoint per server keeps one failure from undoing the others."""
+    sent, failed = [], []
+    with ALLOWLIST_LOCK:
+        for agent in _live_agents(db, for_update=True):
+            node_id = agent.node_id
+            try:
+                with db.begin_nested():
+                    applied = change(agent)
+            except SQLAlchemyError:
+                failed.append(node_id)
+            else:
+                if applied:
+                    sent.append(node_id)
+        try:
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            return [], [*sent, *failed]
+    return sent, failed
 
 
 @router.post("/customers")
 def mark_customer(body: CustomerRequest, db: Session = Depends(_db)):
-    network = _network(body.ip)
-    if network is None or network.network_address.is_unspecified:
-        raise HTTPException(400, "invalid IP address")
-    # An IPv6 block covers the whole /64, so allowing one host would leave the customer blockable through a neighbour.
-    ip = str(network.network_address) if network.version == 4 else str(ipaddress.ip_address(body.ip))
-    sent, full = [], []
-    for agent in _live_agents(db):
+    network = _customer_network(body.ip)
+    if network is None:
+        raise HTTPException(400, "invalid IP address or range")
+    entry = str(network)
+    # A range names no single address, so its blocks are lifted by the agent when the new allowlist arrives.
+    address = None
+    if "/" not in body.ip:
+        address = str(network.network_address) if network.version == 4 else str(ipaddress.ip_address(body.ip))
+    full = []
+
+    def add(agent: Agent) -> bool:
         current = agent.allowlist or []
-        if not _covered(network, current):
-            if len(current) >= MAX_ALLOWLIST:
-                full.append(agent.node_id)
-            else:
-                agent.allowlist = [*current, str(network)]
-                db.commit()
-                enqueue(db, agent.node_id, "allowlist", {"ips": agent.allowlist})
-        enqueue(db, agent.node_id, "unblock", {"ip": ip})
-        if agent.node_id not in full:
-            sent.append(agent.node_id)
-    return {"status": "sent", "entry": str(network), "sent": sent, "full": full}
+        listed = _covered(network, current)
+        if not listed and len(current) >= MAX_ALLOWLIST:
+            full.append(agent.node_id)
+        elif not listed:
+            agent.allowlist = [*current, entry]
+            enqueue(db, agent.node_id, "allowlist", {"ips": agent.allowlist}, commit=False)
+        if address:
+            enqueue(db, agent.node_id, "unblock", {"ip": address}, commit=False)
+        return agent.node_id not in full
+
+    sent, failed = _on_every_server(db, add)
+    return {"status": "partial" if failed else "sent", "entry": entry, "sent": sent, "full": full, "failed": failed}
+
+
+@router.post("/customers/remove")
+def remove_customer(body: CustomerRemoval, db: Session = Depends(_db)):
+    try:
+        entry = str(ipaddress.ip_network(body.entry, strict=False))
+    except ValueError:
+        raise HTTPException(400, "invalid IP address or range") from None
+
+    def remove(agent: Agent) -> bool:
+        current = agent.allowlist or []
+        if entry not in current:
+            return False
+        agent.allowlist = [e for e in current if e != entry]
+        enqueue(db, agent.node_id, "allowlist", {"ips": agent.allowlist}, commit=False)
+        return True
+
+    sent, failed = _on_every_server(db, remove)
+    return {"status": "partial" if failed else "sent", "entry": entry, "sent": sent, "failed": failed}

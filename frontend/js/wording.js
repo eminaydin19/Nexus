@@ -27,8 +27,7 @@ export function modeState(server) {
   return { cls, text: modeName(server.reported_mode) };
 }
 
-/* IPv6 blocks cover a whole /64 and the agent reports only its network address. */
-export const blockAddress = (block) => (block.ip.includes(":") && !block.ip.includes("/") ? `${block.ip}/64` : block.ip);
+export const blockAddress = (block) => (isServerWide(block) ? "Server-wide" : block.cover);
 
 const portsText = (ports) => `${ports.length === 1 ? "port" : "ports"} ${ports.join(", ")}`;
 const capital = (s) => s[0].toUpperCase() + s.slice(1);
@@ -84,7 +83,7 @@ export function describeRow(row) {
   return {
     node: row.node_id,
     what: eventHeadline(row),
-    who: isServerWide(row) ? "Server-wide" : row.ip,
+    who: isServerWide(row) ? "Server-wide" : row.cover,
     code: row.rule,
     evidence: row.evidence,
     pill: eventPill(row),

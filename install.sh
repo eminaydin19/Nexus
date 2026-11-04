@@ -214,7 +214,7 @@ report() {
     local base bind token_cmd agent_cmd
     if [ -n "$DOMAIN" ]; then
         base="https://$DOMAIN"
-        agent_cmd="curl -fsSL $base/install-agent.sh | sudo bash -s -- --token <token>"
+        agent_cmd="curl -fsSL $base/install-agent.sh | NEXUS_ENROLL_TOKEN=<token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash"
     else
         bind="$(env_get HTTP_BIND)"
         if bind_is_loopback "$bind"; then
@@ -222,7 +222,7 @@ report() {
         else
             base="http://<this-server>:${bind##*:}"
         fi
-        agent_cmd="curl -fsSL $base/install-agent.sh | sudo bash -s -- --url $base --token <token>"
+        agent_cmd="curl -fsSL $base/install-agent.sh | NEXUS_ENROLL_TOKEN=<token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash -s -- --url $base"
     fi
     token_cmd="curl -u $ADMIN_USER -X POST -H 'Content-Type: application/json' -d '{\"name\":\"web-1\"}' $base/api/agents/tokens"
     say ""

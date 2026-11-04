@@ -185,7 +185,7 @@ Login yolları ayarlanabilir, varsayılan `/login`, `/wp-login.php`, `/admin`, `
 - Alan adı yoksa yalnızca `127.0.0.1` üzerinde dinler ve dashboard'a SSH tüneli ile girilir. Bu modda yalnızca aynı makinedeki agent bağlanır. Şifre internette düz HTTP'den gitmez.
 - Kurulum sonunda dashboard adresi, kullanıcı adı ve şifre gösterilir.
 
-**Agent:** Dashboard, sunucu başına komut üretir. `curl -fsSL https://<merkez>/install-agent.sh | sudo bash -s -- --token <tek-kullanımlık>`. Script merkezden sunulur, venv kurar, `systemd` servisini başlatır, `observe` modunda açılır. `--uninstall` agent'ı ve `inet nexus` tablosunu siler.
+**Agent:** Dashboard, sunucu başına komut üretir. `curl -fsSL https://<merkez>/install-agent.sh | NEXUS_ENROLL_TOKEN=<tek-kullanımlık> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash`. Script merkezden sunulur, venv kurar, `systemd` servisini başlatır, `observe` modunda açılır. `--uninstall` agent'ı ve `inet nexus` tablosunu siler.
 
 ## Dashboard
 

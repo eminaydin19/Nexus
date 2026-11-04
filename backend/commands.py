@@ -10,12 +10,20 @@ CommandType = Literal["unblock", "allowlist", "mode"]
 _TYPES = {"unblock", "allowlist", "mode"}
 
 
-def enqueue(db: Session, node_id: str, type: CommandType, payload: dict) -> int:
+def enqueue(db: Session, node_id: str, type: CommandType, payload: dict, commit: bool = True) -> int:
     if type not in _TYPES:
         raise ValueError(f"unsupported command type: {type}")
+    if type == "mode":
+        # A server coming back from offline must apply only the latest decision, not replay every change of mind.
+        db.query(AgentCommand).filter(
+            AgentCommand.node_id == node_id, AgentCommand.type == "mode", AgentCommand.acked_at.is_(None)
+        ).delete(synchronize_session=False)
     row = AgentCommand(node_id=node_id, type=type, payload=payload, created_at=time.time())
     db.add(row)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return row.id
 
 

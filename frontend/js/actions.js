@@ -14,6 +14,7 @@ export function statusNote(text, key) {
 }
 
 export function removeButton(block, ctx) {
+  if (isServerWide(block)) return null;
   const key = `remove:${block.node_id}:${block.ip}:${block.kind}`;
   if (block.pending_removal) return statusNote(`Removal sent, ${NEXT_CHECK_IN}`, key);
   const address = blockAddress(block);
@@ -34,17 +35,20 @@ export function customerButton(row, ctx, scope) {
   return btn("This is a customer", {
     ghost: true,
     key: `customer:${scope}:${row.ip}`,
-    label: `${row.ip} is a customer`,
+    label: `${row.cover ?? row.ip} is a customer`,
     onClick: () => markCustomer(row.ip, ctx),
   });
 }
 
+export const notSaved = (failed, ctx) => `Not saved for ${failed.map(ctx.name).join(", ")}. Try again.`;
+
 export async function markCustomer(ip, ctx) {
-  const { sent, full } = await api.markCustomer(ip);
+  const { entry, sent, full, failed } = await api.markCustomer(ip);
   const parts = [];
-  if (sent.length) parts.push(`${ip} sent to ${plural(sent.length, "server")}, ${NEXT_CHECK_IN}.`);
-  else if (!full.length) parts.push("There are no servers to send this to.");
+  if (sent.length) parts.push(`${entry} sent to ${plural(sent.length, "server")}, ${NEXT_CHECK_IN}.`);
+  else if (!full.length && !failed.length) parts.push("There are no servers to send this to.");
   if (full.length) parts.push(`Not allowed on ${full.map(ctx.name).join(", ")}: the allowlist is full.`);
+  if (failed.length) parts.push(notSaved(failed, ctx));
   toast(parts.join(" "));
   await ctx.refresh();
 }
@@ -61,8 +65,8 @@ export function enforceProblem(server) {
 function summaryLines(summary) {
   const lines = [];
   if (summary.would_block) lines.push(`${plural(summary.would_block, "block")} on ${plural(summary.addresses, "address", "addresses")}`);
-  if (summary.would_slow) lines.push(`${plural(summary.would_slow, "connection limit")}`);
-  if (summary.items.length) lines.push(`${plural(summary.items.length, "address", "addresses")} still waiting for review`);
+  if (summary.would_slow) lines.push(`${plural(summary.would_slow, "connection limit")} on ${plural(summary.limited_addresses, "address", "addresses")}`);
+  if (summary.waiting) lines.push(`${plural(summary.waiting, "address", "addresses")} still waiting for review`);
   const top = summary.by_rule[0];
   if (top) lines.push(`Most common: ${ruleName(top.rule)} (${top.count})`);
   return lines;
@@ -105,27 +109,38 @@ async function askLowerMode(server, mode, ctx) {
   await ctx.refresh();
 }
 
-/* What the server is doing now is the pressed button; a request still on its way is stated next to it. */
+async function withdrawMode(server, mode, replaced, ctx) {
+  const name = serverName(server);
+  await api.setMode(server.node_id, mode);
+  toast(`Sent, this replaced the switch to ${modeName(replaced)}. ${name} stays on ${modeName(mode)}, ${NEXT_CHECK_IN}.`);
+  await ctx.refresh();
+}
+
+/* What the server is doing now is the pressed button; a request still on its way is stated next to it, and can be replaced. */
 export function modeControl(server, ctx) {
   const problem = enforceProblem(server);
   const pendingMode = server.pending.filter((c) => c.type === "mode").at(-1)?.payload?.mode;
+  const switching = pendingMode && pendingMode !== server.reported_mode ? pendingMode : null;
+  const choose = (mode) => {
+    if (mode === server.reported_mode) return switching ? withdrawMode(server, mode, switching, ctx) : null;
+    return mode === "enforce" ? askEnforce(server, ctx) : askLowerMode(server, mode, ctx);
+  };
   const buttons = MODES.slice().reverse().map((mode) => {
-    const current = server.reported_mode === mode;
     const capped = server.status === "never" || (mode === "enforce" ? Boolean(problem) : MODES.indexOf(mode) > MODES.indexOf(server.max_mode));
     const b = btn(modeName(mode), {
       ghost: true,
       key: `mode:${server.node_id}:${mode}`,
       disabled: capped,
-      onClick: () => (current ? null : mode === "enforce" ? askEnforce(server, ctx) : askLowerMode(server, mode, ctx)),
+      onClick: () => choose(mode),
     });
-    b.setAttribute("aria-pressed", String(current));
+    b.setAttribute("aria-pressed", String(server.reported_mode === mode));
     return b;
   });
   const group = h("div", "modes", ...buttons);
   group.setAttribute("role", "group");
   group.setAttribute("aria-label", `Mode of ${serverName(server)}`);
   const notes = [
-    pendingMode ? h("span", "meta", `Switching to ${modeName(pendingMode)}, ${NEXT_CHECK_IN}.`) : null,
+    switching ? h("span", "meta", `Switching to ${modeName(switching)}, ${NEXT_CHECK_IN}.`) : null,
     server.config?.enforce_waiting_sample ? h("span", "meta", "Waiting for a first look at open ports before blocking.") : null,
     problem ? h("span", "meta", problem) : null,
   ];

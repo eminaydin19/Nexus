@@ -1,7 +1,7 @@
 import { api, ApiError } from "./api.js";
 import { modeControl } from "./actions.js";
 import { chartPanels, destroyCharts, drawCharts } from "./charts.js";
-import { btn, confirmDialog, dialogButton, dialogForm, duration, h, keyValues, linkButton, list, pill, plural, section, showDialog, toast } from "./ui.js";
+import { btn, confirmDialog, dialogButton, dialogCancel, dialogForm, duration, h, keyValues, linkButton, list, pill, plural, section, showDialog, toast } from "./ui.js";
 import { modeState, serverName } from "./wording.js";
 
 const RANGES = [["60", "Last hour"], ["1440", "Last 24 hours"], ["10080", "Last 7 days"]];
@@ -30,7 +30,7 @@ function lastSeen(server, now) {
 export function installCommand(token, publicUrl, origin) {
   const url = publicUrl || origin;
   const tail = publicUrl ? "bash" : `bash -s -- --url ${origin}`;
-  return `curl -fsSL ${url}/install-agent.sh | sudo NEXUS_ENROLL_TOKEN=${token} ${tail}`;
+  return `curl -fsSL ${url}/install-agent.sh | NEXUS_ENROLL_TOKEN=${token} sudo --preserve-env=NEXUS_ENROLL_TOKEN ${tail}`;
 }
 
 async function copy(button, text, pre) {
@@ -43,7 +43,7 @@ async function copy(button, text, pre) {
   }
 }
 
-function showCommand(name, answer, ctx) {
+async function showCommand(name, answer, ctx) {
   const command = installCommand(answer.token, answer.public_url, location.origin);
   const pre = h("pre", "cmd", command);
   pre.tabIndex = 0;
@@ -59,9 +59,11 @@ function showCommand(name, answer, ctx) {
     pre,
     local,
     h("p", "sub", "The server starts by watching and blocks nothing until you approve it."),
+    h("p", "sub", "If sudo refuses to keep the variable, allow SETENV in sudoers or run this from a root shell (sudo -i)."),
     h("div", "acts", copyButton, dialogButton("Done", "done", { ghost: true })),
   );
-  showDialog(form).then(() => ctx.refresh());
+  await showDialog(form);
+  await ctx.refresh();
 }
 
 async function addServer(ctx) {
@@ -78,7 +80,7 @@ async function addServer(ctx) {
     "Add a server",
     h("label", "", "Server name", input),
     problem,
-    h("div", "acts", dialogButton("Cancel", "no", { ghost: true }), create),
+    h("div", "acts", dialogCancel("Cancel"), create),
   );
   let answer = null;
   form.addEventListener("submit", async (e) => {
@@ -96,7 +98,7 @@ async function addServer(ctx) {
   });
   const name = () => input.value.trim();
   const value = await showDialog(form);
-  if (value === "created" && answer) showCommand(name(), answer, ctx);
+  if (value === "created" && answer) await showCommand(name(), answer, ctx);
 }
 
 async function revoke(server, ctx) {

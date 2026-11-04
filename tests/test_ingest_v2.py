@@ -77,7 +77,7 @@ def test_mode_above_max_rejected(client):
     ingest(client, key, config={"max_mode": "enforce"})
     assert client.put(f"/api/agents/{node}/mode", json={"mode": "enforce"}).status_code == 200
     types = [c["type"] for c in ingest(client, key).json()["commands"]]
-    assert types == ["mode", "mode"]
+    assert types == ["mode"]
 
 
 def test_allowlist_validated_and_enqueued(client):

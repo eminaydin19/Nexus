@@ -275,7 +275,6 @@ test("enforce dialog shows the real summary, closes by Escape, and approves only
   await expect(dialog).toContainText(`${summary.would_block} blocks on ${summary.addresses} addresses`);
   await expect(dialog).toContainText("Most common: SSH password guessing");
   await noAxeViolations(page);
-  await page.screenshot({ path: `${OUT}/dialog-enforce-desktop.png` });
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(review).toBeFocused();
@@ -342,7 +341,7 @@ test("allowlist edits merge, survive a poll, and refuse bad input", async ({ pag
   await expect(page.locator("#toast")).toContainText("applies at next check-in");
   const added = (await (await request.get("/api/agents")).json()).agents.find((a) => a.node_id === "web-2").allowlist;
   expect(added).toEqual([...existing, "198.18.0.0/24"]);
-  await page.getByRole("button", { name: "Remove 198.18.0.0/24 from web-2" }).click();
+  await page.getByRole("button", { name: "Remove 198.18.0.0/24" }).click();
   await page.locator("dialog[open]").getByRole("button", { name: "Remove" }).click();
   await expect(page.locator("#toast")).toContainText("Removal of 198.18.0.0/24");
   const removed = (await (await request.get("/api/agents")).json()).agents.find((a) => a.node_id === "web-2").allowlist;
@@ -363,14 +362,13 @@ test("add server shows the one-time command once", async ({ page, context }) => 
   await expect(dialog).toContainText("Install the agent on <b>fresh</b>");
   const command = await dialog.locator(".cmd").textContent();
   if (PUBLIC_URL) {
-    expect(command).toMatch(new RegExp(`^curl -fsSL ${PUBLIC_URL}/install-agent\\.sh \\| sudo NEXUS_ENROLL_TOKEN=[\\w-]+ bash$`));
+    expect(command).toMatch(new RegExp(`^curl -fsSL ${PUBLIC_URL}/install-agent\\.sh \\| NEXUS_ENROLL_TOKEN=[\\w-]+ sudo --preserve-env=NEXUS_ENROLL_TOKEN bash$`));
     await expect(dialog).not.toContainText("PUBLIC_URL");
   } else {
-    expect(command).toMatch(new RegExp(`^curl -fsSL ${BASE}/install-agent\\.sh \\| sudo NEXUS_ENROLL_TOKEN=[\\w-]+ bash -s -- --url ${BASE}$`));
+    expect(command).toMatch(new RegExp(`^curl -fsSL ${BASE}/install-agent\\.sh \\| NEXUS_ENROLL_TOKEN=[\\w-]+ sudo --preserve-env=NEXUS_ENROLL_TOKEN bash -s -- --url ${BASE}$`));
     await expect(dialog).toContainText("Only agents on this machine can reach it");
   }
   await noAxeViolations(page);
-  await page.screenshot({ path: `${OUT}/dialog-command-desktop.png` });
   await dialog.getByRole("button", { name: "Copy command" }).click();
   await expect(dialog.getByRole("button", { name: "Copied" })).toBeVisible();
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(command);
@@ -430,7 +428,236 @@ test("Content-Security-Policy is live and blocks injected script", async ({ page
   expect(ran).toBe(false);
 });
 
+const writesOf = (page) => {
+  const seen = [];
+  page.on("request", (r) => { if (r.method() !== "GET") seen.push(`${r.method()} ${new URL(r.url()).pathname} ${r.postData() ?? ""}`.trim()); });
+  return seen;
+};
+const slowSummary = (page) => page.route("**/api/watch/*", async (route) => {
+  await new Promise((done) => setTimeout(done, 1200));
+  await route.continue();
+});
+const agentNamed = async (request, id) => (await (await request.get("/api/agents")).json()).agents.find((a) => a.node_id === id);
+
+async function settle(request, id, mode) {
+  await request.put(`/api/agents/${id}/mode`, { data: { mode } });
+  await expect.poll(async () => { const a = await agentNamed(request, id); return `${a.reported_mode} ${JSON.stringify(a.pending)}`; }, { timeout: 40000 }).toBe(`${mode} []`);
+}
+
+test("fix1: two enforce clicks with a slow summary open one dialog and send one request", async ({ page, request }) => {
+  test.setTimeout(120000);
+  await settle(request, "api-1", "observe");
+  await settle(request, "web-4", "observe");
+  const writes = writesOf(page);
+  await slowSummary(page);
+  await open(page, "#/settings");
+  await page.locator('[data-key="mode:api-1:enforce"]').click();
+  await page.locator('[data-key="mode:web-4:enforce"]').click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toContainText("Start blocking on api-1?");
+  await page.waitForTimeout(1500);
+  await expect(dialog).toContainText("Start blocking on api-1?");
+  await dialog.getByRole("button", { name: "Start blocking" }).click();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await page.waitForTimeout(800);
+  expect(writes).toEqual(['PUT /api/agents/api-1/mode {"mode":"enforce"}']);
+  await page.unroute("**/api/watch/*");
+  await settle(request, "web-4", "enforce");
+  await settle(request, "api-1", "enforce");
+});
+
+test("fix1: enforce then revoke with a slow summary fires only what was shown", async ({ page, request }) => {
+  test.setTimeout(120000);
+  await settle(request, "api-1", "observe");
+  const writes = writesOf(page);
+  await slowSummary(page);
+  await open(page, "#/servers/api-1");
+  await page.locator('[data-key="mode:api-1:enforce"]').click();
+  await page.locator('[data-key="revoke:api-1"]').click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog).toContainText("Start blocking on api-1?");
+  await page.waitForTimeout(1500);
+  await dialog.getByRole("button", { name: "Start blocking" }).click();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await page.waitForTimeout(800);
+  expect(writes).toEqual(['PUT /api/agents/api-1/mode {"mode":"enforce"}']);
+  expect((await agentNamed(request, "api-1")).status).not.toBe("revoked");
+  await page.unroute("**/api/watch/*");
+  await settle(request, "api-1", "enforce");
+});
+
+test("fix1: the busy state keeps focus on the control", async ({ page, request }) => {
+  test.setTimeout(120000);
+  await settle(request, "api-1", "observe");
+  await slowSummary(page);
+  await open(page, "#/settings");
+  const first = page.locator('[data-key="mode:api-1:enforce"]');
+  await first.focus();
+  await page.keyboard.press("Enter");
+  await expect(first).toBeFocused();
+  await expect(first).toHaveAttribute("aria-busy", "true");
+  await expect(page.locator("dialog[open]")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await expect(first).toBeFocused();
+  await expect(first).not.toHaveAttribute("aria-busy", "true");
+  await page.unroute("**/api/watch/*");
+  await settle(request, "api-1", "enforce");
+});
+
+test("fix1: a pending mode can be withdrawn, and only the newest stays queued", async ({ page, request }) => {
+  const writes = writesOf(page);
+  await open(page, "#/settings");
+  const stay = (await agentNamed(request, "db-1")).reported_mode;
+  const row = page.locator(".row.modes-row", { hasText: "db-1" });
+  await page.locator('[data-key="mode:db-1:off"]').click();
+  await page.locator("dialog[open]").getByRole("button", { name: "Switch to Off" }).click();
+  await expect(row).toContainText("Switching to Off");
+  await page.locator(`[data-key="mode:db-1:${stay}"]`).click();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  await expect(page.locator("#toast")).toContainText("replaced");
+  await expect(row).not.toContainText("Switching to Off");
+  expect(writes).toEqual(['PUT /api/agents/db-1/mode {"mode":"off"}', `PUT /api/agents/db-1/mode {"mode":"${stay}"}`]);
+  const after = await agentNamed(request, "db-1");
+  expect(after.pending.filter((c) => c.type === "mode").map((c) => c.payload.mode)).toEqual([stay]);
+});
+
+test("fix1: a mode button that is simply current does nothing", async ({ page }) => {
+  const writes = writesOf(page);
+  await open(page, "#/settings");
+  await page.locator('.modes button[aria-pressed="true"]:not(:disabled)').first().click();
+  await page.waitForTimeout(300);
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  expect(writes.filter((w) => w.includes("/mode"))).toEqual([]);
+});
+
+test("fix1: IPv6 rows, button and toast say /64", async ({ page, request }) => {
+  await open(page, "#/events");
+  await expect(page.locator(".row.events", { hasText: "2001:db8:4f::/64" }).first()).toBeVisible();
+  await open(page, "#/watch");
+  const row = page.locator(".row.watch", { hasText: "2001:db8:77::/64" });
+  await expect(row).toBeVisible();
+  await expect(row.locator(".who")).not.toContainText("::5");
+  await row.getByRole("button", { name: "2001:db8:77::/64 is a customer" }).click();
+  await expect(page.locator("#toast")).toContainText("2001:db8:77::/64 sent to");
+  expect((await agentNamed(request, "web-2")).allowlist).toContain("2001:db8:77::/64");
+});
+
+test("fix1: add server cancels with an empty name and Enter submits", async ({ page }) => {
+  const writes = writesOf(page);
+  await open(page, "#/servers");
+  await page.getByRole("button", { name: "Add server" }).click();
+  await page.locator("dialog[open]").getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator("dialog[open]")).toHaveCount(0);
+  expect(writes).toEqual([]);
+  await page.getByRole("button", { name: "Add server" }).click();
+  await page.locator("dialog[open]").getByRole("textbox").press("Enter");
+  await expect(page.locator("dialog[open]").getByRole("textbox")).toBeVisible();
+  expect(writes).toEqual([]);
+  await page.locator("dialog[open]").getByRole("textbox").fill("enter-box");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("dialog[open]")).toContainText("Install the agent on enter-box");
+  expect(writes).toEqual(['POST /api/agents/tokens {"name":"enter-box"}']);
+  await expect(page.locator("dialog[open]")).toContainText("sudo -i");
+  await page.keyboard.press("Escape");
+});
+
+test("fix1: a range goes to all servers and can be removed from all of them", async ({ page, request }) => {
+  await open(page, "#/settings");
+  await page.fill("#allow-ip", "198.19.0.0/24");
+  await page.selectOption("#allow-target", "");
+  await page.getByRole("button", { name: "Add to allowlist" }).click();
+  await expect(page.locator("#toast")).toContainText("198.19.0.0/24 sent to");
+  const row = page.locator(".row.allow", { hasText: "198.19.0.0/24" });
+  await expect(row).toHaveCount(1);
+  await row.getByRole("button", { name: "Remove 198.19.0.0/24" }).click();
+  const dialog = page.locator("dialog[open]");
+  await expect(dialog.locator("select")).toHaveValue("");
+  await noAxeViolations(page);
+  await dialog.getByRole("button", { name: "Remove" }).click();
+  await expect(page.locator("#toast")).toContainText("Removal of 198.19.0.0/24 sent to");
+  const { agents } = await (await request.get("/api/agents")).json();
+  for (const a of agents) expect(a.allowlist).not.toContain("198.19.0.0/24");
+});
+
+test("fix1: the events server filter follows the server list", async ({ page, request }) => {
+  await open(page, "#/events");
+  await page.selectOption("#f-node", "web-2");
+  const { token } = await (await request.post("/api/agents/tokens", { data: { name: "late-box" } })).json();
+  const { node_id: node } = await (await request.post("/api/agents/enroll", { data: { token, hostname: "late-box" } })).json();
+  await expect(page.locator("#f-node option", { hasText: "late-box" })).toHaveCount(1, { timeout: 8000 });
+  await expect(page.locator("#f-node")).toHaveValue("web-2");
+  await request.delete(`/api/agents/${node}`);
+  await expect(page.locator("#f-node option", { hasText: "late-box" })).toHaveCount(0, { timeout: 8000 });
+  await page.selectOption("#f-node", "");
+});
+
+test("fix1: Watch says when its list is cut short", async ({ page }) => {
+  await page.route("**/api/watch", async (route) => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.servers[0].items_total = body.servers[0].items.length + 500;
+    await route.fulfill({ response, json: body });
+  });
+  await open(page, "#/watch");
+  await expect(page.getByText(/Showing the newest \d+ of \d+ entries/).first()).toBeVisible();
+});
+
+for (const [size, viewport] of [["desktop", { width: 1360, height: 900 }], ["375", { width: 375, height: 800 }]]) {
+  test(`dialogs at ${size}: fit, axe clean, screenshots`, async ({ page }) => {
+    await page.setViewportSize(viewport);
+    const shot = async (name) => {
+      await noAxeViolations(page);
+      const box = await page.locator("dialog[open]").boundingBox();
+      expect(box.x + box.width).toBeLessThanOrEqual(viewport.width);
+      await page.screenshot({ path: `${OUT}/dialog-${name}-${size}.png` });
+    };
+    const close = async () => { await page.keyboard.press("Escape"); await expect(page.locator("dialog[open]")).toHaveCount(0); };
+
+    await open(page, "#/watch");
+    await page.getByRole("button", { name: "Review and start blocking on web-2" }).click();
+    await expect(page.locator("dialog[open]")).toBeVisible();
+    await shot("enforce");
+    await close();
+
+    await open(page, "#/settings");
+    await page.locator('[data-key="mode:web-1:off"], [data-key="mode:xss-host:off"]').first().click();
+    await expect(page.locator("dialog[open]")).toBeVisible();
+    await shot("lower-mode");
+    await close();
+    await page.getByRole("button", { name: /^Remove 192\.0\.2\.0\/24/ }).click();
+    await shot("remove-allowlist");
+    await close();
+    await page.getByRole("button", { name: /^Remove 2001:db8:77::\/64/ }).click();
+    await expect(page.locator("dialog[open] select")).toHaveValue("");
+    await shot("remove-customer");
+    await close();
+
+    await open(page, "#/servers/web-4");
+    await page.getByRole("button", { name: "Revoke" }).click();
+    await shot("revoke");
+    await close();
+
+    await open(page, "#/servers");
+    await page.getByRole("button", { name: "Add server" }).click();
+    await shot("add-server");
+    await page.locator("dialog[open]").getByRole("textbox").fill("shot-box");
+    await page.keyboard.press("Enter");
+    await expect(page.locator("dialog[open]")).toContainText("Install the agent");
+    await shot("command");
+    await close();
+  });
+}
+
 if (IS_XSS) {
+  test("fix1: a 0.0.0.0 block is server-wide with no actions", async ({ page }) => {
+    await open(page, "#/blocks");
+    const row = page.locator(".row.blocks", { hasText: "0.0.0.0" }).or(page.locator(".row.blocks", { hasText: "Server-wide" }));
+    await expect(row.locator(".who")).toHaveText("Server-wide");
+    await expect(row).not.toContainText("0.0.0.0");
+    await expect(row.getByRole("button")).toHaveCount(0);
+  });
+
   const stripCsp = (page) => page.route("**/*", async (route) => {
     const response = await route.fetch();
     const headers = { ...response.headers() };

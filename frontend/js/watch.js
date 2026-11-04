@@ -13,7 +13,7 @@ function watchRow(item, nodeId, ctx) {
   );
   const key = `customer:watch:${nodeId}:${item.ip}:${item.rule}`;
   const act = item.pending ? statusNote(`Customer sent, ${NEXT_CHECK_IN}`, key) : customerButton(item, ctx, `watch:${nodeId}:${item.rule}`);
-  const who = isServerWide(item) ? "Server-wide" : item.ip;
+  const who = isServerWide(item) ? "Server-wide" : item.cover;
   return h("li", "row watch", h("div", "who", who), detail, h("div", "acts", act));
 }
 
@@ -51,7 +51,8 @@ export default {
       const name = serverName(entry.server);
       const rows = entry.items.map((item) => watchRow(item, entry.node_id, ctx));
       const sub = entry.would_block || entry.would_slow ? `${plural(entry.would_block, "would-be block")}, ${plural(entry.would_slow, "would-be limit")} in 7 days` : null;
-      out.push(section(`${name}: would have been blocked`, sub, call(entry, ctx), list(rows, `No addresses to review. New ones appear here as ${name} sees them.`)));
+      const cut = entry.items_total > entry.items.length ? h("p", "sub", `Showing the newest ${entry.items.length} of ${entry.items_total} entries.`) : null;
+      out.push(section(`${name}: would have been blocked`, sub, call(entry, ctx), cut, list(rows, `No addresses to review. New ones appear here as ${name} sees them.`)));
     }
     return out;
   },

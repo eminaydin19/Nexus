@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nexus agent installer. Served by central at /install-agent.sh.
-#   curl -fsSL https://<central>/install-agent.sh | sudo bash -s -- --token <one-time-token>
+#   curl -fsSL https://<central>/install-agent.sh | NEXUS_ENROLL_TOKEN=<one-time-token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash
 # Nothing runs until the last line, and a cut anywhere in that line is a syntax error, so a truncated download changes nothing.
 
 EMBEDDED_URL='__NEXUS_PUBLIC_URL__'

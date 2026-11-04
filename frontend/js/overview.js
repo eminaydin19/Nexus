@@ -10,12 +10,12 @@ const REJECTED = new Map([
   ["setup_failed", { text: "The agent could not set up its firewall table. To see why, run this on the server:", command: JOURNAL }],
 ]);
 
-function attentionContent(a) {
+function attentionContent(a, now) {
   const name = a.name || a.node_id;
   switch (a.type) {
     case "offline":
       return a.last_seen
-        ? { p: { cls: "danger", text: "Offline" }, title: `${name} stopped checking in`, text: "Its existing blocks keep working and expire by themselves. To see why the agent stopped, run this on the server:", command: JOURNAL }
+        ? { p: { cls: "danger", text: "Offline" }, title: `${name} stopped checking in`, text: `Last seen ${duration(now - a.last_seen)} ago. Blocks it already applied expire by themselves if the server is still up. To see why the agent stopped, run this on the server:`, command: JOURNAL }
         : { p: { cls: "warn", text: "Not seen" }, title: `${name} has not checked in yet`, text: "Its install may not have finished. To check the agent, run this on the server:", command: JOURNAL };
     case "watch_ready":
       return { p: { cls: "warn", text: "Ready" }, title: `${name} finished 7 days of watching`, text: "Review what it would have blocked, then decide. It will not start blocking by itself.", link: ["Review", "#/watch"] };
@@ -35,10 +35,10 @@ function attentionContent(a) {
 }
 
 const URGENCY = ["danger", "warn", "neutral"];
-const byUrgency = (a, b) => URGENCY.indexOf(attentionContent(a).p.cls) - URGENCY.indexOf(attentionContent(b).p.cls);
+const byUrgency = (a, b) => URGENCY.indexOf(attentionContent(a, 0).p.cls) - URGENCY.indexOf(attentionContent(b, 0).p.cls);
 
-function attentionRow(a) {
-  const c = attentionContent(a);
+function attentionRow(a, now) {
+  const c = attentionContent(a, now);
   const body = h("div", "", h("div", "what", c.title), h("div", "meta", c.text), c.command ? h("code", "cmdline", c.command) : null);
   const link = c.link ? linkButton(c.link[0], c.link[1], { ghost: c.link[1] !== "#/watch", label: `${c.link[0]}: ${a.name || a.node_id}` }) : null;
   return h("li", "row attention", pill(c.p), body, h("div", "acts", link));
@@ -100,7 +100,7 @@ export default {
       ]),
     );
     const out = [state, section("Servers", null, h("div", "list servers", ...data.servers.map((s) => serverCell(s, ctx.now()))))];
-    out.push(section("Needs you", null, list([...data.attention].sort(byUrgency).map(attentionRow), "Nothing needs you right now.")));
+    out.push(section("Needs you", null, list([...data.attention].sort(byUrgency).map((a) => attentionRow(a, ctx.now())), "Nothing needs you right now.")));
     out.push(section("Recent events", null, list(data.recent.map((r) => eventRow(r, ctx)), "No events yet. They appear here as your servers report them.")));
     return out;
   },

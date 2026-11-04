@@ -126,8 +126,11 @@ class BasicAuthMiddleware:
         return user_ok and password_ok
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] in self._exempt or self._authorized(scope):
+        if scope["type"] == "lifespan" or (scope["type"] == "http" and (scope["path"] in self._exempt or self._authorized(scope))):
             await self.app(scope, receive, send)
+            return
+        if scope["type"] != "http":
+            await send({"type": "websocket.close", "code": 1008})
             return
         response = Response("Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Nexus"'})
         await response(scope, receive, send)

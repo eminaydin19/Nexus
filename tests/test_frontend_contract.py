@@ -1,6 +1,8 @@
+import asyncio
 import base64
 import re
 import time
+from pathlib import Path
 from pathlib import Path
 
 import pytest
@@ -8,8 +10,10 @@ import pytest
 pytest.importorskip("torch")
 
 from fastapi.testclient import TestClient
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 
-from backend.db import ActiveBlock, Agent, SecurityEvent, SessionLocal
+from backend.db import ActiveBlock, Agent, SecurityEvent, SessionLocal, engine
 
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
 BASIC = {"Authorization": "Basic " + base64.b64encode(b"admin:test-password").decode()}
@@ -168,11 +172,20 @@ def test_rule_names_live_in_one_module():
             assert "ssh_bruteforce" not in text, name
 
 
-def test_offline_threshold_is_three_send_intervals():
+def test_offline_threshold_outlasts_the_agents_backoff():
     from backend.agents import OFFLINE_AFTER_SECONDS
-    from nexus_agent.main import SEND_INTERVAL
+    from nexus_agent.main import MAX_BACKOFF
 
-    assert OFFLINE_AFTER_SECONDS == 3 * SEND_INTERVAL
+    assert OFFLINE_AFTER_SECONDS == 90 and OFFLINE_AFTER_SECONDS > MAX_BACKOFF + 20
+
+
+def test_a_server_in_backoff_is_not_offline(client):
+    node, key = make_node(client)
+    ingest(client, key)
+    edit_agent(node, last_seen=time.time() - 75)
+    assert server(client, node)["status"] == "online"
+    edit_agent(node, last_seen=time.time() - 95)
+    assert server(client, node)["status"] == "offline"
 
 
 # Headers
@@ -448,7 +461,8 @@ def test_watch_summary_uses_only_simulated_blocks(client):
     ingest(client, key, config={"mode": "observe"}, events=watch_events())
     body = client.get(f"/api/watch/{node}").json()
     assert body["window_days"] == 7 and body["node_id"] == node
-    assert (body["would_block"], body["would_slow"], body["addresses"]) == (2, 1, 2)
+    assert (body["would_block"], body["would_slow"]) == (2, 1)
+    assert (body["addresses"], body["limited_addresses"]) == (1, 1)
     assert body["by_rule"][0] == {"rule": "web_login_bruteforce", "count": 2}
     item = next(i for i in body["items"] if i["rule"] == "web_login_bruteforce")
     assert item["count"] == 2 and item["evidence"] == "b" and item["ports"] == [80, 443] and item["ttl"] == 900
@@ -489,6 +503,125 @@ def test_watch_list_only_has_watching_servers(client):
 def test_watch_list_skips_a_server_that_never_checked_in(client):
     node, _ = make_node(client)
     assert node not in {s["node_id"] for s in client.get("/api/watch").json()["servers"]}
+
+
+def test_enforce_summary_leaves_out_allowlisted_and_server_wide(client):
+    node, key = make_node(client)
+    events = watch_events() + [
+        {"rule": "port_scan", "ip": "0.0.0.0", "action": "block_all", "ttl": 60, "evidence": "x", "simulated": True},
+        {"rule": "web_probe", "ip": "192.0.2.5", "action": "block_port", "ports": [80], "ttl": 60, "evidence": "x", "simulated": True},
+    ]
+    ingest(client, key, config={"mode": "observe"}, events=events)
+    edit_agent(node, allowlist=["192.0.2.0/24"])
+    body = client.get(f"/api/watch/{node}").json()
+    assert (body["would_block"], body["addresses"], body["would_slow"], body["limited_addresses"]) == (2, 1, 1, 1)
+    assert "web_probe" not in {r["rule"] for r in body["by_rule"]} and "port_scan" not in {r["rule"] for r in body["by_rule"]}
+    # Server-wide rows stay visible on Watch, but nobody can review them as an address.
+    assert {i["ip"] for i in body["items"]} == {"0.0.0.0", "198.51.100.61", "198.51.100.62"}
+    assert body["waiting"] == 2
+
+
+def test_watch_reports_true_count_past_the_cap(client):
+    from backend.panel import MAX_WATCH_ITEMS
+
+    node, _ = make_node(client)
+    with SessionLocal() as db:
+        for i in range(MAX_WATCH_ITEMS + 5):
+            db.add(SecurityEvent(
+                node_id=node, ts=time.time(), rule="r", ip=f"198.18.{i // 256}.{i % 256}", action="block_port", simulated=True,
+                evidence=f"line {i}",
+            ))
+        db.commit()
+    body = client.get(f"/api/watch/{node}").json()
+    assert len(body["items"]) == MAX_WATCH_ITEMS and body["items_total"] == MAX_WATCH_ITEMS + 5
+    assert body["waiting"] == MAX_WATCH_ITEMS + 5
+    assert body["items"][0]["evidence"] == f"line {MAX_WATCH_ITEMS + 4}"
+
+
+def test_watch_loads_the_listed_events_in_one_query(client):
+    node, _ = make_node(client)
+    with SessionLocal() as db:
+        for i in range(30):
+            db.add(SecurityEvent(node_id=node, ts=time.time(), rule="r", ip=f"198.18.0.{i}", action="block_port", simulated=True, evidence="e"))
+        db.commit()
+    statements = []
+    listen = lambda conn, cursor, sql, *rest: statements.append(sql) if "security_events" in sql else None
+    event.listen(engine, "before_cursor_execute", listen)
+    try:
+        assert len(client.get(f"/api/watch/{node}").json()["items"]) == 30
+    finally:
+        event.remove(engine, "before_cursor_execute", listen)
+    assert len(statements) == 2
+
+
+def test_ipv6_rows_carry_the_range_a_block_covers(client):
+    node, key = make_node(client)
+    v6 = {"rule": "web_exploit", "ip": "2001:db8:9::5", "action": "block_port", "ports": [80], "ttl": 60, "evidence": "x", "simulated": True}
+    ingest(client, key, config={"mode": "observe"}, events=[v6, {**SSH, "simulated": True}],
+           active_blocks=[{"ip": "2001:db8:9::", "rule": "web_exploit", "until": time.time() + 900}])
+    covers = {i["ip"]: i["cover"] for i in client.get(f"/api/watch/{node}").json()["items"]}
+    assert covers == {"2001:db8:9::5": "2001:db8:9::/64", "203.0.113.9": "203.0.113.9"}
+    rows = client.get("/api/events", params={"node": node}).json()["events"]
+    assert {r["cover"] for r in rows} == {"2001:db8:9::/64", "203.0.113.9"}
+    block = next(b for b in client.get("/api/blocks").json()["blocks"] if b["node_id"] == node)
+    assert block["cover"] == "2001:db8:9::/64"
+
+
+# Mode commands
+
+
+def test_a_newer_mode_replaces_the_pending_one(client):
+    node, key = make_node(client)
+    ingest(client, key, config={"max_mode": "enforce", "mode": "enforce"})
+    assert client.put(f"/api/agents/{node}/mode", json={"mode": "off"}).status_code == 200
+    assert client.put(f"/api/agents/{node}/mode", json={"mode": "observe"}).status_code == 200
+    assert client.put(f"/api/agents/{node}/mode", json={"mode": "enforce"}).status_code == 200
+    assert [p["payload"] for p in server(client, node)["pending"]] == [{"mode": "enforce"}]
+    delivered = ingest(client, key)["commands"]
+    assert [c["payload"] for c in delivered] == [{"mode": "enforce"}]
+
+
+def test_a_new_mode_leaves_other_pending_commands(client):
+    node, key = make_node(client)
+    ingest(client, key, config={"max_mode": "enforce"})
+    client.post(f"/api/agents/{node}/unblock", json={"ip": "203.0.113.5"})
+    client.put(f"/api/agents/{node}/mode", json={"mode": "off"})
+    client.put(f"/api/agents/{node}/mode", json={"mode": "observe"})
+    assert types(client, key) == ["unblock", "mode"]
+
+
+@pytest.mark.parametrize("path", ["install.sh", "install-agent.sh", "README.md"])
+def test_printed_enroll_command_keeps_the_token_out_of_ps(path):
+    text = (Path(__file__).resolve().parent.parent / path).read_text()
+    assert "sudo --preserve-env=NEXUS_ENROLL_TOKEN bash" in text
+    assert "sudo bash -s -- --token" not in text and "sudo bash -s -- --url" not in text
+
+
+# Basic auth by scope type
+
+
+async def run_auth(scope_type):
+    from backend.security import BasicAuthMiddleware
+
+    called, sent = [], []
+
+    async def inner(scope, receive, send):
+        called.append(scope["type"])
+
+    async def send(message):
+        sent.append(message)
+
+    credentials = base64.b64encode(b"u:p")
+    scope = {"type": scope_type, "path": "/x", "headers": [(b"authorization", b"Basic " + credentials)]}
+    await BasicAuthMiddleware(inner, username="u", password="p", exempt_paths=frozenset())(scope, None, send)
+    return called, sent
+
+
+def test_auth_passes_lifespan_and_refuses_websockets_even_with_credentials():
+    assert asyncio.run(run_auth("lifespan"))[0] == ["lifespan"]
+    assert asyncio.run(run_auth("http"))[0] == ["http"]
+    called, sent = asyncio.run(run_auth("websocket"))
+    assert called == [] and sent == [{"type": "websocket.close", "code": 1008}]
 
 
 # Customers
@@ -546,7 +679,7 @@ def test_customer_ipv4_mapped_becomes_ipv4(client):
     assert server(client, node)["allowlist"] == ["203.0.113.53/32"]
 
 
-@pytest.mark.parametrize("ip", ["0.0.0.0", "::", "nonsense", "<img src=x>", "203.0.113.0/24"])
+@pytest.mark.parametrize("ip", ["0.0.0.0", "::", "0.0.0.0/0", "::/0", "nonsense", "<img src=x>", "203.0.113.0/33"])
 def test_customer_rejects_what_is_not_one_address(client, ip):
     assert client.post("/api/customers", json={"ip": ip}).status_code == 400
 
@@ -561,6 +694,61 @@ def test_customer_reports_a_full_allowlist_instead_of_dropping_entries(client):
     assert node in body["full"] and node not in body["sent"]
     assert server(client, node)["allowlist"] == full
     edit_agent(node, allowlist=[])
+
+
+def test_customer_accepts_a_range_through_the_same_validation(client):
+    node, key = make_node(client)
+    assert client.put(f"/api/agents/{node}/allowlist", json=["192.0.2.0/24"]).status_code == 200
+    body = client.post("/api/customers", json={"ip": "198.51.100.9/24"}).json()
+    assert body["entry"] == "198.51.100.0/24" and node in body["sent"]
+    assert server(client, node)["allowlist"] == ["192.0.2.0/24", "198.51.100.0/24"]
+    commands = ingest(client, key)["commands"]
+    # A range has no single address to unblock; the agent lifts covered blocks when the allowlist arrives.
+    assert [c["type"] for c in commands] == ["allowlist", "allowlist"]
+    edit_agent(node, allowlist=[])
+
+
+def test_customer_ipv6_range_is_never_narrower_than_a_block(client):
+    node, _ = make_node(client)
+    assert client.post("/api/customers", json={"ip": "2001:db8:5::1/120"}).json()["entry"] == "2001:db8:5::/64"
+    assert server(client, node)["allowlist"] == ["2001:db8:5::/64"]
+
+
+def test_customer_failure_on_one_server_is_reported_and_keeps_the_rest(client, monkeypatch):
+    import backend.panel as panel
+
+    bad, _ = make_node(client)
+    good, _ = make_node(client)
+    real = panel.enqueue
+
+    def flaky(db, node, *args, **kwargs):
+        if node == bad:
+            raise OperationalError("insert", {}, Exception("disk full"))
+        return real(db, node, *args, **kwargs)
+
+    monkeypatch.setattr(panel, "enqueue", flaky)
+    r = client.post("/api/customers", json={"ip": "203.0.113.60"})
+    assert r.status_code == 200
+    body = r.json()
+    assert bad in body["failed"] and bad not in body["sent"] and good in body["sent"]
+    monkeypatch.undo()
+    # The allowlist write and its command stand or fall together.
+    assert "203.0.113.60/32" not in server(client, bad)["allowlist"] and server(client, bad)["pending"] == []
+    assert "203.0.113.60/32" in server(client, good)["allowlist"]
+    assert {p["type"] for p in server(client, good)["pending"]} == {"allowlist", "unblock"}
+
+
+def test_customer_removal_reaches_every_server_holding_the_entry(client):
+    a, key_a = make_node(client)
+    b, _ = make_node(client)
+    client.put(f"/api/agents/{a}/allowlist", json=["192.0.2.0/24"])
+    client.post("/api/customers", json={"ip": "203.0.113.61"})
+    r = client.post("/api/customers/remove", json={"entry": "203.0.113.61/32"})
+    assert r.status_code == 200
+    assert {a, b} <= set(r.json()["sent"])
+    assert server(client, a)["allowlist"] == ["192.0.2.0/24"] and server(client, b)["allowlist"] == []
+    assert ingest(client, key_a)["commands"][-1]["payload"] == {"ips": ["192.0.2.0/24"]}
+    assert client.post("/api/customers/remove", json={"entry": "nonsense"}).status_code == 400
 
 
 def test_watch_item_stays_pending_until_ack_then_leaves(client):

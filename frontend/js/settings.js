@@ -1,6 +1,6 @@
 import { api } from "./api.js";
-import { NEXT_CHECK_IN, markCustomer, modeControl } from "./actions.js";
-import { btn, confirmDialog, h, keyValues, list, pill, section, toast } from "./ui.js";
+import { NEXT_CHECK_IN, markCustomer, modeControl, notSaved } from "./actions.js";
+import { btn, confirmDialog, h, keyValues, list, pill, plural, section, toast } from "./ui.js";
 import { modeState, serverName } from "./wording.js";
 
 const EVERYWHERE = "";
@@ -57,30 +57,55 @@ function addForm(servers, ctx) {
   return form;
 }
 
-async function removeEntry(server, entry, ctx) {
-  const name = serverName(server);
+function holderSelect(holders) {
+  const scope = h("select", "", ...[[EVERYWHERE, `All ${plural(holders.length, "server")} that have it`], ...holders.map((s) => [s.node_id, serverName(s)])].map(([v, l]) => {
+    const o = h("option", "", l);
+    o.value = v;
+    return o;
+  }));
+  scope.id = "remove-from";
+  return scope;
+}
+
+async function removeEntry(entry, holders, ctx) {
+  const only = holders.length === 1 ? holders[0] : null;
+  const scope = only ? null : holderSelect(holders);
+  let label = null;
+  if (scope) {
+    label = h("label", "", "Remove from", scope);
+    label.htmlFor = scope.id;
+  }
   const yes = await confirmDialog({
-    title: `Remove ${entry} from ${name}?`,
-    body: [h("p", "", `${name} can block this address again if it breaks a rule. Entries in the agent's own file on the server stay in force.`)],
+    title: only ? `Remove ${entry} from ${serverName(only)}?` : `Remove ${entry}?`,
+    body: [label, h("p", "", `${only ? serverName(only) : "These servers"} can block this address again if it breaks a rule. Entries in an agent's own file on the server stay in force.`)],
     yes: "Remove",
     danger: true,
   });
   if (!yes) return;
-  await changeAllowlist(server.node_id, (current) => current.filter((e) => e !== entry));
-  toast(`Removal of ${entry} sent to ${name}, ${NEXT_CHECK_IN}.`);
+  const nodeId = only ? only.node_id : scope.value;
+  if (nodeId) {
+    await changeAllowlist(nodeId, (current) => current.filter((e) => e !== entry));
+    toast(`Removal of ${entry} sent to ${ctx.name(nodeId)}, ${NEXT_CHECK_IN}.`);
+  } else {
+    const { sent, failed } = await api.removeCustomer(entry);
+    const done = sent.length ? `Removal of ${entry} sent to ${plural(sent.length, "server")}, ${NEXT_CHECK_IN}.` : "";
+    toast([done, failed.length ? notSaved(failed, ctx) : ""].filter(Boolean).join(" ") || "No server has this entry any more.");
+  }
   await ctx.refresh();
 }
 
 function allowRows(servers, ctx) {
-  return servers.flatMap((server) =>
-    (server.allowlist ?? []).map((entry) =>
-      h(
-        "li",
-        "row allow",
-        h("div", "who", entry),
-        h("div", "meta", serverName(server)),
-        h("div", "acts", btn("Remove", { ghost: true, key: `allow:${server.node_id}:${entry}`, label: `Remove ${entry} from ${serverName(server)}`, onClick: () => removeEntry(server, entry, ctx) })),
-      ),
+  const holders = new Map();
+  for (const server of servers) {
+    for (const entry of server.allowlist ?? []) holders.set(entry, [...(holders.get(entry) ?? []), server]);
+  }
+  return [...holders].map(([entry, on]) =>
+    h(
+      "li",
+      "row allow",
+      h("div", "who", entry),
+      h("div", "meta", on.length === servers.length && on.length > 1 ? `All ${on.length} servers` : on.map(serverName).join(", ")),
+      h("div", "acts", btn("Remove", { ghost: true, key: `allow:${entry}`, label: `Remove ${entry}`, onClick: () => removeEntry(entry, on, ctx) })),
     ),
   );
 }

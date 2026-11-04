@@ -58,4 +58,5 @@ export const api = {
   setAllowlist: (id, entries) => send("PUT", `/api/agents/${agent(id)}/allowlist`, entries),
   setMode: (id, mode) => send("PUT", `/api/agents/${agent(id)}/mode`, { mode }),
   markCustomer: (ip) => send("POST", "/api/customers", { ip }),
+  removeCustomer: (entry) => send("POST", "/api/customers/remove", { entry }),
 };

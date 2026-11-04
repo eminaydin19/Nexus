@@ -105,6 +105,7 @@ def agents():
         event("web_login_bruteforce", "198.51.100.61", "block_port", [80, 443], 900, 'POST /wp-login.php HTTP/1.1" 200', simulated=True, ago=500),
         event("ssh_bruteforce", "203.0.113.18", "block_port", [22], 3600, "Failed password for admin from 203.0.113.18 port 40112 ssh2", simulated=True, ago=800),
         event("conn_flood", "198.51.100.204", "rate_limit", (), 600, "260 concurrent connections", simulated=True, ago=700),
+        event("web_exploit", "2001:db8:77::5", "block_port", [80, 443], 3600, "GET /item?id=1+OR+1=1", simulated=True, ago=600),
     ]
     if x:
         web1_events += [
@@ -113,6 +114,7 @@ def agents():
             event("__proto__", "203.0.113.92", "alert", (), 0, XSS, ago=30),
         ]
         web1_blocks.append(block("203.0.113.90", XSS, "block_port", [22]))
+        web1_blocks.append(block("0.0.0.0", "distributed_flood", "block_all", (), 500))
         web2_events.append(event(XSS, "198.51.100.90", "block_port", [80], 900, XSS, simulated=True, ago=5))
     return [
         FakeAgent(XSS if x else "web-1", events=web1_events, blocks=web1_blocks),

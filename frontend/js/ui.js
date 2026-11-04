@@ -7,27 +7,36 @@ export function h(tag, cls, ...children) {
 
 export const pill = ({ cls, text }) => h("span", `pill ${cls}`, text);
 
+/*
+ * One action at a time across the whole page, from the click until its dialog is closed and its request done, so one
+ * confirmation can never fire a second action on a server the operator was not shown. A flag, not b.disabled: disabling
+ * the focused button would drop keyboard focus to the top of the page. Keyed, so a polling redraw keeps the busy state.
+ */
+let inFlight = null;
+
+async function runAction(button, action) {
+  if (inFlight !== null) return;
+  inFlight = button.dataset.key ?? "";
+  button.setAttribute("aria-busy", "true");
+  try {
+    await action();
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    inFlight = null;
+    for (const el of document.querySelectorAll('[aria-busy="true"]')) el.removeAttribute("aria-busy");
+    button.removeAttribute("aria-busy");
+  }
+}
+
 export function btn(text, { ghost = false, danger = false, key, onClick, disabled = false, label } = {}) {
   const b = h("button", ghost ? "ghost" : danger ? "danger" : "", text);
   b.type = "button";
   b.disabled = disabled;
   if (key) b.dataset.key = key;
   if (label) b.setAttribute("aria-label", label);
-  if (onClick) {
-    // A busy flag, not b.disabled: disabling the focused button would drop keyboard focus to the top of the page.
-    let busy = false;
-    b.addEventListener("click", async () => {
-      if (busy) return;
-      busy = true;
-      try {
-        await onClick();
-      } catch (err) {
-        toast(err.message);
-      } finally {
-        busy = false;
-      }
-    });
-  }
+  if (key && inFlight === key) b.setAttribute("aria-busy", "true");
+  if (onClick) b.addEventListener("click", () => runAction(b, onClick));
   return b;
 }
 
@@ -93,8 +102,12 @@ export function swapView(view, next) {
   if (key && !view.contains(document.activeElement)) restoreFocus(key);
 }
 
-/* Resolves with the value of the button that closed it, or "" for Escape. */
+let dialogBusy = false;
+
+/* Resolves with the value of the button that closed it, or "" for Escape. Never replaces a dialog that is open. */
 export function showDialog(form) {
+  if (dialogBusy) return Promise.resolve("");
+  dialogBusy = true;
   const dialog = document.getElementById("dialog");
   const opener = focusedKey();
   dialog.replaceChildren(form);
@@ -106,6 +119,7 @@ export function showDialog(form) {
       () => {
         const value = dialog.returnValue;
         dialog.replaceChildren();
+        dialogBusy = false;
         restoreFocus(opener);
         resolve(value);
       },
@@ -126,6 +140,14 @@ export function dialogButton(text, value, { ghost = false, danger = false, autof
   const b = h("button", ghost ? "ghost" : danger ? "danger" : "", text);
   b.value = value;
   b.autofocus = autofocus;
+  return b;
+}
+
+/* Closes without submitting, so a required field cannot hold it open and Enter goes to the form's primary button. */
+export function dialogCancel(text) {
+  const b = h("button", "ghost", text);
+  b.type = "button";
+  b.addEventListener("click", () => b.closest("dialog").close("no"));
   return b;
 }
 

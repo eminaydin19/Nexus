@@ -2,6 +2,7 @@ import hashlib
 import ipaddress
 import re
 import secrets
+import threading
 import time
 from typing import Literal
 
@@ -21,8 +22,10 @@ MAX_ALLOWLIST = 1000
 NODE_ID_PATTERN = r"^[A-Za-z0-9._:@-]+$"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:@-]")
 _ENROLL_ATTEMPTS = 5
-# Three of the agent's SEND_INTERVAL (5 s), so one lost report does not call a server offline.
-OFFLINE_AFTER_SECONDS = 15
+# Outlasts the agent's worst healthy gap: 60 s of backoff plus one send stalling for 20 s.
+OFFLINE_AFTER_SECONDS = 90
+# Serializes allowlist read-modify-writes. Enough with SQLite only because the Dockerfile runs one uvicorn worker.
+ALLOWLIST_LOCK = threading.Lock()
 
 
 class InvalidToken(Exception):
@@ -199,8 +202,8 @@ class UnblockRequest(BaseModel):
     ip: str = Field(max_length=45)
 
 
-def _agent_or_404(db: Session, node_id: str) -> Agent:
-    agent = db.get(Agent, node_id)
+def _agent_or_404(db: Session, node_id: str, for_update: bool = False) -> Agent:
+    agent = db.get(Agent, node_id, with_for_update=for_update)
     if agent is None:
         raise HTTPException(404, "unknown agent")
     return agent
@@ -218,16 +221,16 @@ def unblock(node_id: str, body: UnblockRequest, db: Session = Depends(_db)):
 
 @router.put("/{node_id}/allowlist")
 def set_allowlist(node_id: str, body: list[str], db: Session = Depends(_db)):
-    agent = _agent_or_404(db, node_id)
     if len(body) > MAX_ALLOWLIST:
         raise HTTPException(400, f"at most {MAX_ALLOWLIST} entries")
     try:
         entries = [str(ipaddress.ip_network(item, strict=False)) for item in body]
     except ValueError:
         raise HTTPException(400, "invalid IP or CIDR in allowlist") from None
-    agent.allowlist = entries
-    db.commit()
-    return {"status": "ok", "command_id": enqueue(db, node_id, "allowlist", {"ips": entries})}
+    with ALLOWLIST_LOCK:
+        agent = _agent_or_404(db, node_id, for_update=True)
+        agent.allowlist = entries
+        return {"status": "ok", "command_id": enqueue(db, node_id, "allowlist", {"ips": entries})}
 
 
 @router.put("/{node_id}/mode")
@@ -236,5 +239,4 @@ def set_mode(node_id: str, body: ModeRequest, db: Session = Depends(_db)):
     if MODES.index(body.mode) > MODES.index(agent.max_mode):
         raise HTTPException(409, f"mode exceeds the agent's max_mode ({agent.max_mode})")
     agent.mode = body.mode
-    db.commit()
     return {"status": "ok", "command_id": enqueue(db, node_id, "mode", {"mode": body.mode})}

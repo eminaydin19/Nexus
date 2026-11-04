@@ -38,8 +38,10 @@ With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.s
 The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. To upgrade, run `git pull` first and then the installer again: it rebuilds Nexus and keeps your secrets and data. At the end it prints where to log in and how to add your first server:
 
 ```bash
-curl -fsSL https://nexus.example.com/install-agent.sh | sudo bash -s -- --token <one-time-token>
+curl -fsSL https://nexus.example.com/install-agent.sh | NEXUS_ENROLL_TOKEN=<one-time-token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash
 ```
+
+The token stays out of `ps` this way. sudo must allow keeping the variable: a sudoers rule for `ALL` already does, a narrower one needs `SETENV`. If sudo refuses, run the same line from a root shell (`sudo -i`).
 
 The agent needs systemd and Python 3.9 or newer. It starts in observe mode: no traffic is blocked until you enable enforce in the panel. Remove it with `--uninstall`. Python 3.9 can come from your distribution, for example `python3.9` on Ubuntu 20.04 or `python39` on the RHEL 8 family. CloudWatch ingestion remains optional, see `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`.
 
