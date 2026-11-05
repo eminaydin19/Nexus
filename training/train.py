@@ -99,6 +99,12 @@ def cap(array: np.ndarray, limit: int, rng: np.random.Generator) -> np.ndarray:
     return array[np.sort(rng.choice(len(array), limit, replace=False))]
 
 
+def ordinary_mask(values: np.ndarray, spread: float = 6.0) -> np.ndarray:
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    return values <= median + spread * 1.4826 * max(mad, 1e-9)
+
+
 def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, source_name: str) -> dict:
     started = time.time()
     rng = np.random.default_rng(seed)
@@ -153,6 +159,9 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         eval_on = "train"
     val_windows = cap(val_windows, 10000, rng)
 
+    # The newest history can hold an incident. Calibrating on it would make the next attack look normal, so calibrate
+    # on train and validation together and leave out windows no model finds ordinary.
+    val_windows = np.concatenate([val_windows, cap(train_windows, 10000, rng)])
     last = val_windows[:, -1, :]
     errors = {
         "iforest": iforest.error(last),
@@ -160,10 +169,12 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         "transformer": transformer.error(val_windows),
         "vae": vae.error(last),
     }
+    ordinary = np.logical_and.reduce([ordinary_mask(values) for values in errors.values()])
+    val_windows = val_windows[ordinary]
     calibration = {}
     for key, values in errors.items():
-        lo = float(np.median(values))
-        hi = float(np.percentile(values, 99))
+        lo = float(np.median(values[ordinary]))
+        hi = float(np.percentile(values[ordinary], 99))
         calibration[key] = [lo, max(hi, lo + 1e-9)]
 
     bundle = {

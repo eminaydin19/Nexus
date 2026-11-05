@@ -101,3 +101,17 @@ def test_old_bundle_format_rejected(tmp_path):
     joblib.dump({"format": 1}, path)
     with pytest.raises(ValueError):
         build_ensemble(settings).load(path)
+
+
+def test_incident_in_newest_history_does_not_blind_calibration():
+    rng = np.random.default_rng(0)
+    ts, clean = _node(rng, 600, 20, 40, 100, 5)
+    polluted = clean.copy()
+    polluted[-60:] = np.column_stack([
+        rng.uniform(0, 100, 60), rng.uniform(10, 90, 60), np.exp(rng.uniform(1, 13, 60)), np.exp(rng.uniform(0, 8, 60)),
+    ])
+    calibrated = train({"n": (ts, clean)}, 4, 1, 100, 1, "test")["calibration"]
+    survived = train({"n": (ts, polluted)}, 4, 1, 100, 1, "test")["calibration"]
+    # The top of the normal range must stay near clean behavior, not move toward the incident.
+    for key in ("lstm", "transformer", "vae"):
+        assert survived[key][1] < calibrated[key][1] * 3, (key, survived[key], calibrated[key])
