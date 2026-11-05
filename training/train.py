@@ -99,10 +99,16 @@ def cap(array: np.ndarray, limit: int, rng: np.random.Generator) -> np.ndarray:
     return array[np.sort(rng.choice(len(array), limit, replace=False))]
 
 
-def ordinary_mask(values: np.ndarray, spread: float = 6.0) -> np.ndarray:
+def ordinary_mask(
+    values: np.ndarray, older: np.ndarray | None = None, spread: float = 6.0, frequent: float = 98.0
+) -> np.ndarray:
     median = np.median(values)
     mad = np.median(np.abs(values - median))
-    return values <= median + spread * 1.4826 * max(mad, 1e-9)
+    limit = median + spread * 1.4826 * max(mad, 1e-9)
+    # A state seen in over 2% of older history recurs, whatever its distance: a cron job takes 13% of a batch server's
+    # time, and leaving it out of calibration makes the job alarm every time it runs. Only older history can vouch for
+    # a state, because an incident in the newest rows can be a large share of them.
+    return values <= max(limit, np.percentile(values if older is None else older, frequent))
 
 
 def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, source_name: str) -> dict:
@@ -117,10 +123,12 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
 
     train_parts: dict[str, list[np.ndarray]] = {}
     val_parts: dict[str, list[np.ndarray]] = {}
+    holdout_parts: dict[str, list[np.ndarray]] = {}
     for node, (ts, x) in data.items():
-        cut = int(len(x) * 0.8)
+        cut, holdout_cut = int(len(x) * 0.8), int(len(x) * 0.9)
         train_parts[node] = segments(ts[:cut], x[:cut])
-        val_parts[node] = segments(ts[cut:], x[cut:])
+        val_parts[node] = segments(ts[cut:holdout_cut], x[cut:holdout_cut])
+        holdout_parts[node] = segments(ts[holdout_cut:], x[holdout_cut:])
 
     default_scaler = FeatureScaler.fit(np.concatenate([p for parts in train_parts.values() for p in parts]))
     scalers = {
@@ -128,14 +136,16 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         for node, parts in train_parts.items()
         if sum(len(p) for p in parts) >= MIN_NODE_ROWS
     }
-    train_scaled_parts = [
-        scalers.get(node, default_scaler).transform(p) for node, parts in train_parts.items() for p in parts
-    ]
-    val_scaled_parts = [
-        scalers.get(node, default_scaler).transform(p) for node, parts in val_parts.items() for p in parts
-    ]
+    def scaled_parts(parts_by_node: dict[str, list[np.ndarray]]) -> dict[str, list[np.ndarray]]:
+        return {
+            node: [scalers.get(node, default_scaler).transform(p) for p in parts] for node, parts in parts_by_node.items()
+        }
 
-    train_scaled = np.concatenate(train_scaled_parts)
+    train_by_node, val_by_node, holdout_by_node = map(scaled_parts, (train_parts, val_parts, holdout_parts))
+    train_scaled_parts = [p for parts in train_by_node.values() for p in parts]
+
+    # At a 5 second interval history reaches hundreds of thousands of rows, and training repeats every day.
+    train_scaled = cap(np.concatenate(train_scaled_parts), 40000, rng)
     train_windows = cap(windows_from(train_scaled_parts, window), 40000, rng)
     if len(train_windows) < 200:
         raise NotEnoughDataError(f"Not enough contiguous history: {len(train_windows)} windows of {window} steps, need 200.")
@@ -151,30 +161,36 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     transformer_loss = transformer.fit(train_windows, epochs=epochs, seed=seed)
     log.info("final loss: vae=%.4f lstm=%.4f transformer=%.4f", vae_loss, lstm_loss, transformer_loss)
 
-    val_windows = windows_from(val_scaled_parts, window)
-    eval_on = "validation"
-    if len(val_windows) < 50:
-        log.warning("validation set too small (%d windows), calibrating on training data", len(val_windows))
-        val_windows = cap(train_windows, 5000, rng)
-        eval_on = "train"
-    val_windows = cap(val_windows, 10000, rng)
+    def raw_errors(windows: np.ndarray) -> dict[str, np.ndarray]:
+        last = windows[:, -1, :]
+        return {
+            "iforest": iforest.error(last),
+            "lstm": lstm.error(windows),
+            "transformer": transformer.error(windows),
+            "vae": vae.error(last),
+        }
 
     # The newest history can hold an incident. Calibrating on it would make the next attack look normal, so calibrate
-    # on train and validation together and leave out windows no model finds ordinary.
-    val_windows = np.concatenate([val_windows, cap(train_windows, 10000, rng)])
-    last = val_windows[:, -1, :]
-    errors = {
-        "iforest": iforest.error(last),
-        "lstm": lstm.error(val_windows),
-        "transformer": transformer.error(val_windows),
-        "vae": vae.error(last),
-    }
-    ordinary = np.logical_and.reduce([ordinary_mask(values) for values in errors.values()])
-    val_windows = val_windows[ordinary]
+    # on train and validation together and leave out windows no model finds ordinary. Each node keeps its own share:
+    # what is ordinary for a batch server is not ordinary for a web server.
+    node_calibration: dict[str, np.ndarray] = {}
+    limit = max(1000, 20000 // len(data))
+    for node in data:
+        older = cap(windows_from(train_by_node[node], window), limit // 2, rng)
+        node_windows = np.concatenate([cap(windows_from(val_by_node[node], window), limit // 2, rng), older])
+        if not len(node_windows):
+            continue
+        all_errors = raw_errors(node_windows)
+        ordinary = np.logical_and.reduce([
+            ordinary_mask(values, values[-len(older):] if len(older) else None) for values in all_errors.values()
+        ])
+        node_calibration[node] = node_windows[ordinary]
+    val_windows = np.concatenate(list(node_calibration.values()))
+    errors = raw_errors(val_windows)
     calibration = {}
     for key, values in errors.items():
-        lo = float(np.median(values[ordinary]))
-        hi = float(np.percentile(values[ordinary], 99))
+        lo = float(np.median(values))
+        hi = float(np.percentile(values, 99))
         calibration[key] = [lo, max(hi, lo + 1e-9)]
 
     bundle = {
@@ -200,9 +216,28 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     )
     ensemble.install_bundle(bundle)
 
-    normal = ensemble.combine(ensemble.score_arrays(val_windows))
+    def combined(windows: np.ndarray) -> np.ndarray:
+        return ensemble.combine(ensemble.score_arrays(windows))
+
+    normal = combined(val_windows)
     threshold = float(max(0.5, np.percentile(normal, 99.5)))
     bundle["threshold"] = threshold
+    thresholds = {
+        node: float(max(0.5, np.percentile(combined(windows), 99.5)))
+        for node, windows in node_calibration.items() if len(windows) >= MIN_NODE_ROWS
+    }
+    bundle["thresholds"] = thresholds
+
+    # Measured on the newest tenth of history, which neither training nor any threshold saw. An incident there counts
+    # against the rate: the number errs toward looking worse, never better.
+    alarms, seen = 0, 0
+    for node, parts in holdout_by_node.items():
+        node_windows = cap(windows_from(parts, window), 10000, rng)
+        if len(node_windows):
+            alarms += int(np.sum(combined(node_windows) >= thresholds.get(node, threshold)))
+            seen += len(node_windows)
+    eval_on = "holdout" if seen >= 50 else "calibration"
+    false_positive_rate = alarms / seen if seen >= 50 else float(np.mean(normal >= threshold))
 
     recalls = {}
     for sigma in (4, 8):
@@ -219,7 +254,7 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
         "eval_windows": len(val_windows),
         "eval_on": eval_on,
         "epochs": epochs,
-        "false_positive_rate": float(np.mean(normal >= threshold)),
+        "false_positive_rate": false_positive_rate,
         **recalls,
         "seconds": round(time.time() - started, 1),
     }

@@ -70,6 +70,11 @@ class Ensemble:
             return self.threshold_override
         return float(self.bundle["threshold"]) if self.bundle else 0.0
 
+    def threshold_for(self, node_id: str) -> float:
+        if self.threshold_override > 0 or not self.bundle:
+            return self.threshold
+        return float(self.bundle.get("thresholds", {}).get(node_id, self.bundle["threshold"]))
+
     def load(self, path: Path) -> bool:
         if not path.exists():
             return False
@@ -161,7 +166,7 @@ class Ensemble:
                 scores["transformer"] = float(to_score(self._transformer.error(windows), *self._calibration["transformer"])[0])
 
         ensemble = float(self.combine(scores))
-        is_anomaly = ensemble >= self.threshold
+        is_anomaly = ensemble >= self.threshold_for(node_id)
         severity = None
         if is_anomaly:
             severity = "critical" if ensemble >= self.critical_score else "warning"

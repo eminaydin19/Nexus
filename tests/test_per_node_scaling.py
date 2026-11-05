@@ -6,7 +6,7 @@ pytest.importorskip("torch")
 from backend.config import settings
 from backend.main import build_ensemble
 from backend.models.features import FeatureScaler
-from training.train import train
+from training.train import ordinary_mask, train
 
 
 def _node(rng, rows, cpu, mem, net, latency):
@@ -107,7 +107,8 @@ def test_incident_in_newest_history_does_not_blind_calibration():
     rng = np.random.default_rng(0)
     ts, clean = _node(rng, 600, 20, 40, 100, 5)
     polluted = clean.copy()
-    polluted[-60:] = np.column_stack([
+    # Rows 80-90% of history: the validation share, which calibration reads. The last 10% is the untouched holdout.
+    polluted[-120:-60] = np.column_stack([
         rng.uniform(0, 100, 60), rng.uniform(10, 90, 60), np.exp(rng.uniform(1, 13, 60)), np.exp(rng.uniform(0, 8, 60)),
     ])
     calibrated = train({"n": (ts, clean)}, 4, 1, 100, 1, "test")["calibration"]
@@ -115,3 +116,32 @@ def test_incident_in_newest_history_does_not_blind_calibration():
     # The top of the normal range must stay near clean behavior, not move toward the incident.
     for key in ("lstm", "transformer", "vae"):
         assert survived[key][1] < calibrated[key][1] * 3, (key, survived[key], calibrated[key])
+
+
+def test_recurring_state_stays_in_calibration():
+    values = np.concatenate([np.full(870, 1.0) + np.linspace(0, 0.01, 870), np.full(130, 50.0)])
+    assert ordinary_mask(values)[-1]
+
+
+def test_one_off_spike_leaves_calibration():
+    values = np.concatenate([np.ones(990) + np.linspace(0, 0.01, 990), np.full(10, 50.0)])
+    assert not ordinary_mask(values)[-1]
+
+
+def test_large_incident_in_newest_rows_cannot_vouch_for_itself():
+    older = np.ones(800) + np.linspace(0, 0.01, 800)
+    values = np.concatenate([np.full(200, 50.0), older])
+    assert not ordinary_mask(values, older)[0]
+    assert ordinary_mask(values)[0]
+
+
+def test_each_node_gets_its_own_threshold_and_holdout_rate(trained):
+    bundle, ens = trained
+    assert set(bundle["thresholds"]) >= {"small", "big", "flat"}
+    assert bundle["report"]["eval_on"] == "holdout"
+    assert 0.0 <= bundle["report"]["false_positive_rate"] <= 1.0
+    assert ens.threshold_for("big") == bundle["thresholds"]["big"]
+    assert ens.threshold_for("never-seen") == bundle["threshold"]
+    ens.threshold_override = 0.7
+    assert ens.threshold_for("big") == 0.7
+    ens.threshold_override = 0.0
