@@ -74,7 +74,9 @@ See [threshold tuning](docs/threshold-tuning.md) to change any threshold.
 
 ## Behind a CDN or proxy
 
-The firewall sees the CDN's address, so blocking it would cut off everyone. When traffic comes from CDN ranges, web rules on that server only alert. SSH rules keep working. Nexus trusts `X-Forwarded-For` in logs only if you enable that explicitly.
+The firewall sees the CDN's address, so blocking it would cut off everyone. When traffic comes from CDN ranges, web rules on that server only alert. SSH rules keep working. Nexus never reads `X-Forwarded-For` from logs, because a client can write anything there.
+
+Your own reverse proxy or a large NAT looks the same. An address with 200 successful requests from 10 different browsers in the last hour gets alerts from web rules, not blocks. Add your proxy to the allowlist anyway, so it is protected from its first request.
 
 ## Agent permissions and central compromise
 

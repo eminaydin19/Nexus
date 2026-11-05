@@ -624,3 +624,12 @@ def test_new_connections_reads_counters_and_tolerates_failure():
     enf.mode = "observe"
     assert enf.new_connections() == {}
 
+
+
+def test_active_survives_concat_element_without_timeout():
+    out = table_json(
+        ("port4", [{"concat": ["203.0.113.8", 22]}]),
+        ("all4", [{"elem": {"val": "203.0.113.50", "timeout": 60, "expires": 30}}]),
+    )
+    enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out)}))
+    assert "203.0.113.50" in {b.ip for b in enf.active()}

@@ -241,7 +241,8 @@ class Enforcer:
                     continue
                 for el in s.get("elem", []):
                     el = el.get("elem", el) if isinstance(el, dict) else el
-                    val = el.get("val") if isinstance(el, dict) else el
+                    # An element with no timeout has no "val": the element itself is the concat.
+                    val = el.get("val", el) if isinstance(el, dict) else el
                     expires = float(el.get("expires", 0)) if isinstance(el, dict) else 0.0
                     rule = el.get("comment", "") if isinstance(el, dict) else ""
                     if isinstance(val, dict):

@@ -22,10 +22,14 @@ MAX_BOT_CACHE = 10000
 TRUST_WINDOW = 3600
 TRUST_REQUESTS = 20
 TRUST_MULTIPLIER = 3
+SHARED_REQUESTS = 200
+SHARED_AGENTS = 10
+MAX_SHARED_IPS = 10000
 SSH_OK_TTL = 86400
 BOT_TTL = 3600
 BOT_FAIL_TTL = 60
 DNS_TIMEOUT = 2.0
+HOST_TRY_AGAIN = 2  # h_errno from netdb.h; the socket module does not export it.
 FETCH_TIMEOUT = 10
 MAX_FETCH_BYTES = 10 * 1024 * 1024
 MIN_RANGES = 5
@@ -40,6 +44,9 @@ _STATIC = (
     ("link-local", ("169.254.0.0/16", "fe80::/10")),
     ("cgnat", ("100.64.0.0/10",)),
     ("multicast", ("224.0.0.0/4", "ff00::/8")),
+    ("reserved", ("240.0.0.0/4",)),
+    # A translator stands in for everyone behind it, so one abuser there must not cut off all of them.
+    ("translated", ("64:ff9b::/96", "2002::/16")),
 )
 
 _CDN_SOURCES = {
@@ -77,12 +84,25 @@ class _NetIndex:
             return merged[i][2]
         return None
 
+    def overlaps(self, net) -> bool:
+        starts, merged = self._idx[net.version]
+        i = bisect_right(starts, int(net.broadcast_address)) - 1
+        return i >= 0 and int(net.network_address) <= merged[i][1]
+
 
 _STATIC_INDEX = _NetIndex((ipaddress.ip_network(c), why) for why, nets in _STATIC for c in nets)
 
 
+def _dns_unanswered(exc: OSError) -> bool:
+    if isinstance(exc, socket.gaierror):
+        return exc.errno == socket.EAI_AGAIN
+    return isinstance(exc, TimeoutError) or (isinstance(exc, socket.herror) and exc.errno == HOST_TRY_AGAIN)
+
+
 def _parse_nets(items: Iterable, what: str) -> list:
     nets = []
+    if isinstance(items, str):
+        items = [items]
     for item in items:
         try:
             nets.append(ipaddress.ip_network(item.strip(), strict=False))
@@ -94,7 +114,7 @@ def _parse_nets(items: Iterable, what: str) -> list:
 def _ip_set(value) -> set:
     if value is None:
         return set()
-    if isinstance(value, str):
+    if not isinstance(value, (list, tuple, set, frozenset)):
         value = [value]
     out = set()
     for v in value:
@@ -124,6 +144,8 @@ class Protector:
         self._ssh_ok = {}  # type: Dict[str, float]
         # ip -> [window_start, ok_count, login_until, probe_until]; counters, not per-request lists.
         self._trust = OrderedDict()  # type: OrderedDict
+        # ip -> [window_start, ok_count, user agents]. Separate from trust: one forwarded probe must not reset it.
+        self._shared = OrderedDict()  # type: OrderedDict
         self._bots = {}  # type: Dict[str, tuple]
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nexus-dns")
         self._cdn_ranges = {}  # type: Dict[str, List[str]]
@@ -147,8 +169,10 @@ class Protector:
         with self._lock:
             if len(self._ssh_ok) >= MAX_SSH_IPS:
                 self._ssh_ok = {k: v for k, v in self._ssh_ok.items() if v > now}
-            if len(self._ssh_ok) < MAX_SSH_IPS:
-                self._ssh_ok[ip] = now + SSH_OK_TTL
+            if len(self._ssh_ok) >= MAX_SSH_IPS:
+                # The login that just succeeded is the one to keep: the admin is at the keyboard now.
+                del self._ssh_ok[min(self._ssh_ok, key=self._ssh_ok.get)]
+            self._ssh_ok[ip] = now + SSH_OK_TTL
 
     def export_ssh_ok(self) -> List[list]:
         now = self._clock()
@@ -168,9 +192,10 @@ class Protector:
                 self._ssh_ok[ip] = float(exp)
 
     def update_network(self, central_ip=None, gateway=None, resolvers=None) -> None:
-        # An empty answer is a failed lookup, and forgetting the old address would make it blockable.
+        # An empty answer is a failed lookup, and forgetting the old address would make it blockable. A partial DNS
+        # answer looks like a full one, so central's addresses only grow until the agent restarts.
         if central_ip:
-            self._central = _ip_set(central_ip)
+            self._central = self._central | _ip_set(central_ip)
         if gateway:
             self._gateway = _ip_set(gateway)
         if resolvers:
@@ -187,21 +212,35 @@ class Protector:
         why = _STATIC_INDEX.find(ip)
         if why:
             return why
-        if self._allow.find(ip):
+        # An IPv6 block covers the whole /64, so an address is protected when anything protected shares its /64.
+        net = ipaddress.ip_network(ip + "/64", strict=False) if ":" in ip else None
+        if self._allow.overlaps(net) if net else self._allow.find(ip):
             return "allowlist"
-        if ip in self._central:
+        if self._covers(ip, net, self._central):
             return "central"
-        if ip in self._gateway:
+        if self._covers(ip, net, self._gateway):
             return "gateway"
-        if ip in self._resolvers:
+        if self._covers(ip, net, self._resolvers):
             return "resolver"
-        if ip in self._active_ssh:
+        if self._covers(ip, net, self._active_ssh):
             return "active-ssh"
-        if self._ssh_ok.get(ip, 0) > self._clock():
+        now = self._clock()
+        if self._ssh_ok.get(ip, 0) > now:
             return "recent-ssh"
+        if net:
+            with self._lock:
+                live = {k for k, exp in self._ssh_ok.items() if exp > now}
+            if self._covers(ip, net, live):
+                return "recent-ssh"
         if self._cdn.find(ip):
             return "cdn"
         return None
+
+    @staticmethod
+    def _covers(ip: str, net, addrs: set) -> bool:
+        if ip in addrs:
+            return True
+        return net is not None and any(":" in a and ipaddress.ip_address(a) in net for a in addrs)
 
     def _entry(self, ip: str, now: float) -> list:
         e = self._trust.get(ip)
@@ -223,6 +262,15 @@ class Protector:
             if now - e[0] >= TRUST_WINDOW:
                 e[0], e[1] = now, 0
             e[1] += 1
+            s = self._shared.get(ip)
+            if s is None or now - s[0] >= TRUST_WINDOW:
+                s = self._shared[ip] = [now, 0, set()]
+                if len(self._shared) > MAX_SHARED_IPS:
+                    self._shared.popitem(last=False)
+            self._shared.move_to_end(ip)
+            s[1] += 1
+            if event.user_agent and len(s[2]) < SHARED_AGENTS:
+                s[2].add(hash(event.user_agent))
 
     def note_login_ok(self, ip: str) -> None:
         ip = normalize_ip(ip)
@@ -240,6 +288,17 @@ class Protector:
         with self._lock:
             e = self._entry(ip, now)
             e[0], e[1], e[2], e[3] = now, 0, 0.0, now + TRUST_WINDOW
+
+    def is_shared(self, ip: str) -> bool:
+        """Many working requests from many browsers: a reverse proxy or large NAT, where a block hits everyone behind it.
+
+        An attacker can fake this with 200 good requests and 10 agents. It then gets alerts, not blocks, for up to an
+        hour: the top rule accepts that over cutting off every customer behind a proxy.
+        """
+        ip = normalize_ip(ip)
+        s = self._shared.get(ip) if ip else None
+        return (s is not None and self._clock() - s[0] < TRUST_WINDOW
+                and s[1] >= SHARED_REQUESTS and len(s[2]) >= SHARED_AGENTS)
 
     def threshold_multiplier(self, ip: str) -> int:
         ip = normalize_ip(ip)
@@ -269,7 +328,8 @@ class Protector:
             ok = self._pool.submit(self._check_bot, ip).result(timeout=DNS_TIMEOUT)
             ttl = BOT_TTL
         except Exception:
-            ok, ttl = False, BOT_FAIL_TTL
+            # DNS gave no answer, so this could be the real bot. When in doubt Nexus does not block: ask again in a minute.
+            ok, ttl = True, BOT_FAIL_TTL
         with self._lock:
             if len(self._bots) >= MAX_BOT_CACHE:
                 self._bots = {k: v for k, v in self._bots.items() if v[0] > now}
@@ -283,7 +343,9 @@ class Protector:
             if not host.endswith(_BOT_SUFFIXES):
                 return False
             infos = self._resolver.getaddrinfo(host, None)
-        except OSError:
+        except OSError as exc:
+            if _dns_unanswered(exc):
+                raise
             return False
         return ip in {normalize_ip(i[4][0]) for i in infos}
 

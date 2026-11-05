@@ -26,7 +26,8 @@ _SSH_FAIL = (
 _SSH_OK = re.compile(
     _SSH_HEADER
     + r"Accepted (?:password|publickey|keyboard-interactive/pam) for .* from (\S+) port (\d{1,5})"
-    + _SSH_TAIL
+    # A certificate login appends its ID, serial and CA, and it must still earn the admin's 24 hours of protection.
+    + r"(?: ssh2(?:: [A-Za-z0-9-]+ SHA256:\S+(?: ID .* \(serial \d+\) CA [A-Za-z0-9-]+ SHA256:\S+)?)?)?\Z"
 )
 # Classify on the text right after the header: a username may contain "Accepted password"
 # or "Failed password", so searching the whole line would let it flip the kind.
@@ -35,7 +36,8 @@ _SSH_CLASSIFY = re.compile(_SSH_HEADER + r"(Failed |Invalid user |Connection clo
 _QUOTED = r'"((?:[^"\\]|\\.)*)"'
 _WEB = re.compile(
     r"(\S+) \S+ \S+ \[[^\]\n]*\] " + _QUOTED + r" (\d{3}) (?:\d+|-)"
-    r"(?: " + _QUOTED + " " + _QUOTED + r")?\Z"
+    # Trailing fields are common additions to the combined format (request time, X-Forwarded-For). Never read them.
+    r"(?: " + _QUOTED + " " + _QUOTED + r"(?: .*)?)?\Z"
 )
 _REQUEST = re.compile(r"([A-Z]+) (\S+)(?: HTTP/\d(?:\.\d)?)?\Z")
 
@@ -71,7 +73,9 @@ class LogEvent:
 def normalize_ip(s: str) -> Optional[str]:
     if not isinstance(s, str) or len(s) > 64:
         return None
-    s = s.split("%", 1)[0]
+    # Only an IPv6 address has a zone.
+    if ":" in s:
+        s = s.split("%", 1)[0]
     try:
         addr = ipaddress.ip_address(s)
     except ValueError:

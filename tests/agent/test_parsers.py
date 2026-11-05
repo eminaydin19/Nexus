@@ -191,15 +191,15 @@ def test_web_lowercase_method_has_no_path():
 
 def test_ua_cannot_override_status_or_path():
     ua = '" 200 1 "x" "y'
-    line = f'203.0.113.9 - - [t] "GET /a HTTP/1.1" 404 1 "-" "{ua}"'
+    line = f'203.0.113.9 - - [05/Nov/2026:10:00:00 +0000] "GET /a HTTP/1.1" 404 1 "-" "{ua}"'
     ev = parse_web_line(line, 0)
-    assert ev is None or (ev.path == "/a" and ev.status == 404)
+    assert ev.path == "/a" and ev.status == 404
 
 
 def test_xff_never_read():
-    line = '10.0.0.1 - - [t] "GET / HTTP/1.1" 200 1 "-" "-" "8.8.8.8"'
+    line = '10.0.0.1 - - [05/Nov/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "-" "8.8.8.8"'
     ev = parse_web_line(line, 0)
-    assert ev is None or ev.ip == "10.0.0.1"
+    assert ev.ip == "10.0.0.1"
 
 
 def test_dataclass_type():
@@ -269,3 +269,15 @@ def test_web_line_age(age, stale):
 def test_web_line_without_usable_time_counts_as_now():
     assert web_line_is_stale('203.0.113.9 - - [nope] "GET / HTTP/1.1" 200 5', NOW) is False
     assert web_line_is_stale("junk", NOW) is False
+
+
+def test_ssh_certificate_login_is_ok_event():
+    line = ("Nov  5 10:00:00 h sshd[1]: Accepted publickey for root from 203.0.113.5 port 5000 ssh2: "
+            "ED25519-CERT SHA256:abc ID admin@corp (serial 7) CA ED25519 SHA256:def")
+    ev = parse_ssh_line(line, 0)
+    assert ev.kind == "ssh_ok" and ev.ip == "203.0.113.5"
+
+
+def test_scope_only_on_ipv6():
+    assert normalize_ip("1.1.1.1%junk") is None
+    assert normalize_ip("fe80::1%eth0") == "fe80::1"

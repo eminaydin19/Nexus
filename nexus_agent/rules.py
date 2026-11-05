@@ -323,7 +323,7 @@ class RuleEngine:
         if self._active.get(key, 0) > now:
             return []
         web = rule in _WEB_RULES
-        if web and (self._behind_cdn or self._p.is_cdn(ip)):
+        if web and (self._behind_cdn or self._p.is_cdn(ip) or self._p.is_shared(ip)):
             return [Decision(rule, ip, "alert", (), 0, evidence)]
         why = self._p.reason(ip)
         if why:
@@ -334,7 +334,8 @@ class RuleEngine:
             # activity from the same source, and never for an IP the Protector currently trusts.
             bad = self._bad.get(key[1])
             proven = bad is not None and now - bad[0] < WINDOW
-            trusted = self._p.threshold_multiplier(ip) > 1 or (bad is not None and now - bad[1] < WINDOW)
+            trusted = (self._p.threshold_multiplier(ip) > 1 or self._p.is_shared(ip)
+                       or (bad is not None and now - bad[1] < WINDOW))
             if not proven or trusted:
                 return [Decision(rule, ip, "alert", (), 0, evidence)]
         if web and self._p.verify_bot(ip, ua):

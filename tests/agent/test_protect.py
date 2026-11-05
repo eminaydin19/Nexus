@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import socket
 import sys
 import types
@@ -231,10 +232,10 @@ def test_bot_result_cached_one_hour(clock):
     assert r.calls == 2
 
 
-def test_slow_resolver_times_out(clock, monkeypatch):
+def test_slow_resolver_gets_the_benefit_of_the_doubt(clock, monkeypatch):
     monkeypatch.setattr(protect, "DNS_TIMEOUT", 0.1)
     r = FakeResolver({GOOD: "a.googlebot.com"}, {"a.googlebot.com": [GOOD]}, delay=1.0)
-    assert Protector([], None, None, [], clock, resolver=r).verify_bot(GOOD, UA) is False
+    assert Protector([], None, None, [], clock, resolver=r).verify_bot(GOOD, UA) is True
 
 
 def fake_requests(monkeypatch, responses):
@@ -343,3 +344,76 @@ def test_update_network_replaces_and_keeps_old_value_on_empty():
     assert p.reason("192.0.2.1") == "central"
     assert p.reason("192.0.2.12") == "gateway" and p.reason("192.0.2.2") is None
     assert p.reason("192.0.2.3") == "resolver"
+
+
+def test_ssh_ok_keeps_newest_login_when_full(clock):
+    p = Protector([], None, None, [], clock)
+    for i in range(protect.MAX_SSH_IPS):
+        p.note_ssh_ok(str(ipaddress.ip_address(int(ipaddress.ip_address("11.0.0.0")) + i)))
+    p.note_ssh_ok("198.51.100.77")
+    assert p.reason("198.51.100.77") == "recent-ssh"
+
+
+def test_central_address_survives_a_partial_dns_answer():
+    p = Protector(central_ip=["192.0.2.1", "192.0.2.2"])
+    p.update_network(central_ip=["192.0.2.2"])
+    assert p.reason("192.0.2.1") == "central" and p.reason("192.0.2.2") == "central"
+
+
+@pytest.mark.parametrize("kwargs, why", [
+    ({"allowlist": ["2001:db8:1:1::5/128"]}, "allowlist"),
+    ({"central_ip": ["2001:db8:1:1::5"]}, "central"),
+    ({"gateway": ["2001:db8:1:1::5"]}, "gateway"),
+    ({"resolvers": ["2001:db8:1:1::5"]}, "resolver"),
+])
+def test_v6_block_never_covers_a_protected_neighbor(kwargs, why):
+    p = Protector(**kwargs)
+    assert p.reason("2001:db8:1:1::9") == why
+    assert p.reason("2001:db8:1:2::9") is None
+
+
+def test_v6_ssh_login_protects_its_whole_block_range(clock):
+    p = Protector([], None, None, [], clock)
+    p.note_ssh_ok("2001:db8:1:1::5")
+    p.set_active_ssh(["2001:db8:2:2::5"])
+    assert p.reason("2001:db8:1:1::9") == "recent-ssh"
+    assert p.reason("2001:db8:2:2::9") == "active-ssh"
+    assert p.reason("2001:db8:3:3::9") is None
+
+
+def test_v4_neighbor_stays_blockable():
+    assert Protector(central_ip=["192.0.2.1"]).reason("192.0.2.2") is None
+
+
+@pytest.mark.parametrize("ip", ["240.0.0.1", "255.255.255.255", "64:ff9b::1.2.3.4", "2002:102:304::1"])
+def test_reserved_and_translated_ranges_protected(ip):
+    assert Protector().reason(ip) is not None
+
+
+def test_bare_string_inputs():
+    p = Protector(allowlist="198.51.100.0/24", central_ip="192.0.2.1")
+    assert p.reason("198.51.100.5") == "allowlist" and p.reason("192.0.2.1") == "central"
+    assert Protector(central_ip=5).reason("192.0.2.1") is None
+
+
+class _NoAnswer:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def gethostbyaddr(self, ip):
+        raise self.exc
+
+    def getaddrinfo(self, host, port):
+        raise AssertionError("not reached")
+
+
+@pytest.mark.parametrize("exc, expected", [
+    (socket.herror(2, "Host name lookup failure"), True),
+    (socket.gaierror(socket.EAI_AGAIN, "try again"), True),
+    (TimeoutError(), True),
+    (socket.herror(1, "Unknown host"), False),
+    (socket.gaierror(socket.EAI_NONAME, "no name"), False),
+])
+def test_bot_check_when_dns_gives_no_answer(clock, exc, expected):
+    p = Protector([], None, None, [], clock, resolver=_NoAnswer(exc))
+    assert p.verify_bot("203.0.113.9", UA) is expected

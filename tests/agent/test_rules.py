@@ -645,3 +645,22 @@ def test_unknown_user_try_counts_once_and_repeated_tries_on_one_connection_all_c
     d = eng.feed(ssh_line("Failed password for customer from %s port 50009 ssh2" % IP))
     assert [x.rule for x in d] == ["ssh_bruteforce"]
 
+
+
+def _browsing(eng, ip, requests=200, agents=10):
+    for i in range(requests):
+        eng.feed(LogEvent("web", ip, 0, "GET", "/", 200, user_agent="agent-%d" % (i % agents)))
+
+
+def test_reverse_proxy_gets_alerts_not_blocks():
+    eng, _, prot = mk()
+    _browsing(eng, IP)
+    assert prot.is_shared(IP)
+    decisions = all_decisions(eng, probe, 10)
+    assert decisions and {d.action for d in decisions} == {"alert"}
+
+
+def test_one_browser_with_many_requests_is_not_shared():
+    eng, _, prot = mk()
+    _browsing(eng, IP, requests=500, agents=1)
+    assert not prot.is_shared(IP)
