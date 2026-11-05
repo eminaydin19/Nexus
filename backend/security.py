@@ -154,8 +154,8 @@ class OriginCheckMiddleware:
             origin = headers.get(b"origin", b"").decode("latin-1")
             host = headers.get(b"host", b"")
             if self.trust_proxy:
-                host = headers.get(b"x-forwarded-host", host)
-            if origin and urlsplit(origin).netloc != host.decode("latin-1"):
+                host = headers.get(b"x-forwarded-host", host).split(b",")[0].strip()
+            if origin and urlsplit(origin).netloc.lower() != host.decode("latin-1").lower():
                 counters.inc("nexus_auth_failures_total")
                 await JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)(scope, receive, send)
                 return

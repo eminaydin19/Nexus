@@ -309,3 +309,23 @@ def test_event_slack_text_escapes_every_field(monkeypatch):
     n, texts, run = _real_notifier(monkeypatch)
     run(n.notify_event(_ev("<!channel>", node_id="<!here>", action="<a>", ip="<i>", ports=["<p>"])))
     assert "<" not in texts[0].replace(":rotating_light:", "") and "&lt;!channel&gt;" in texts[0]
+
+
+def test_prune_removes_old_acked_commands_only(client):
+    import time
+
+    from backend.db import AgentCommand
+
+    pipeline = client.app.state.pipeline
+    old = time.time() - 365 * 86400
+    with SessionLocal() as db:
+        acked = AgentCommand(node_id="prune", type="mode", payload={}, created_at=old, acked_at=old)
+        waiting = AgentCommand(node_id="prune", type="allowlist", payload={}, created_at=old)
+        recent = AgentCommand(node_id="prune", type="mode", payload={}, created_at=old, acked_at=time.time())
+        db.add_all([acked, waiting, recent])
+        db.commit()
+        ids = (acked.id, waiting.id, recent.id)
+        pipeline._last_prune = 0.0
+        pipeline._prune(db)
+        left = {c.id for c in db.query(AgentCommand).filter(AgentCommand.node_id == "prune")}
+    assert left == {ids[1], ids[2]}

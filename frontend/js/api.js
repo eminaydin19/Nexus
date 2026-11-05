@@ -13,10 +13,13 @@ function explain(status, detail) {
   return `The server had a problem (status ${status}). Try again.`;
 }
 
+const REQUEST_TIMEOUT_MS = 20000;
+
 async function request(path, options = {}) {
   let res;
   try {
-    res = await fetch(path, options);
+    // A hung request would otherwise keep the page's action guard held until reload.
+    res = await fetch(path, { ...options, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   } catch {
     throw new ApiError(0, "Could not reach the Nexus server. Check your connection and try again.");
   }

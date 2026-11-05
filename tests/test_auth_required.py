@@ -78,6 +78,13 @@ def _origin_client(trust_proxy):
     return TestClient(app)
 
 
+def test_origin_check_tolerates_proxy_host_list_and_case():
+    h = {"Origin": "https://Nexus.Example", "X-Forwarded-Host": "nexus.example, internal.lan"}
+    assert _origin_client(True).post("/x", headers=h).status_code == 200
+    h = {"Origin": "https://evil.example", "X-Forwarded-Host": "nexus.example, evil.example"}
+    assert _origin_client(True).post("/x", headers=h).status_code == 403
+
+
 def test_forwarded_host_only_trusted_behind_proxy():
     h = {"Origin": "https://nexus.example", "X-Forwarded-Host": "nexus.example"}
     assert _origin_client(True).post("/x", headers=h).status_code == 200

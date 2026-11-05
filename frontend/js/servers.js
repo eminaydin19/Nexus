@@ -30,7 +30,9 @@ function lastSeen(server, now) {
 /* Exactly one of these two shapes reaches the operator, depending on whether central knows its public address. */
 export function installCommand(token, publicUrl, origin) {
   const url = publicUrl || origin;
-  const tail = publicUrl ? "bash" : `bash -s -- --url ${origin}`;
+  // The agent refuses plain http to a remote central unless told, so a command without the flag could only fail.
+  const insecure = /^http:\/\/(?!localhost\b|127\.|\[::1\])/.test(origin) ? " --insecure" : "";
+  const tail = publicUrl ? "bash" : `bash -s -- --url ${origin}${insecure}`;
   return `curl -fsSL ${url}/install-agent.sh | NEXUS_ENROLL_TOKEN=${token} sudo --preserve-env=NEXUS_ENROLL_TOKEN ${tail}`;
 }
 
@@ -178,12 +180,19 @@ function cdnText(config) {
   return config.behind_cdn ? "Behind a CDN: web rules only alert" : "Not behind a CDN";
 }
 
+/* Log lines the agent skipped as older than 10 minutes. A wrong clock or timezone makes all of them look old, and detection then sees nothing. */
+function staleText(config) {
+  if (config.stale_lines === undefined) return "Not reported yet";
+  return config.stale_lines ? `${config.stale_lines} skipped. If this keeps growing, check this server's clock and timezone` : "None";
+}
+
 function capabilities(s) {
   const can = s.capabilities?.enforce;
   return keyValues([
     ["Can block with nftables", can === undefined ? "Not reported yet" : can ? "Yes" : "No"],
     ["Highest mode allowed", modeState({ status: "online", reported_mode: s.max_mode }).text],
     ["CDN", cdnText(s.config ?? {})],
+    ["Old log lines", staleText(s.config ?? {})],
     ["Platform", String(s.capabilities?.platform ?? "Not reported yet")],
     ["Agent version", s.version || "Not reported yet"],
   ]);
