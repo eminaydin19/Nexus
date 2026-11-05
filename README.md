@@ -1,84 +1,119 @@
-<div align="center">
-  <h1>Nexus Security</h1>
-  <p><strong>Real-time Anomaly Detection & Active Defense for AWS Cloud Infrastructure</strong></p>
-  <img src="https://img.shields.io/badge/Production-Ready-success?style=flat-square" />
-  <img src="https://img.shields.io/badge/AWS-CloudWatch-orange?style=flat-square&logo=amazon-aws" />
-</div>
+# Nexus
 
-<br>
+Self-hosted defense for your Linux servers. An agent on each server reads SSH and web logs, finds attackers from evidence, and blocks them with nftables. A central panel shows every server in one place.
 
-Nexus is an advanced security and telemetry analysis system designed for cloud environments. It continuously ingests real-time metrics, analyzes them using a multi-model machine learning ensemble, and actively defends your infrastructure by automatically quarantining malicious actors at the firewall level.
+**Top rule: not blocking a real customer matters more than catching every attack. When in doubt, Nexus does not block.**
 
-## Architecture
+No AWS account is needed. MIT licensed.
 
-1. **Ingestion:** Receives telemetry securely via CloudWatch or agent APIs using strict rate limits and API key validation.
-2. **Analysis:** The machine learning ensemble evaluates metrics (CPU, Memory, Network, Latency). It computes an aggregate Ensemble Score.
-3. **Defense:** If the score exceeds the critical threshold, Nexus triggers Safe Mode and injects block rules into the host's firewall.
-4. **Observability:** Metrics are exposed via a Prometheus `/metrics` endpoint, and events are logged to a local SQLite database for the dashboard.
+## What it does
 
-## Key Capabilities
+| Attack | Reaction |
+|---|---|
+| SSH brute force | Blocks that IP on the SSH port |
+| Web login brute force, vulnerability probing, exploit patterns | Blocks that IP on the web ports |
+| Port scan | Alert. A full short block only with log evidence from the same IP, because a scan's source can be spoofed |
+| Connection flood from one IP | Rate limit, never a block: many customers can share one address |
+| Distributed flood | Alert only |
+| Server metrics out of pattern (ML ensemble) | Alert only. A score never blocks anyone |
 
-- **Multi-Model ML Ensemble:** Uses a combination of Isolation Forest, LSTM Autoencoders, Variational Autoencoders (VAE), and Time-Series Transformers to detect both statistical outliers and complex behavioral anomalies.
-- **Active Defense Firewall:** Automatically blocks malicious IPs in real-time. Supports `iptables`, `nftables`, and macOS `pfctl`. Includes a Safe Mode to protect APIs during critical attacks.
-- **AWS CloudWatch Integration:** Directly ingests metrics and logs from AWS CloudWatch using Boto3. 100% production-ready.
-- **Real-time Dashboard:** A responsive WebSockets-based dashboard with Deviation Drivers and active defense management.
-- **High Performance:** CPU-bound inference pipeline optimized for edge nodes and small AWS EC2 instances to prevent memory bottlenecks.
-- **Continuous Learning:** The system automatically retrains its neural networks every 24 hours in the background without downtime.
+Blocks always expire, and the kernel holds the timer, so they end even if the agent crashes. Blocking and detection run on the server, so protection continues while central is down.
 
-## Installation
+## What it does not do
 
-Nexus runs on any Linux server with Docker and Docker Compose 2.24 or newer. AWS is not needed.
+**It cannot stop a large DDoS. Use Cloudflare or a similar service.** A flood that fills your server's network link has already done its damage by the time a firewall on that server sees it.
+
+It also does not inspect traffic like a WAF, and it does not block at the CDN. Nexus cannot detect an attack that leaves no trace in the logs it reads or in its connection samples.
+
+## Install
+
+You need Docker with Compose 2.24 or newer for central. Each protected server needs Linux with systemd and Python 3.9 or newer: Ubuntu 20.04+, Debian 11+ or RHEL 8+.
+
+**1. Install central.**
 
 ```bash
 git clone https://github.com/eminaydin19/Nexus.git && cd Nexus && ./install.sh --domain nexus.example.com
 ```
 
-With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.sh`), Nexus listens on `127.0.0.1:8000` only, and you reach it over an SSH tunnel; only an agent on the same machine can connect then.
+With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.sh`), central listens on `127.0.0.1:8000`, you reach it over an SSH tunnel, and only an agent on the same machine can connect. The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. To upgrade, run `git pull` and then the installer again; secrets and data are kept.
 
-The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. To upgrade, run `git pull` first and then the installer again: it rebuilds Nexus and keeps your secrets and data. At the end it prints where to log in and how to add your first server:
+**2. Add a server.** The panel gives you this command with a one-time token:
 
 ```bash
 curl -fsSL https://nexus.example.com/install-agent.sh | NEXUS_ENROLL_TOKEN=<one-time-token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash
 ```
 
-The token stays out of `ps` this way. sudo must allow keeping the variable: a sudoers rule for `ALL` already does, a narrower one needs `SETENV`. If sudo refuses, run the same line from a root shell (`sudo -i`).
+The token stays out of `ps` this way. sudo must allow keeping the variable: a sudoers rule for `ALL` already does, and a narrower one needs `SETENV`. If sudo refuses, run the same line from a root shell (`sudo -i`). Remove the agent with `--uninstall`.
 
-The agent needs systemd and Python 3.9 or newer. It starts in observe mode: no traffic is blocked until you enable enforce in the panel. Remove it with `--uninstall`. Python 3.9 can come from your distribution, for example `python3.9` on Ubuntu 20.04 or `python39` on the RHEL 8 family. CloudWatch ingestion remains optional, see `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`.
+## From observe to enforce
 
-## Configuration (.env)
+An agent starts in `observe`: it blocks nothing and lists what it would have blocked under Watch. After 7 days the panel shows that summary and asks for your approval. Nothing switches by itself, and you can switch earlier. The panel names the modes Watching, Blocking and Off.
 
-Nexus is highly customizable. The `install.sh` script generates your `.env` file, but you can manually tune the AI models and defense systems:
+To keep a server out of `enforce` whatever central says, set `NEXUS_MAX_MODE=observe` in `/etc/nexus-agent.env`. Central cannot change that file.
+
+## How customers are protected
+
+Nexus never blocks:
+
+- Private, loopback, link-local, CGNAT and multicast addresses.
+- Your allowlist. "This is a customer" in the panel adds to it and lifts any block.
+- Central, the default gateway and the DNS servers in `/etc/resolv.conf`.
+- IPs with an active SSH session or a successful SSH login in the last 24 hours.
+- Published Cloudflare, Fastly and CloudFront ranges.
+- Googlebot and Bingbot, verified by forward and reverse DNS.
+
+Blocks stay narrow:
+
+- A block applies to the attacked port. The only exception is a short full block for a scan with log evidence.
+- Volume alone only slows an address down.
+- IPv6 blocks apply to the `/64`.
+- An IP with 20 successful page requests in the last hour and no scan traces gets 3 times the web thresholds.
+- If there are more than 50 new blocks in 5 minutes or 2000 active blocks, the agent stops adding full blocks, alerts you and falls back to rate limits.
+
+See [threshold tuning](docs/threshold-tuning.md) to change any threshold.
+
+## Behind a CDN or proxy
+
+The firewall sees the CDN's address, so blocking it would cut off everyone. When traffic comes from CDN ranges, web rules on that server only alert. SSH rules keep working. Nexus trusts `X-Forwarded-For` in logs only if you enable that explicitly.
+
+## Agent permissions and central compromise
+
+The agent runs as the `nexus-agent` user with `CAP_NET_ADMIN` and `CAP_DAC_READ_SEARCH`. It reads logs and manages one nftables table, `inet nexus`. It connects out to central and opens no port. Central can send it only three commands: unblock an IP, update the allowlist, change the mode. Central cannot run commands, write files, update the agent or request a block. [SECURITY.md](SECURITY.md) covers what an attacker controlling central could still do.
+
+## SQLite or Postgres
+
+Central stores data in SQLite by default, in one worker process. That suits a small fleet. For more servers, set `DATABASE_URL=postgresql+psycopg://user:pass@host/nexus` in `.env`.
+
+## CloudWatch (optional)
+
+Set `INGESTION_SOURCE=cloudwatch` with `AWS_REGION` and `EC2_INSTANCE_IDS` to also score CloudWatch metrics. See `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`. Blocking still needs an agent.
+
+## Configuration
+
+`.env.example` lists central's settings. The main ones:
 
 | Variable | Default | Description |
 |---|---|---|
-| `INGESTION_SOURCE` | `webhook` | Source of data. Agents use `webhook`. `cloudwatch` is optional and needs AWS. |
-| `WEIGHT_ISOLATION_FOREST` | 0.25 | Relative weight of the Isolation Forest model. |
-| `WEIGHT_LSTM_AE` | 0.45 | Relative weight of the LSTM Autoencoder. |
-| `WEIGHT_TRANSFORMER` | 0.30 | Relative weight of the Transformer Attention model. |
-| `WEIGHT_VAE` | 0.30 | Relative weight of the Variational Autoencoder. |
-| `CRITICAL_SCORE` | 0.85 | Threshold (0.0 - 1.0) required to trigger Active Defense. |
-| `DEFENSE_MODE` | `dry_run` | `off`, `dry_run` (log only) or `enforce` (update firewall). |
-| `DEFENSE_FIREWALL` | `auto` | `iptables`, `nftables` or `pfctl`. |
-| `DEFENSE_BLOCK_SECONDS` | 300 | Quarantine duration for blocked IPs. |
+| `SLACK_WEBHOOK_URL` | empty | Where alerts go |
+| `ALERT_COOLDOWN_SECONDS` | 900 | Minimum gap between alerts for the same rule |
+| `CRITICAL_SCORE` | 0.85 | ML score that sends a Slack alert. It never blocks |
+| `RETENTION_DAYS` | 30 | How long history is kept |
+| `RATE_LIMIT_PER_MINUTE` | 300 | Requests per minute per client IP |
 
-## Active Defense Deep-Dive
+`/metrics` serves Prometheus metrics behind the dashboard's basic auth.
 
-When the system detects an attack:
-1. **Safe Mode Activation:** Nexus returns `503 Service Unavailable` for non-essential APIs, protecting your backend while keeping the health and dashboard sockets alive.
-2. **IP Quarantine:** The source IP of the malicious telemetry is immediately blocked at the OS level (`iptables`/`nftables`).
-3. **Auto-Recovery:** Blocks expire automatically after `DEFENSE_BLOCK_SECONDS`. You can also manually unblock IPs via the Dashboard.
+## Tests
 
-*Note: To use `enforce` mode in Docker, the container must be run with `--privileged` or `CAP_NET_ADMIN` to manipulate the host's firewall.*
-
-## Prometheus & Monitoring
-
-You can easily scrape Nexus using Prometheus. The `/metrics` endpoint is protected by basic auth.
-```yaml
-scrape_configs:
-  - job_name: nexus
-    basic_auth: { username: admin, password: <DASHBOARD_PASSWORD> }
-    static_configs: [{ targets: ["nexus-host:80"] }]
+```bash
+scripts/test.sh          # unit tests
+scripts/test.sh --nft    # real nftables in a container
+scripts/test.sh --e2e    # installers in systemd containers
+scripts/test.sh --panel  # panel in a real browser
+tests/e2e/run.sh         # real attacks and customers, on SQLite and Postgres
 ```
 
+The scenarios change one kernel-wide setting while they run, `net.netfilter.nf_log_all_netns`, and restore it afterwards.
+
 ## License
-This project is licensed under the MIT License.
+
+[MIT](LICENSE). The bundled Archivo font uses the [SIL Open Font License](frontend/fonts/OFL.txt).
