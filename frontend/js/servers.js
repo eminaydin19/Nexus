@@ -14,6 +14,7 @@ const THRESHOLDS = new Map([
   ["exploit_threshold", "Attack requests before a block"],
   ["scan_ports", "Closed ports before a port scan block"],
   ["max_conn_per_ip", "Connections per address before slowing"],
+  ["max_new_conn_rate", "New connections per second before slowing"],
   ["syn_recv_alert", "Half-open connections before an alert"],
   ["max_tracked_ips", "Addresses tracked at once"],
   ["ssh_ports", "SSH ports"],

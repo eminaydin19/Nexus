@@ -55,7 +55,7 @@ FLOOD = """
 import socket, sys, time
 src, dst, other = sys.argv[1:4]
 socks = []
-for _ in range(200):
+for _ in range(600):
     s = socket.socket(); s.setblocking(False); s.bind((src, 0)); s.connect_ex((dst, 8080)); socks.append(s)
 try:
     o = socket.socket(); o.settimeout(0.5); o.bind((other, 0)); o.connect((dst, 8080)); other_ok = True
@@ -198,7 +198,7 @@ def test_restart_keeps_blocks(net):
     second = net.enforcer()
     assert second.setup()
     got = second.active()
-    assert [(b.ip, b.ports, b.rule) for b in got] == [(CLI4, [22, 80], "unknown")]
+    assert [(b.ip, b.ports, b.rule) for b in got] == [(CLI4, [22, 80], "test_rule")]  # the kernel keeps why, in the element comment
     assert not net.connect(SRV4, 22, CLI4)
     after = net.nft("-j", "list", "chain", "inet", "nexus", "prerouting").stdout
     assert len(json.loads(after)["nftables"]) == len(json.loads(before)["nftables"])
@@ -286,7 +286,7 @@ def test_rate_limit_is_per_ip_and_not_a_block(net):
     assert net.connect(SRV4, 8080, CLI4)
     out = ns_run(CLI, sys.executable, "-c", FLOOD, CLI4, SRV4, CLI4B).stdout.split()
     # a shared limit would starve the second address while the first one floods
-    assert 0 < int(out[0]) < 100 and out[1] == "True"
+    assert 0 < int(out[0]) < 450 and out[1] == "True"
 
 
 def left(enf, ip):

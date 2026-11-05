@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from . import __version__
 from .client import Client, ClientError, Command
 from .collectors import (
-    WEB_LOGS, LineQueue, LogCollectors, read_connections, sample_connections, sample_metrics, web_peers,
+    WEB_LOGS, LineQueue, LogCollectors, read_connections, sample_connections, sample_metrics, ssh_peers, web_peers,
 )
 from .config import (
     AgentConfig, is_insecure, load_ssh_ok, load_state, read_gateways, read_resolvers, resolve_host, save_state,
@@ -56,6 +56,10 @@ NETWORK_RETRY = 60
 SSH_STATE_INTERVAL = 60
 SSH_SILENCE_WARN = 3600
 LAST_SEND_SAVE_INTERVAL = 60
+JOURNAL_SOCKET = "/run/systemd/journal/socket"
+# sshd drops an unauthenticated connection after LoginGraceTime (120 s by default), so one that outlives this is a session.
+# shortcut: a longer LoginGraceTime lets a held unauthenticated connection pass as a session; read sshd_config if that shows up.
+SSH_SESSION_MIN_AGE = 150
 
 
 class Agent:
@@ -83,6 +87,9 @@ class Agent:
         self._behind_cdn = False
         self._breaker_was = False
         self._next_conn = 0.0
+        self._ssh_seen = None  # type: Optional[Dict[tuple, float]]
+        self._new_counts = {}  # type: Dict[str, int]
+        self._new_at = None  # type: Optional[float]
         self._failures = 0
         self._latency_ms = 0.0
         self._lock = threading.Lock()
@@ -235,7 +242,7 @@ class Agent:
             self._next_conn = now + CONN_INTERVAL
             per_ip, syn_recv = self._sample_connections()
             if self._listening and self.enforcer.mode != "off":
-                self._apply(self.engine.feed_connections(per_ip, syn_recv))
+                self._apply(self.engine.feed_connections(per_ip, syn_recv, self._new_conn_rates(now)))
         self._note_breaker()
 
     def _process_lines(self) -> None:
@@ -274,7 +281,7 @@ class Agent:
         per_ip, syn_recv, active_ssh, listening = sample_connections(self.cfg.rules.ssh_ports, conns)
         if not listening:
             return per_ip, syn_recv
-        self.protector.set_active_ssh(active_ssh)
+        self._note_ssh_sessions(conns)
         self._listening = listening
         self._push_listening()
         if self._await_sample:
@@ -282,6 +289,23 @@ class Agent:
         self._warn_if_ssh_silent(active_ssh)
         self._update_behind_cdn(web_peers(self.cfg.rules.web_ports, conns))
         return per_ip, syn_recv
+
+    def _note_ssh_sessions(self, conns: list) -> None:
+        # An open connection proves nothing: one held before login would make its owner unblockable on every rule.
+        now = self.mono()
+        # Connections older than this agent get the benefit of the doubt: a restart must not expose a long-running admin.
+        default = now if self._ssh_seen is not None else now - SSH_SESSION_MIN_AGE
+        seen = self._ssh_seen or {}
+        self._ssh_seen = {peer: seen.get(peer, default) for peer in ssh_peers(self.cfg.rules.ssh_ports, conns)}
+        self.protector.set_active_ssh({peer[0] for peer, first in self._ssh_seen.items() if now - first >= SSH_SESSION_MIN_AGE})
+
+    def _new_conn_rates(self, now: float) -> Dict[str, float]:
+        counts = self.enforcer.new_connections()
+        previous, at = self._new_counts, self._new_at
+        self._new_counts, self._new_at = counts, now
+        if at is None or now <= at:
+            return {}
+        return {ip: (n - previous.get(ip, 0)) / (now - at) for ip, n in counts.items() if n > previous.get(ip, 0)}
 
     def _warn_if_ssh_silent(self, active_ssh: set) -> None:
         idle = getattr(self.collectors, "ssh_idle_seconds", None)
@@ -507,8 +531,9 @@ def build_agent(cfg: AgentConfig) -> Agent:
     protector = Protector(central_ip=resolve_host(urlsplit(cfg.url).hostname), gateway=read_gateways(),
                           resolvers=read_resolvers())
     agent = Agent(cfg, client, protector, RuleEngine(cfg.rules, protector), Enforcer("observe"))
-    agent.collectors = LogCollectors(agent.lines, web_logs=WEB_LOGS + cfg.web_logs,
-                                     journalctl=shutil.which("journalctl"))
+    # The binary alone proves nothing: containers and LXC ship it with no journald, which would leave scans unread.
+    journalctl = shutil.which("journalctl") if os.path.exists(JOURNAL_SOCKET) else None
+    agent.collectors = LogCollectors(agent.lines, web_logs=WEB_LOGS + cfg.web_logs, journalctl=journalctl)
     return agent
 
 

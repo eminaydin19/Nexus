@@ -27,19 +27,20 @@ FLOOD_RATIO = 5
 FLOOD_MIN_TOTAL = 1000
 FLOOD_ALPHA = 0.05
 MIN_WINDOW_EVENTS = 1000
-EXPLOIT_MIN_REQUESTS = 2
+# Scanners send hundreds of different URLs; a developer pasting code into a search box sends a few, and refreshes.
+EXPLOIT_MIN_REQUESTS = 5
+NEW_CONN_SUSTAINED_SAMPLES = 2
 EVIDENCE_LINES = 3
 EVIDENCE_CHARS = 500
 MAX_DECODES = 2
 
-# rule -> (action, base ttl in seconds)
 _RULES = {
-    "ssh_bruteforce": ("block_port", 3600),
-    "web_login_bruteforce": ("block_port", 900),
-    "web_probe": ("block_port", 1800),
-    "web_exploit": ("block_port", 3600),
-    "port_scan": ("block_all", 900),
-    "conn_flood": ("rate_limit", 600),
+    "ssh_bruteforce": "block_port",
+    "web_login_bruteforce": "block_port",
+    "web_probe": "block_port",
+    "web_exploit": "block_port",
+    "port_scan": "block_all",
+    "conn_flood": "rate_limit",
 }
 _WEB_RULES = frozenset(("web_login_bruteforce", "web_probe", "web_exploit"))
 
@@ -101,12 +102,19 @@ class RuleConfig:
     probe_threshold: int = 10
     exploit_threshold: int = 3
     scan_ports: int = 20
-    max_conn_per_ip: int = 200
+    max_conn_per_ip: int = 1000
+    max_new_conn_rate: int = 100
     syn_recv_alert: int = 500
     max_tracked_ips: int = 100000
     login_paths: Tuple[str, ...] = ("/login", "/wp-login.php", "/admin", "/api/login")
     ssh_ports: Tuple[int, ...] = (22,)
     web_ports: Tuple[int, ...] = (80, 443)
+    ttl_ssh_bruteforce: int = 3600
+    ttl_web_login_bruteforce: int = 900
+    ttl_web_probe: int = 1800
+    ttl_web_exploit: int = 3600
+    ttl_port_scan: int = 900
+    ttl_conn_flood: int = 600
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "RuleConfig":
@@ -132,6 +140,8 @@ class RuleConfig:
                     value = int(raw)
                     if value <= 0:
                         raise ValueError("must be positive")
+                    if f.name.startswith("ttl_"):
+                        value = min(value, MAX_TTL)
             except ValueError as exc:
                 log.warning("ignoring invalid %s=%r (%s); keeping %r", name, raw, exc, default)
                 continue
@@ -153,6 +163,7 @@ class RuleEngine:
         self._active = OrderedDict()  # type: OrderedDict  # (rule, ip) -> expiry of its last Decision
         self._offense = OrderedDict()  # type: OrderedDict  # (rule, ip) -> [count, last_ts]
         self._conn_suppressed = set()  # type: set
+        self._new_streak = {}  # type: Dict[str, int]
         self._bad = OrderedDict()  # type: OrderedDict  # key -> [last bad ts, last bad ts while trusted]
         self._last_sweep = None  # type: Optional[float]
         self._avg = None  # type: Optional[float]
@@ -180,7 +191,8 @@ class RuleEngine:
             if event.kind == "ssh_fail":
                 self._mark_bad(event.ip)
                 # No trust multiplier: web traffic is cheap to farm and says nothing about who owns SSH access.
-                return self._hit("ssh_bruteforce", event.ip, (next(self._seq),), event.raw, self._cfg.ssh_fail_threshold)
+                return self._hit("ssh_bruteforce", event.ip, (self._ssh_key(event),), event.raw, self._cfg.ssh_fail_threshold,
+                                 tag=event.password_try)
             if event.kind == "web":
                 return self._web(event)
             return []
@@ -190,15 +202,35 @@ class RuleEngine:
             self._sweep(self._clock())
             return self._hit("port_scan", ip, (port,), "port %d" % port, self._cfg.scan_ports)
 
-    def feed_connections(self, per_ip: Dict[str, int], syn_recv: int) -> List[Decision]:
+    def _ssh_key(self, event: LogEvent) -> tuple:
+        # One wrong password logs "Failed" and then "Connection closed", and an unknown user adds "Invalid user" too:
+        # all one try. Keys that repeat on a connection count once; only further "Failed" lines on it add a try.
+        if event.src_port is None:
+            return (next(self._seq),)
+        dq = self._win.get(("ssh_bruteforce", _ident(event.ip)), ())
+        tries = sum(1 for e in dq if e[1][0][0] == event.src_port and e[3])
+        return (event.src_port, tries + 1 if event.password_try else 1)
+
+    def feed_connections(self, per_ip: Dict[str, int], syn_recv: int,
+                         new_per_sec: Optional[Dict[str, float]] = None) -> List[Decision]:
         with self._lock:
             now = self._clock()
             self._sweep(now)
             out = []  # type: List[Decision]
             over_protected = set()
+            over = {}  # type: Dict[str, str]
             for ip, n in per_ip.items():
-                if n < self._cfg.max_conn_per_ip or n < self._cfg.max_conn_per_ip * self._p.threshold_multiplier(ip):
-                    continue
+                if n >= self._cfg.max_conn_per_ip * self._p.threshold_multiplier(ip):
+                    over[ip] = "%d concurrent connections" % n
+            # No trust multiplier here: a flood of real requests earns trust from its own first 20 answers.
+            streak = {}  # type: Dict[str, int]
+            for ip, rate in (new_per_sec or {}).items():
+                if rate >= self._cfg.max_new_conn_rate:
+                    streak[ip] = self._new_streak.get(ip, 0) + 1
+                    if streak[ip] >= NEW_CONN_SUSTAINED_SAMPLES:
+                        over[ip] = "%d new connections per second" % rate
+            self._new_streak = streak
+            for ip, evidence in over.items():
                 ident = _ident(ip)
                 why = self._p.reason(ip)
                 if why:
@@ -206,7 +238,7 @@ class RuleEngine:
                     if ident not in self._conn_suppressed:
                         self.suppressed[why] += 1
                     continue
-                out += self._fire("conn_flood", ip, now, "%d concurrent connections" % n, None)
+                out += self._fire("conn_flood", ip, now, evidence, None)
             self._conn_suppressed = over_protected
             return out + self._flood(now, sum(per_ip.values()), syn_recv)
 
@@ -251,9 +283,8 @@ class RuleEngine:
         hits = exploit_hits(ev.path)
         if hits:
             self._mark_bad(ev.ip, trusted)
-            # Several patterns in one URL can be a benign page (inline script with ../ and $( ), so require 2 requests.
             out += self._hit("web_exploit", ev.ip, hits, ev.raw, self._cfg.exploit_threshold * mult, ev.user_agent,
-                             EXPLOIT_MIN_REQUESTS)
+                             EXPLOIT_MIN_REQUESTS, ev.path)
         return out
 
     def _mark_bad(self, ip: str, trusted: bool = False) -> None:
@@ -266,7 +297,7 @@ class RuleEngine:
         self._remember(self._bad, ident, rec)
 
     def _hit(self, rule: str, ip: str, keys: tuple, raw: str, threshold: int, ua: Optional[str] = None,
-             min_events: int = 1) -> List[Decision]:
+             min_requests: int = 1, tag=None) -> List[Decision]:
         now = self._clock()
         span = SCAN_WINDOW if rule == "port_scan" else WINDOW
         ident = _ident(ip)
@@ -280,8 +311,8 @@ class RuleEngine:
             self._win.move_to_end(wk)
         while dq and dq[0][0] <= now - span:
             dq.popleft()
-        dq.append((now, keys, raw))
-        if len(dq) < min_events or len(set().union(*(e[1] for e in dq))) < threshold:
+        dq.append((now, keys, raw, tag))
+        if len({e[3] for e in dq}) < min_requests or len(set().union(*(e[1] for e in dq))) < threshold:
             return []
         evidence = "\n".join(e[2] for e in list(dq)[-EVIDENCE_LINES:])[:EVIDENCE_CHARS]
         del self._win[wk]
@@ -310,8 +341,9 @@ class RuleEngine:
             self.suppressed["verified-bot"] += 1
             return []
         off = self._offense.get(key)
-        repeats = off[0] if off and now - off[1] < OFFENSE_MEMORY else 0
-        action, base = _RULES[rule]
+        # A slowdown is no punishment: steady traffic from an office would otherwise grow it to a day.
+        repeats = off[0] if off and now - off[1] < OFFENSE_MEMORY and rule != "conn_flood" else 0
+        action, base = _RULES[rule], getattr(self._cfg, "ttl_" + rule)
         ttl = min(base * 2 ** min(repeats, 10), MAX_TTL)
         self._remember(self._offense, key, [repeats + 1, now])
         self._remember(self._active, key, now + ttl)

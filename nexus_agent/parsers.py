@@ -19,13 +19,13 @@ _SSH_HEADER = (
 # Publickey lines end with the key type and fingerprint, which have a fixed shape.
 _SSH_TAIL = r"(?: ssh2(?:: [A-Za-z0-9-]+ SHA256:\S+)?)?\Z"
 _SSH_FAIL = (
-    re.compile(_SSH_HEADER + r"Failed \S+ for .* from (\S+) port \d{1,5}" + _SSH_TAIL),
-    re.compile(_SSH_HEADER + r"Invalid user .* from (\S+) port \d{1,5}(?: \[preauth\])?\Z"),
-    re.compile(_SSH_HEADER + r"Connection closed by authenticating user .* (\S+) port \d{1,5} \[preauth\]\Z"),
+    re.compile(_SSH_HEADER + r"Failed \S+ for .* from (\S+) port (\d{1,5})" + _SSH_TAIL),
+    re.compile(_SSH_HEADER + r"Invalid user .* from (\S+) port (\d{1,5})(?: \[preauth\])?\Z"),
+    re.compile(_SSH_HEADER + r"Connection closed by authenticating user .* (\S+) port (\d{1,5}) \[preauth\]\Z"),
 )
 _SSH_OK = re.compile(
     _SSH_HEADER
-    + r"Accepted (?:password|publickey|keyboard-interactive/pam) for .* from (\S+) port \d{1,5}"
+    + r"Accepted (?:password|publickey|keyboard-interactive/pam) for .* from (\S+) port (\d{1,5})"
     + _SSH_TAIL
 )
 # Classify on the text right after the header: a username may contain "Accepted password"
@@ -64,6 +64,8 @@ class LogEvent:
     status: Optional[int] = None
     raw: str = ""
     user_agent: Optional[str] = None  # raw is truncated, so the agent string is kept separately
+    src_port: Optional[int] = None  # ssh: tells which lines belong to the same connection
+    password_try: bool = False  # ssh: a "Failed ..." line, one real try among several on a connection
 
 
 def normalize_ip(s: str) -> Optional[str]:
@@ -102,7 +104,8 @@ def parse_ssh_line(line: str, now: float) -> Optional[LogEvent]:
             ip = normalize_ip(m.group(1))
             if ip is None:
                 return None
-            return LogEvent(kind, ip, now, raw=line[:MAX_RAW])
+            return LogEvent(kind, ip, now, raw=line[:MAX_RAW], src_port=int(m.group(2)),
+                            password_try=head.group(1) == "Failed ")
     return None
 
 

@@ -184,6 +184,11 @@ def _canonical_ip(value: str) -> str:
     return str(ipaddress.ip_address(value))
 
 
+def _storable(value):
+    # Log text can hold a NUL or a lone surrogate. Postgres refuses both, and a refused batch would block every later event.
+    return value.replace("\x00", "").encode("utf-8", "replace").decode() if isinstance(value, str) else value
+
+
 class SecurityEventIn(BaseModel):
     rule: str = Field(min_length=1, max_length=64)
     ip: str
@@ -200,7 +205,10 @@ class SecurityEventIn(BaseModel):
     @field_validator("evidence", mode="before")
     @classmethod
     def _truncate(cls, value):
+        value = _storable(value)
         return value[:500] if isinstance(value, str) else value
+
+    _storable_rule = field_validator("rule", mode="before")(_storable)
 
 
 class BlockIn(BaseModel):
@@ -212,6 +220,7 @@ class BlockIn(BaseModel):
     kind: Literal["block_port", "block_all", "rate_limit"] = "block_all"
 
     _valid_ip = field_validator("ip")(_canonical_ip)
+    _storable_rule = field_validator("rule", mode="before")(_storable)
 
 
 class IngestPayload(BaseModel):

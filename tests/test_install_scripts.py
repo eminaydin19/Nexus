@@ -1066,7 +1066,7 @@ def test_default_path_never_needs_aws():
 def test_shellcheck_clean():
     # No skip: this image has it (Dockerfile.test) and CI installs it, so a missing binary must fail.
     assert shutil.which("shellcheck"), "shellcheck is not installed"
-    files = ["install.sh", "install-agent.sh", "deploy/latency_probe.sh", "scripts/test.sh", "tests/e2e/run.sh",
+    files = ["install.sh", "install-agent.sh", "deploy/latency_probe.sh", "scripts/test.sh", "tests/e2e/install.sh", "tests/e2e/run.sh",
              "tests/e2e/check.sh"]
     r = subprocess.run(["shellcheck", "-x", *files], cwd=ROOT, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr

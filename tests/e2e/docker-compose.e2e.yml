@@ -1,0 +1,114 @@
+# Attack and customer scenarios. tests/e2e/run.sh owns this project; never bring it up under another name.
+# 203.0.113.0/24 is routable as far as the Protector knows, so no address here is exempt from blocking by range.
+name: nexus-scenarios
+
+x-tool: &tool
+  build:
+    context: stack
+    target: tools
+  image: nexus-scenarios-tools
+  init: true
+  cap_add: [NET_RAW, NET_ADMIN]
+  extra_hosts: ["target:203.0.113.20"]
+
+services:
+  central:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: nexus-scenarios-central
+    environment:
+      DATA_DIR: /data
+      DASHBOARD_USER: admin
+      DASHBOARD_PASSWORD: e2e-dashboard-password
+      DATABASE_URL: ${E2E_DATABASE_URL:-}
+      # Every anomaly counts as critical, so the "critical score blocks nobody" scenario does not depend on what a short
+      # training run on this stack's mixed traffic can reach.
+      CRITICAL_SCORE: "0.5"
+    volumes:
+      - central-data:/data
+    mem_limit: 800m
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.10
+
+  postgres:
+    image: postgres:17-alpine
+    profiles: [postgres]
+    environment:
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: e2e-db-password
+      POSTGRES_DB: nexus
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.11
+
+  target:
+    build:
+      context: stack
+      target: target
+      additional_contexts:
+        repo: ../..
+    image: nexus-scenarios-target
+    hostname: target
+    init: true
+    cap_add: [NET_ADMIN, SYSLOG]
+    devices: ["/dev/kmsg:/dev/kmsg"]
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.20
+
+  attacker:
+    <<: *tool
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.30
+  customer:
+    <<: *tool
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.31
+  nat_customer:
+    <<: *tool
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.32
+  cdn:
+    <<: *tool
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.33
+  scanner:
+    <<: *tool
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.34
+
+  runner:
+    build:
+      context: stack
+      target: runner
+    image: nexus-scenarios-runner
+    init: true
+    environment:
+      E2E_PROJECT: nexus-scenarios
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scenarios.py:/e2e/scenarios.py:ro
+      - ./.scenario-out:/e2e/out
+    networks:
+      e2e:
+        ipv4_address: 203.0.113.40
+
+networks:
+  e2e:
+    ipam:
+      config:
+        - subnet: 203.0.113.0/24
+          gateway: 203.0.113.1
+
+volumes:
+  central-data:
+  postgres-data:

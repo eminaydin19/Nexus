@@ -76,30 +76,30 @@ def test_block_port_argv_exact():
     enf, runner, _ = make()
     res = enf.apply(dec())
     assert res.ok and not res.simulated
-    assert ["nft", "add", "element", "inet", "nexus", "port4", "{ 203.0.113.9 . 22 timeout 3600s }"] in runner.calls
+    assert ["nft", "add", "element", "inet", "nexus", "port4", "{ 203.0.113.9 . 22 timeout 3600s comment \"ssh_bruteforce\" }"] in runner.calls
 
 
 def test_block_port_one_element_per_port():
     enf, runner, _ = make()
     enf.apply(dec(ports=(80, 443, 80)))
     assert writes(runner) == [["nft", "add", "element", "inet", "nexus", "port4",
-                               "{ 203.0.113.9 . 80 timeout 3600s, 203.0.113.9 . 443 timeout 3600s }"]]
+                               "{ 203.0.113.9 . 80 timeout 3600s comment \"ssh_bruteforce\", 203.0.113.9 . 443 timeout 3600s comment \"ssh_bruteforce\" }"]]
 
 
 def test_block_all_and_rate_limit_argv():
     enf, runner, _ = make()
     enf.apply(dec("block_all", ports=()))
     enf.apply(dec("rate_limit", ip="198.51.100.1", ports=(), ttl=60))
-    assert ["nft", "add", "element", "inet", "nexus", "all4", "{ 203.0.113.9 timeout 3600s }"] in runner.calls
-    assert ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.1 timeout 60s }"] in runner.calls
+    assert ["nft", "add", "element", "inet", "nexus", "all4", "{ 203.0.113.9 timeout 3600s comment \"ssh_bruteforce\" }"] in runner.calls
+    assert ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.1 timeout 60s comment \"ssh_bruteforce\" }"] in runner.calls
 
 
 def test_ipv6_blocked_as_64():
     enf, runner, _ = make()
     enf.apply(dec(ip="2001:db8:1:2:aaaa:bbbb:cccc:dddd"))
     enf.apply(dec("block_all", ip="2001:db8:1:2::5", ports=()))
-    assert ["nft", "add", "element", "inet", "nexus", "port6", "{ 2001:db8:1:2:: . 22 timeout 3600s }"] in runner.calls
-    assert ["nft", "add", "element", "inet", "nexus", "all6", "{ 2001:db8:1:2:: timeout 3600s }"] in runner.calls
+    assert ["nft", "add", "element", "inet", "nexus", "port6", "{ 2001:db8:1:2:: . 22 timeout 3600s comment \"ssh_bruteforce\" }"] in runner.calls
+    assert ["nft", "add", "element", "inet", "nexus", "all6", "{ 2001:db8:1:2:: timeout 3600s comment \"ssh_bruteforce\" }"] in runner.calls
 
 
 def test_ipv4_mapped_ipv6_uses_v4_set():
@@ -127,7 +127,7 @@ def test_invalid_block_raises(kw):
 def test_ttl_clamped_to_one_day():
     enf, runner, _ = make()
     enf.apply(dec(ttl=10**9))
-    assert writes(runner)[0][-1].endswith("timeout 86400s }")
+    assert writes(runner)[0][-1].endswith("timeout 86400s comment \"ssh_bruteforce\" }")
 
 
 def test_file_exists_is_success():
@@ -150,7 +150,7 @@ def test_breaker_opens_after_50_in_5m():
     res = enf.apply(dec(ip="198.51.100.77", ttl=3600))
     assert res.ok and res.detail == "breaker: rate_limit"
     assert enf.breaker_open
-    assert writes(runner)[-1] == ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.77 timeout 600s }"]
+    assert writes(runner)[-1] == ["nft", "add", "element", "inet", "nexus", "limit4", "{ 198.51.100.77 timeout 600s comment \"ssh_bruteforce\" }"]
     assert not any("198.51.100.77" in " ".join(c) and "port4" in c for c in runner.calls)
 
 
@@ -246,7 +246,7 @@ def test_setup_single_atomic_transaction():
                    "ip saddr . tcp dport @port4 drop", "ip saddr @all4 drop",
                    "ip6 saddr & ffff:ffff:ffff:ffff:: . tcp dport @port6 drop",
                    "ip6 saddr & ffff:ffff:ffff:ffff:: @all6 drop",
-                   "ip saddr @limit4 ct state new", "limit rate over 50/second",
+                   "ip saddr @limit4 ct state new", "limit rate over 100/second", "update @seen4 { ip saddr counter }",
                    'log prefix "nexus-scan "', "tcp dport != @listening"]:
         assert needle in script
     assert "flush ruleset" not in script and "interval" not in script
@@ -486,14 +486,14 @@ def test_reapply_longer_replaces_atomically():
     assert enf.apply(dec("block_all", ports=(), ttl=3600)).ok
     assert writes(runner) == [["nft", "-f", "-"]]
     assert runner.inputs[-1] == ("delete element inet nexus all4 { 203.0.113.9 }\n"
-                                 "add element inet nexus all4 { 203.0.113.9 timeout 3600s }\n")
+                                 "add element inet nexus all4 { 203.0.113.9 timeout 3600s comment \"ssh_bruteforce\" }\n")
 
 
 def test_reapply_mixed_ports_only_touches_shorter_ones():
     out = table_json(("port4", [{"elem": {"val": {"concat": ["203.0.113.9", 22]}, "expires": 9000}}]))
     enf, runner, _ = make(runner=FakeRunner({"-j list set": (0, out)}))
     enf.apply(dec(ports=(22, 80), ttl=3600))
-    assert writes(runner) == [["nft", "add", "element", "inet", "nexus", "port4", "{ 203.0.113.9 . 80 timeout 3600s }"]]
+    assert writes(runner) == [["nft", "add", "element", "inet", "nexus", "port4", "{ 203.0.113.9 . 80 timeout 3600s comment \"ssh_bruteforce\" }"]]
 
 
 def test_breaker_downgrade_does_not_shorten_existing_limit():
@@ -603,3 +603,24 @@ def test_failed_downgraded_write_keeps_breaker_in_detail():
     runner.responses["limit4"] = (1, "Error: nope")
     res = enf.apply(dec(ip="203.0.113.2"))
     assert not res.ok and res.detail.startswith("breaker") and res.ttl == 600
+
+
+def test_rule_survives_a_restart_through_the_element_comment():
+    listing = {"nftables": [{"set": {"name": "port4", "elem": [
+        {"elem": {"val": {"concat": ["203.0.113.9", 80]}, "expires": 60, "comment": "web_probe"}}]}}]}
+    present = json.dumps({"nftables": [{"rule": {"chain": "prerouting"}}]})
+    enf, _, _ = make(runner=FakeRunner({"list chain": (0, present), "list table": (0, json.dumps(listing))}))
+    assert enf.setup()
+    enf.mode = "enforce"
+    assert [(b.ip, b.rule, b.ports) for b in enf.active()] == [("203.0.113.9", "web_probe", [80])]
+
+
+def test_new_connections_reads_counters_and_tolerates_failure():
+    seen = {"nftables": [{"set": {"name": "seen4", "elem": [
+        {"elem": {"val": "203.0.113.9", "counter": {"packets": 42, "bytes": 2000}, "expires": 50}}]}}]}
+    enf, _, _ = make(mode="enforce", runner=FakeRunner({"list set inet nexus seen4": (0, json.dumps(seen)),
+                                                       "list set inet nexus seen6": (1, "Error")}))
+    assert enf.new_connections() == {"203.0.113.9": 42}
+    enf.mode = "observe"
+    assert enf.new_connections() == {}
+

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -26,6 +27,9 @@ MAX_ACTIVE_REPORT = 1000  # ingest limit on active_blocks
 MAX_PORTS_REPORT = 16  # BlockIn.ports limit
 V6_MASK = "ffff:ffff:ffff:ffff::"
 BLOCK_SETS = ("port4", "port6", "all4", "all6", "limit4", "limit6")
+NEW_CONN_SETS = ("seen4", "seen6")
+# One bit of the conntrack mark, so tools that use other bits keep working.
+SEEN_BIT = "0x40000000"
 _KIND = {"port": "block_port", "all": "block_all", "limit": "rate_limit"}
 _SET_FOR = {"block_port": "port", "block_all": "all", "rate_limit": "limit"}
 
@@ -74,6 +78,10 @@ def _address(ip: str) -> Tuple[str, str]:
     return "6", str(ipaddress.IPv6Network((addr, 64), strict=False).network_address)
 
 
+def _safe_comment(rule: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", rule)[:64]
+
+
 def _port(p: object) -> int:
     if isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= 65535:
         raise ValueError("invalid port: %r" % (p,))
@@ -87,11 +95,16 @@ def _setup_script(with_rules: bool) -> str:
         for name in ("all", "limit"):
             lines.append("add set inet nexus %s%s { type %s; flags timeout; }" % (name, fam, t))
         lines.append("add set inet nexus meter%s { type %s; flags dynamic,timeout; timeout 1m; size 65535; }" % (fam, t))
+        lines.append("add set inet nexus seen%s { type %s; flags dynamic,timeout; timeout 1m; size 65535; }" % (fam, t))
     lines.append("add set inet nexus listening { type inet_service; }")
     lines.append("add chain inet nexus prerouting { type filter hook prerouting priority -150; policy accept; }")
     if with_rules:
         s6 = "ip6 saddr & ffff:ffff:ffff:ffff::"
-        rate = "limit rate over 50/second"
+        rate = "limit rate over 100/second burst 200 packets"
+        # Counts each connection once, when the handshake completes. "established" alone is not enough: a forged SYN makes
+        # the real owner of that address answer our SYN-ACK with a RST, and only "assured" leaves that packet out.
+        first = ("ct status assured ct direction original ct mark & %s == 0 meta l4proto tcp ct mark set ct mark | %s"
+                 % (SEEN_BIT, SEEN_BIT))
         lines += [
             "add rule inet nexus prerouting ip saddr . tcp dport @port4 drop",
             "add rule inet nexus prerouting %s . tcp dport @port6 drop" % s6,
@@ -101,6 +114,8 @@ def _setup_script(with_rules: bool) -> str:
             "update @meter4 { ip saddr %s } drop" % rate,
             "add rule inet nexus prerouting %s @limit6 ct state new "
             "update @meter6 { %s %s } drop" % (s6, s6, rate),
+            "add rule inet nexus prerouting meta nfproto ipv4 %s update @seen4 { ip saddr counter }" % first,
+            "add rule inet nexus prerouting meta nfproto ipv6 %s update @seen6 { %s counter }" % (first, s6),
             # Only SYNs addressed to this host from outside: forwarded and loopback traffic is not a scan of us.
             'add rule inet nexus prerouting fib daddr type local iif != "lo" ct state new tcp flags syn '
             'tcp dport != @listening '
@@ -190,7 +205,8 @@ class Enforcer:
             if rows is not None:
                 now = self._clock()
                 self._live = {
-                    (s, a, p): (now + exp, self._live.get((s, a, p), (0, "unknown"))[1]) for s, a, p, exp in rows
+                    (s, a, p): (now + exp, rule or self._live.get((s, a, p), (0, "unknown"))[1])
+                    for s, a, p, exp, rule in rows
                 }
             return True
 
@@ -208,8 +224,8 @@ class Enforcer:
                 log.error("nft teardown failed (%s): %s", rc, out.strip())
             return ok
 
-    def _read_kernel(self, set_name: Optional[str] = None) -> Optional[List[Tuple[str, str, int, float]]]:
-        """Block elements as (set, addr, port, seconds left); [] when nft or the table is absent, None on error."""
+    def _read_kernel(self, set_name: Optional[str] = None) -> Optional[List[Tuple[str, str, int, float, str]]]:
+        """Block elements as (set, addr, port, seconds left, rule); [] when nft or the table is absent, None on error."""
         what = ["set", "inet", TABLE, set_name] if set_name else ["table", "inet", TABLE]
         rc, out = self._run(["nft", "-j", "list"] + what)
         if rc == 127 or (rc != 0 and "No such file" in out):
@@ -227,11 +243,12 @@ class Enforcer:
                     el = el.get("elem", el) if isinstance(el, dict) else el
                     val = el.get("val") if isinstance(el, dict) else el
                     expires = float(el.get("expires", 0)) if isinstance(el, dict) else 0.0
+                    rule = el.get("comment", "") if isinstance(el, dict) else ""
                     if isinstance(val, dict):
                         addr, port = val["concat"]
                     else:
                         addr, port = val, 0
-                    rows.append((s["name"], str(ipaddress.ip_address(addr)), int(port), expires))
+                    rows.append((s["name"], str(ipaddress.ip_address(addr)), int(port), expires, rule))
         except (ValueError, KeyError, TypeError, AttributeError):
             log.error("unparseable nft output for table inet %s", TABLE)
             return None
@@ -280,7 +297,7 @@ class Enforcer:
 
     def _write(self, keys: List[Key], addr: str, ttl: int, rule: str, now: float, detail: str) -> ApplyResult:
         setname = keys[0][0]
-        left = {(a, p): e for _, a, p, e in self._read_kernel(setname) or []}
+        left = {(a, p): e for _, a, p, e, _ in self._read_kernel(setname) or []}
         # nft reports whole seconds, so a block re-applied right away would otherwise be rewritten every time.
         todo = [k for k in keys if left.get((k[1], k[2]), -1) < ttl - 1]
         for k in keys:
@@ -288,8 +305,9 @@ class Enforcer:
                 self._live[k] = (now + left[(k[1], k[2])], rule)
         if not todo:
             return ApplyResult(True, False, detail)  # a live block is never shortened
+        # The comment is the kernel's copy of why: it survives an agent restart, when memory of the rule does not.
         items = "{ %s }" % ", ".join(
-            "%s . %d timeout %ds" % (addr, k[2], ttl) if k[2] else "%s timeout %ds" % (addr, ttl) for k in todo)
+            '%s timeout %ds comment "%s"' % (self._elem(k), ttl, _safe_comment(rule)) for k in todo)
         replace = [k for k in todo if (k[1], k[2]) in left]
         if replace:
             # Delete + add in one transaction extends a timeout on every kernel; a plain re-add may keep the old one.
@@ -321,8 +339,8 @@ class Enforcer:
             kernel = self._read_kernel()
             if kernel is None and strict:
                 return None
-            rows = [(s, a, p, now + e, self._live.get((s, a, p), (0, "unknown"))[1], False)
-                    for s, a, p, e in kernel or []]
+            rows = [(s, a, p, now + e, rule or self._live.get((s, a, p), (0, "unknown"))[1], False)
+                    for s, a, p, e, rule in kernel or []]
             if self.mode == "observe":
                 rows += [(s, a, p, v[0], v[1], True) for (s, a, p), v in self._sim.items()]
             grouped: Dict[Tuple[str, str, bool], BlockIn] = {}
@@ -344,7 +362,7 @@ class Enforcer:
             rows = self._read_kernel()
             if rows is None:
                 return False
-            targets = [(s, a, p) for s, a, p, _ in rows if a == addr and s.endswith(fam)]
+            targets = [(s, a, p) for s, a, p, _, _ in rows if a == addr and s.endswith(fam)]
             if targets:
                 script = "".join("delete element inet %s %s { %s }\n" % (TABLE, s, self._elem((s, a, p)))
                                  for s, a, p in targets)
@@ -362,6 +380,25 @@ class Enforcer:
                     del d[k]
             return True
 
+    def new_connections(self) -> Dict[str, int]:
+        """Completed handshakes per source since its set element appeared. {} when unread: a miss, never a false alarm."""
+        out = {}  # type: Dict[str, int]
+        with self._lock:
+            if self.mode != "enforce":
+                return out
+            for name in NEW_CONN_SETS:
+                rc, text = self._run(["nft", "-j", "list", "set", "inet", TABLE, name])
+                if rc != 0:
+                    continue
+                try:
+                    for item in json.loads(text).get("nftables", []):
+                        for el in (item.get("set") or {}).get("elem", []):
+                            el = el["elem"]
+                            out[str(ipaddress.ip_address(el["val"]))] = int(el["counter"]["packets"])
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    log.warning("unparseable nft output for set %s", name)
+        return out
+
     def update_listening(self, ports: Iterable[int]) -> bool:
         wanted = frozenset(_port(p) for p in ports)
         with self._lock:
@@ -378,7 +415,7 @@ class Enforcer:
             return True
 
     def _flush_blocks(self, quiet: bool = False) -> bool:
-        script = "".join("flush set inet %s %s\n" % (TABLE, n) for n in BLOCK_SETS + ("meter4", "meter6"))
+        script = "".join("flush set inet %s %s\n" % (TABLE, n) for n in BLOCK_SETS + ("meter4", "meter6") + NEW_CONN_SETS)
         rc, out = self._run(["nft", "-f", "-"], script)
         if rc == 127 or (rc != 0 and "No such file" in out):
             return True

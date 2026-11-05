@@ -94,7 +94,7 @@ Bu bölüm tasarımın zorunlu parçasıdır. Her kuralın testi olmalıdır.
 - Kullanıcının allowlist'i.
 - Merkezin IP'si ve varsayılan gateway.
 - `/etc/resolv.conf` içindeki DNS sunucuları.
-- Sunucuda aktif SSH oturumu olan IP'ler. Son 24 saatte başarılı SSH girişi yapan IP'ler de.
+- Sunucuda aktif SSH oturumu olan IP'ler. Son 24 saatte başarılı SSH girişi yapan IP'ler de. Açık bağlantı tek başına oturum sayılmaz: `LoginGraceTime`'ı (150 sn) aşan veya agent başlamadan önce kurulmuş bağlantı oturumdur, yoksa login öncesi tutulan bir bağlantı sahibini tüm kurallardan korurdu.
 - Yayınlanmış CDN aralıkları: Cloudflare, Fastly, CloudFront. Pakete bir kopya gömülür, agent günde bir kez güncellemeyi dener. Güncelleme başarısızsa son liste kullanılmaya devam edilir.
 - İleri ve geri DNS'i doğrulanan Googlebot ve Bingbot.
 
@@ -105,7 +105,7 @@ Bu bölüm tasarımın zorunlu parçasıdır. Her kuralın testi olmalıdır.
 - Hacim temelli tepki yalnızca hız sınırıdır. NAT arkasındaki müşteriler aynı IP'yi paylaşabilir.
 - IPv6'da engel `/64` bloğuna uygulanır.
 
-**Güvenilir IP:** Son 1 saatte en az 20 başarılı (`2xx`/`3xx`) sayfa isteği yapıp hiç tarama izine rastlanmayan IP için web kurallarının ve `conn_flood` eşiği 3 katına çıkar. WordPress'te başarılı login (`/wp-login.php`'ye POST ve `302`) da güven sağlar. Diğer sitelerde durum kodu login'i kanıtlamaz, bu yüzden sayılmaz. SSH kurallarına web güveni uygulanmaz.
+**Güvenilir IP:** Son 1 saatte en az 20 başarılı (`2xx`/`3xx`) sayfa isteği yapıp hiç tarama izine rastlanmayan IP için web kurallarının ve `conn_flood` eşzamanlı bağlantı eşiği 3 katına çıkar. Yeni bağlantı hızı eşiğine güven uygulanmaz: gerçek isteklerle gelen sel ilk 20 yanıtla bu güveni kazanırdı. WordPress'te başarılı login (`/wp-login.php`'ye POST ve `302`) da güven sağlar. Diğer sitelerde durum kodu login'i kanıtlamaz, bu yüzden sayılmaz. SSH kurallarına web güveni uygulanmaz.
 
 **Süre:** Engeller her zaman sürelidir ve süre kernelde tutulur (nftables set `timeout`). Agent çökse bile engel kendiliğinden biter. Tekrarlayan saldırıda süre katlanır, üst sınır 24 saattir.
 
@@ -123,12 +123,12 @@ Eşikler 5 dakikalık kayan pencerede ve ayarlanabilirdir. Başlangıç değerle
 
 | Kural | Eşik | Engel süresi |
 |---|---|---|
-| `ssh_bruteforce` | 10 başarısız giriş | 1 saat |
+| `ssh_bruteforce` | 10 başarısız giriş (aynı bağlantının `Failed`, `Invalid user` ve `Connection closed` satırları tek deneme sayılır) | 1 saat |
 | `web_login_bruteforce` | Login yollarına 30 `401`/`403` | 15 dakika |
 | `web_probe` | Tarama listesinden 10 farklı yol ve `4xx` yanıt | 30 dakika |
-| `web_exploit` | En az 2 ayrı istekte 3 farklı saldırı kalıbı | 1 saat |
+| `web_exploit` | En az 5 farklı URL'de 3 farklı saldırı kalıbı (kod yapıştırıp sayfayı yenileyen müşteri engellenmez) | 1 saat |
 | `port_scan` | 60 saniyede 20 farklı kapalı port | 15 dakika |
-| `conn_flood` | IP başına 200 eşzamanlı bağlantı | Hız sınırı, 10 dakika |
+| `conn_flood` | IP başına iki ardışık örnekte (5 sn arayla) saniyede 100 tamamlanmış yeni bağlantı veya 1000 eşzamanlı bağlantı | Hız sınırı (saniyede 100 yeni bağlantı), 10 dakika, süre katlanmaz |
 | `distributed_flood` | SYN-RECV > 500 veya yeni bağlantıda ani sıçrama | Yalnızca alarm |
 
 Login yolları ayarlanabilir, varsayılan `/login`, `/wp-login.php`, `/admin`, `/api/login`.

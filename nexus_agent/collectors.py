@@ -393,6 +393,17 @@ def sample_connections(ssh_ports: Iterable[int] = (22,), conns: Optional[list] =
     return per_ip, syn_recv, active_ssh, listening
 
 
+def ssh_peers(ssh_ports: Iterable[int], conns: list) -> Set[Tuple[str, int]]:
+    ports = set(ssh_ports)
+    out = set()  # type: Set[Tuple[str, int]]
+    for c in conns:
+        if c.status == psutil.CONN_ESTABLISHED and c.raddr and c.laddr and c.laddr.port in ports:
+            ip = normalize_ip(c.raddr.ip)
+            if ip:
+                out.add((ip, c.raddr.port))
+    return out
+
+
 def web_peers(web_ports: Iterable[int], conns: Optional[list] = None) -> Set[str]:
     conns = read_connections() if conns is None else conns
     ports = set(web_ports)

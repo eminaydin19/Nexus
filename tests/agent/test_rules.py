@@ -5,7 +5,7 @@ import time
 import pytest
 
 from nexus_agent import rules
-from nexus_agent.parsers import LogEvent
+from nexus_agent.parsers import LogEvent, parse_ssh_line
 from nexus_agent.protect import Protector
 from nexus_agent.rules import RuleConfig, RuleEngine
 
@@ -135,9 +135,9 @@ def test_probe_with_200_status_not_counted_and_no_note_probe():
 
 def test_web_exploit_3_distinct_patterns_1h():
     eng, _, _ = mk()
-    paths = ["/a?q=1 union select 2", "/a?q=%27+or+1=1", "/x/../../y"]
-    assert all_decisions(eng, lambda i: web(paths[i], 200), 2) == []
-    d = eng.feed(web(paths[2], 200))[0]
+    paths = ["/a?q=1 union select 2", "/a?q=%27+or+1=1", "/x/../../y", "/x/../../z", "/x/../../w"]
+    assert all_decisions(eng, lambda i: web(paths[i], 200), 4) == []
+    d = eng.feed(web(paths[4], 200))[0]
     assert (d.rule, d.action, d.ports, d.ttl) == ("web_exploit", "block_port", (80, 443), 3600)
 
 
@@ -256,35 +256,64 @@ def test_port_scan_threshold_not_tripled_for_trusted():
 
 def test_conn_flood_rate_limits_not_blocks():
     eng, _, _ = mk()
-    assert eng.feed_connections({IP: 199}, 0) == []
-    d = eng.feed_connections({IP: 200}, 0)[0]
+    assert eng.feed_connections({IP: 999}, 0) == []
+    d = eng.feed_connections({IP: 1000}, 0)[0]
     assert (d.rule, d.action, d.ttl, d.ip) == ("conn_flood", "rate_limit", 600, IP)
 
 
-def test_conn_flood_once_while_active_then_escalates():
+def test_conn_flood_once_while_active_and_never_grows():
     eng, clock, _ = mk()
-    assert len(eng.feed_connections({IP: 500}, 0)) == 1
-    assert eng.feed_connections({IP: 500}, 0) == []
-    clock.t += 601
-    assert eng.feed_connections({IP: 500}, 0)[0].ttl == 1200
+    assert eng.feed_connections({IP: 1500}, 0)[0].ttl == 600
+    assert eng.feed_connections({IP: 1500}, 0) == []
+    for _ in range(4):
+        clock.t += 601
+        assert eng.feed_connections({IP: 1500}, 0)[0].ttl == 600
+
+
+def test_office_with_250_open_connections_is_left_alone():
+    eng, _, _ = mk()
+    assert eng.feed_connections({IP: 250}, 0, {IP: 20.0}) == []
+    assert eng.feed_connections({IP: 250}, 0, {IP: 20.0}) == []
+
+
+def test_new_connection_rate_must_be_sustained():
+    eng, clock, _ = mk()
+    assert eng.feed_connections({}, 0, {IP: 400.0}) == []
+    clock.t += 5
+    assert eng.feed_connections({}, 0, {IP: 20.0}) == []
+    clock.t += 5
+    assert eng.feed_connections({}, 0, {IP: 400.0}) == []
+    clock.t += 5
+    d = eng.feed_connections({}, 0, {IP: 400.0})
+    assert [(x.rule, x.action) for x in d] == [("conn_flood", "rate_limit")]
+    assert "400 new connections per second" in d[0].evidence
+
+
+def test_new_connection_rate_ignores_earned_trust_and_respects_protection():
+    eng, _, prot = mk(allowlist=["198.18.0.0/24"])
+    prot.note_login_ok(IP)
+    eng.feed_connections({}, 0, {IP: 150.0, "198.18.0.5": 900.0})
+    d = eng.feed_connections({}, 0, {IP: 150.0, "198.18.0.5": 900.0})
+    assert [x.ip for x in d] == [IP]
+    assert eng.suppressed["allowlist"] == 1
 
 
 def test_conn_flood_protected_and_cdn_ips_accepted_silently():
     eng, _, _ = mk(allowlist=["198.18.0.0/24"])
-    assert eng.feed_connections({"198.18.0.5": 900, CF: 900, "127.0.0.1": 900}, 0) == []
+    assert eng.feed_connections({"198.18.0.5": 1900, CF: 1900, "127.0.0.1": 1900}, 0) == []
     assert eng.suppressed["allowlist"] == 1 and eng.suppressed["cdn"] == 1 and eng.suppressed["loopback"] == 1
-    eng.feed_connections({"198.18.0.5": 900}, 0)
+    eng.feed_connections({"198.18.0.5": 1900}, 0)
     assert eng.suppressed["allowlist"] == 1  # same ongoing episode counted once
     eng.feed_connections({}, 0)
-    eng.feed_connections({"198.18.0.5": 900}, 0)
+    eng.feed_connections({"198.18.0.5": 1900}, 0)
     assert eng.suppressed["allowlist"] == 2
 
 
 def test_conn_flood_trust_multiplier():
     eng, _, prot = mk()
     prot.note_login_ok(IP)
-    assert eng.feed_connections({IP: 599}, 0) == []
-    assert len(eng.feed_connections({IP: 600}, 0)) == 1
+    assert eng.feed_connections({IP: 2999}, 0) == []
+    assert len(eng.feed_connections({IP: 3000}, 0)) == 1
 
 
 def test_distributed_flood_alert_only():
@@ -333,10 +362,18 @@ def test_single_request_with_three_patterns_does_not_block():
     assert eng.feed(web(url, 200)) == []
 
 
-def test_same_patterns_across_two_requests_fire():
+def test_pasted_code_refreshed_and_edited_does_not_fire():
     eng, _, _ = mk()
-    assert eng.feed(web("/a?<script+src=../x", 200)) == []
-    d = eng.feed(web("/a?$(id)", 200))
+    snippet = '/search?q=<script>$("#%s").load("../api")</script>'
+    assert all_decisions(eng, lambda i: web(snippet % "a", 200), 20) == []
+    assert all_decisions(eng, lambda i: web(snippet % "bcd"[i], 200), 3) == []
+
+
+def test_exploit_fires_on_the_fifth_different_request():
+    eng, _, _ = mk()
+    snippet = '/search?q=<script>$("#%d").load("../api")</script>'
+    assert all_decisions(eng, lambda i: web(snippet % i, 200), 4) == []
+    d = eng.feed(web(snippet % 4, 200))
     assert len(d) == 1 and d[0].rule == "web_exploit"
 
 
@@ -450,7 +487,7 @@ def test_cdn_source_web_rules_alert_only_ssh_still_blocks():
 def test_behind_cdn_mode_web_alert_ssh_and_scan_normal():
     eng, _, _ = mk()
     eng.set_behind_cdn(True)
-    got = all_decisions(eng, lambda i: web(["/a?<script", "/a?f=/etc/passwd", "/a/../b"][i], 200), 3)
+    got = all_decisions(eng, lambda i: web(["/a?<script", "/a?f=/etc/passwd", "/a/../b", "/c/../b", "/d/../b"][i], 200), 5)
     assert [(d.rule, d.action, d.ports, d.ttl) for d in got] == [("web_exploit", "alert", (), 0)]
     assert all_decisions(eng, lambda i: ssh_fail(), 10)[0].action == "block_port"
     assert scan(eng, first=3000)[0].action == "block_all"  # the SSH failures above are the handshake evidence
@@ -524,7 +561,7 @@ def test_config_from_env_valid_and_invalid(caplog):
     })
     assert cfg.ssh_fail_threshold == 5 and cfg.web_ports == (80, 8443) and cfg.max_tracked_ips == 50
     assert cfg.login_paths == ("/signin", "/admin")
-    assert cfg.max_conn_per_ip == 200 and cfg.probe_threshold == 10 and cfg.ssh_ports == (22,)
+    assert cfg.max_conn_per_ip == 1000 and cfg.probe_threshold == 10 and cfg.ssh_ports == (22,)
     assert "NEXUS_RULE_MAX_CONN_PER_IP" in caplog.text
 
 
@@ -569,3 +606,42 @@ def test_ipv6_offense_history_per_64_and_forget_from_any_address():
     for i in range(10):
         got += eng.feed(ssh_fail(V6[i]))
     assert len(got) == 1 and got[0].ttl == 3600
+
+
+def test_ttl_env_knobs_clamp_and_reject():
+    cfg = RuleConfig.from_env({"NEXUS_RULE_TTL_WEB_PROBE": "25", "NEXUS_RULE_TTL_PORT_SCAN": "999999",
+                               "NEXUS_RULE_TTL_SSH_BRUTEFORCE": "0", "NEXUS_RULE_TTL_CONN_FLOOD": "-5"})
+    assert cfg.ttl_web_probe == 25
+    assert cfg.ttl_port_scan == 86400
+    assert cfg.ttl_ssh_bruteforce == 3600 and cfg.ttl_conn_flood == 600
+
+
+def test_configured_ttl_is_what_the_decision_carries():
+    prot = Protector()
+    eng = RuleEngine(RuleConfig(ttl_conn_flood=8), prot)
+    assert eng.feed_connections({IP: 1500}, 0)[0].ttl == 8
+
+
+def ssh_line(text):
+    return parse_ssh_line("2026-11-05T10:53:17.589186+00:00 target sshd-session[47]: " + text, 0)
+
+
+def test_one_wrong_password_with_its_closing_line_counts_once():
+    eng, _, _ = mk()
+    for port in range(50000, 50009):
+        assert eng.feed(ssh_line("Failed password for customer from %s port %d ssh2" % (IP, port))) == []
+        assert eng.feed(ssh_line("Connection closed by authenticating user customer %s port %d [preauth]" % (IP, port))) == []
+    d = eng.feed(ssh_line("Failed password for customer from %s port 50009 ssh2" % IP))
+    assert [x.rule for x in d] == ["ssh_bruteforce"]
+
+
+def test_unknown_user_try_counts_once_and_repeated_tries_on_one_connection_all_count():
+    eng, _, _ = mk()
+    for port in range(50000, 50003):
+        assert eng.feed(ssh_line("Invalid user bob from %s port %d" % (IP, port))) == []
+        assert eng.feed(ssh_line("Failed password for invalid user bob from %s port %d ssh2" % (IP, port))) == []
+    for _ in range(6):
+        assert eng.feed(ssh_line("Failed password for customer from %s port 50009 ssh2" % IP)) == []
+    d = eng.feed(ssh_line("Failed password for customer from %s port 50009 ssh2" % IP))
+    assert [x.rule for x in d] == ["ssh_bruteforce"]
+

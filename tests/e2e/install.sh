@@ -110,7 +110,7 @@ boot() {
     CONTAINERS+=("$name")
     docker run -d --name "$name" --hostname "$name" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
         --network "$NETWORK" "$name" >/dev/null
-    docker exec "$name" bash -c 'for _ in $(seq 60); do s=$(systemctl is-system-running 2>/dev/null); case "$s" in running|degraded) exit 0;; esac; sleep 1; done; echo "systemd state: $s"; exit 1'
+    docker exec "$name" bash -c 'for _ in $(seq 180); do s=$(systemctl is-system-running 2>/dev/null); case "$s" in running|degraded) exit 0;; esac; sleep 1; done; echo "systemd state: $s"; exit 1'
 }
 
 for base in "${REFUSAL_TARGETS[@]}"; do

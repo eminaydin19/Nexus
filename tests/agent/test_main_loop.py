@@ -534,7 +534,7 @@ def test_startup_clamps_persisted_enforce_and_flushes_leftovers(tmp_path):
     save_state(tmp_path, "enforce", [])
     rig = Rig(tmp_path, max_mode="observe")
     assert rig.enforcer.mode == "observe"
-    assert rig.nft.flushes == 8  # six block sets and two meters
+    assert rig.nft.flushes == 10  # six block sets, two meters and two new-connection counters
     assert not any("add table" in s for s in rig.nft.scripts())
 
 
@@ -546,7 +546,7 @@ def test_startup_in_enforce_keeps_kernel_blocks(tmp_path):
 def test_observe_flush_happens_only_once(rig):
     rig.agent.tick()
     rig.agent.handle_command(Command(1, "mode", {"mode": "observe"}))
-    assert rig.nft.flushes == 8
+    assert rig.nft.flushes == 10
 
 
 def test_failed_startup_enforce_is_reported(tmp_path, monkeypatch):
@@ -701,10 +701,13 @@ def test_off_mode_does_not_run_rules(tmp_path):
 
 
 def test_connections_feed_active_ssh_listening_and_rules(enforcing, monkeypatch):
-    many = [est(80, IP) for _ in range(200)]
+    many = [est(80, IP) for _ in range(1000)]
     monkeypatch.setattr(psutil, "net_connections",
                         lambda kind: [listen(22), listen(80), listen(8080), est(22, "198.51.100.7")] + many)
     enforcing.clock.t += 5
+    enforcing.agent.tick()
+    assert enforcing.protector.reason("198.51.100.7") is None, "an unauthenticated connection proves nothing"
+    enforcing.clock.t += agent_main.SSH_SESSION_MIN_AGE
     enforcing.agent.tick()
     assert enforcing.protector.reason("198.51.100.7") == "active-ssh"
     assert ("limit4", IP, 0) in enforcing.nft.elems
@@ -728,6 +731,8 @@ def test_connection_sampling_runs_every_five_seconds(rig, monkeypatch):
 def test_denied_sample_keeps_listening_and_active_ssh(rig, monkeypatch):
     monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22), est(22, "198.51.100.7")])
     rig.clock.t += 5
+    rig.agent.tick()
+    rig.clock.t += agent_main.SSH_SESSION_MIN_AGE
     rig.agent.tick()
 
     def deny(kind):
@@ -1270,3 +1275,34 @@ def test_uninstall_without_nft_exits_zero_with_message(monkeypatch, capsys):
     monkeypatch.setattr(Enforcer, "teardown", lambda self: pytest.fail("no nft to call"))
     assert main(["uninstall"]) == 0
     assert "nft" in capsys.readouterr().out
+
+
+def test_ssh_connection_held_before_login_gives_no_protection_when_it_closes_in_time(rig, monkeypatch):
+    held = est(22, IP)
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22), held])
+    rig.clock.t += 5
+    rig.agent.tick()
+    rig.clock.t += agent_main.SSH_SESSION_MIN_AGE - 10
+    rig.agent.tick()
+    assert rig.protector.reason(IP) is None
+
+
+def test_session_older_than_the_agent_is_protected_from_the_first_sample(tmp_path, monkeypatch):
+    monkeypatch.setattr(psutil, "net_connections", lambda kind: [listen(22), est(22, IP)])
+    rig = Rig(tmp_path)
+    assert rig.protector.reason(IP) == "active-ssh"
+
+
+def test_journalctl_without_journald_keeps_the_kernel_log_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_URL", "https://c.example")
+    monkeypatch.setenv("NEXUS_API_KEY", "k")
+    monkeypatch.setenv("NEXUS_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(agent_main.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(agent_main, "JOURNAL_SOCKET", str(tmp_path / "absent"))
+    collectors = agent_main.build_agent(agent_main.AgentConfig.from_env()).collectors
+    assert not [name for name, _ in collectors.journals]
+    assert "scan" in [name for name, _ in collectors.files]
+    (tmp_path / "absent").write_text("")
+    collectors = agent_main.build_agent(agent_main.AgentConfig.from_env()).collectors
+    assert "scan" in [name for name, _ in collectors.journals]
+

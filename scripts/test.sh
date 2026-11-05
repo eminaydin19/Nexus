@@ -8,7 +8,7 @@ if [ "${1:-}" = "--nft" ]; then
 fi
 if [ "${1:-}" = "--e2e" ]; then
     shift
-    exec tests/e2e/run.sh "$@"
+    exec tests/e2e/install.sh "$@"
 fi
 if [ "${1:-}" = "--panel" ]; then
     shift
