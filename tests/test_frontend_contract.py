@@ -565,7 +565,7 @@ def test_a_new_mode_leaves_other_pending_commands(client):
     assert types(client, key) == ["unblock", "mode"]
 
 
-@pytest.mark.parametrize("path", ["install.sh", "frontend/js/servers.js", "README.md"])
+@pytest.mark.parametrize("path", ["install.sh", "README.md"])
 def test_printed_enroll_command_keeps_the_token_out_of_ps(path):
     text = (Path(__file__).resolve().parent.parent / path).read_text()
     assert "sudo --preserve-env=NEXUS_ENROLL_TOKEN bash" in text

@@ -1,34 +1,57 @@
 # Nexus
 
-Self-hosted defense for your Linux servers. An agent on each server reads SSH and web logs, finds attackers from evidence, and blocks them with nftables. A central panel shows every server in one place.
+Real-time anomaly detection and active defense for Linux servers.
+
+An agent on each server reads SSH and web logs, finds attackers from evidence and behavior, and blocks them in the kernel with nftables. A self-hosted panel shows every server in one place. No cloud account is needed.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+![Nexus panel](assets/nexus_dashboard.png)
 
 **Top rule: not blocking a real customer matters more than catching every attack. When in doubt, Nexus does not block.**
 
-No AWS account is needed. MIT licensed.
+## How it works
 
-## What it does
+```text
+SSH and web logs ──> rules ───────────────┐
+                 ──> per-IP anomaly model ─┴─> customer protections ──> nftables block
+                                                      │
+                                                      └──> panel and Slack alerts
+```
 
-| Attack | Reaction |
+- Detection and blocking run on the server, so protection continues while central is down.
+- Every block expires, and the kernel holds the timer, so a block ends even if the agent crashes.
+- Central cannot run commands on a server, update an agent or request a block. See [SECURITY.md](SECURITY.md).
+
+## What it detects
+
+| Attack | Response |
 |---|---|
-| SSH brute force | Blocks that IP on the SSH port |
-| Web login brute force, vulnerability probing, exploit patterns | Blocks that IP on the web ports |
-| Port scan | Alert. A full short block only with log evidence from the same IP, because a scan's source can be spoofed |
-| Connection flood from one IP | Rate limit, never a block: many customers can share one address |
-| Distributed flood | Alert only |
-| Few or slow attempts under the rule thresholds (per-IP anomaly model) | Alert by default. With `NEXUS_RULE_ANOMALY_BLOCK=1`, blocks the attacked port for 15 minutes, only with log evidence too. [Measured on simulated data only](docs/anomaly-evaluation.md) |
-| Server metrics out of pattern (ML ensemble) | Alert only. These scores name no address, so they never block anyone |
+| SSH brute force | Blocks the address on the SSH port |
+| Web login brute force, vulnerability probing, exploit patterns | Blocks the address on the web ports |
+| Slow attacks under the rule thresholds (anomaly model) | Alerts by default. With `NEXUS_RULE_ANOMALY_BLOCK=1`, blocks the attacked port for 15 minutes |
+| Port scan | Alerts. A short full block only with log evidence from the same address |
+| Connection flood from one address | Rate limit, never a block |
+| Distributed flood | Alerts only |
+| Unusual server metrics (ML ensemble) | Alerts only |
 
-Blocks always expire, and the kernel holds the timer, so they end even if the agent crashes. Blocking and detection run on the server, so protection continues while central is down.
+The anomaly model never blocks on its score alone. It also needs at least 3 suspicious log events from the address, and every customer protection still applies.
 
-## What it does not do
+## Results
 
-**It cannot stop a large DDoS. Use Cloudflare or a similar service.** A flood that fills your server's network link has already done its damage by the time a firewall on that server sees it.
+| Measure | fail2ban | Rules | Rules + model | Target |
+|---|---|---|---|---|
+| Attacks blocked (recall) | 20.4% | 42.4% | **87.7%** | 95%, not met |
+| Blocks that hit an attacker (precision) | 60.7% | 100% | **99.4%** | 99%, met |
+| Customers blocked | 7.9% | 0% | 0.3% | |
 
-It also does not inspect traffic like a WAF, and it does not block at the CDN. Nexus cannot detect an attack that leaves no trace in the logs it reads or in its connection samples.
+**These numbers come from simulated logs, not from a real server.** Slow SSH attacks are the gap: they look like a person trying usernames. The [evaluation](docs/anomaly-evaluation.md) has per-attack results, confidence intervals and what was not measured.
+
+Real attacks also run against real `sshd`, nginx and nftables in `tests/e2e`.
 
 ## Install
 
-You need Docker with Compose 2.24 or newer for central. Each protected server needs Linux with systemd and Python 3.9 or newer: Ubuntu 20.04+, Debian 11+ or RHEL 8+.
+Central needs Docker with Compose 2.24 or newer. Each protected server needs Linux with systemd and Python 3.9 or newer: Ubuntu 20.04+, Debian 11+ or RHEL 8+.
 
 **1. Install central.**
 
@@ -36,7 +59,7 @@ You need Docker with Compose 2.24 or newer for central. Each protected server ne
 git clone https://github.com/eminaydin19/Nexus.git && cd Nexus && ./install.sh --domain nexus.example.com
 ```
 
-With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.sh`), central listens on `127.0.0.1:8000`, you reach it over an SSH tunnel, and only an agent on the same machine can connect. The installer generates the dashboard password, stores it in `.env` (mode 600) and prints it once. To upgrade, run `git pull` and then the installer again; secrets and data are kept.
+With a domain, Caddy serves HTTPS on ports 80 and 443. Without one, central listens on `127.0.0.1:8000`, and you reach it over an SSH tunnel. The installer prints the dashboard password once. To upgrade, run `git pull` and the installer again.
 
 **2. Add a server.** The panel gives you this command with a one-time token:
 
@@ -44,56 +67,43 @@ With a domain, Caddy serves HTTPS on ports 80 and 443. Without one (`./install.s
 curl -fsSL https://nexus.example.com/install-agent.sh | NEXUS_ENROLL_TOKEN=<one-time-token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash
 ```
 
-The token stays out of `ps` this way. sudo must allow keeping the variable: a sudoers rule for `ALL` already does, and a narrower one needs `SETENV`. If sudo refuses, run the same line from a root shell (`sudo -i`). Remove the agent with `--uninstall`.
+If sudo refuses to keep the variable, run the line from a root shell. Remove the agent with `--uninstall`.
 
-## From observe to enforce
+**3. Watch, then enforce.** An agent starts in `observe`: it blocks nothing and lists what it would have blocked. After 7 days the panel shows a summary and asks for your approval. Nothing switches by itself.
 
-An agent starts in `observe`: it blocks nothing and lists what it would have blocked under Watch. After 7 days the panel shows that summary and asks for your approval. Nothing switches by itself, and you can switch earlier. The panel names the modes Watching, Blocking and Off.
+To keep a server out of `enforce` whatever central says, set `NEXUS_MAX_MODE=observe` in `/etc/nexus-agent.env`.
 
-To keep a server out of `enforce` whatever central says, set `NEXUS_MAX_MODE=observe` in `/etc/nexus-agent.env`. Central cannot change that file.
+To try anomaly blocking, set `NEXUS_RULE_ANOMALY_BLOCK=1` in the same file and stay in `observe`. Its decisions appear under Watch, and nobody is blocked.
 
-## How customers are protected
+## Who is never blocked
 
-Nexus never blocks:
+- Private, loopback, link-local, CGNAT and multicast addresses
+- Your allowlist. "This is a customer" in the panel adds to it and lifts any block
+- Central, the default gateway and the DNS servers in `/etc/resolv.conf`
+- Addresses with an active SSH session or a successful SSH login in the last 24 hours
+- Published Cloudflare, Fastly and CloudFront ranges
+- Googlebot and Bingbot, verified by forward and reverse DNS
 
-- Private, loopback, link-local, CGNAT and multicast addresses.
-- Your allowlist. "This is a customer" in the panel adds to it and lifts any block.
-- Central, the default gateway and the DNS servers in `/etc/resolv.conf`.
-- IPs with an active SSH session or a successful SSH login in the last 24 hours.
-- Published Cloudflare, Fastly and CloudFront ranges.
-- Googlebot and Bingbot, verified by forward and reverse DNS.
+Blocks also stay narrow:
 
-Blocks stay narrow:
-
-- A block applies to the attacked port. The only exception is a short full block for a scan with log evidence.
-- Volume alone only slows an address down.
-- IPv6 blocks apply to the `/64`.
-- An IP with 20 successful page requests in the last hour and no scan traces gets 3 times the web thresholds.
-- If there are more than 50 new blocks in 5 minutes or 2000 active blocks, the agent stops adding full blocks, alerts you and falls back to rate limits.
-
-See [threshold tuning](docs/threshold-tuning.md) to change any threshold.
-
-The per-IP anomaly model never blocks on its score alone. It needs at least 3 suspicious log events from the address, three times that for an address with earned trust, and every protection above still applies. To test it safely, set the flag and keep the server in `observe`: its decisions appear under Watch and nobody is blocked.
+- A block covers the attacked port. The only exception is a short full block for a scan with log evidence
+- IPv6 blocks apply to the `/64`
+- An address with 20 successful page requests in the last hour and no scan traces gets 3 times the web thresholds
+- Above 50 new blocks in 5 minutes or 2000 active blocks, the agent stops adding full blocks, alerts you and falls back to rate limits
 
 ## Behind a CDN or proxy
 
-The firewall sees the CDN's address, so blocking it would cut off everyone. When traffic comes from CDN ranges, web rules on that server only alert. SSH rules keep working. Nexus never reads `X-Forwarded-For` from logs, because a client can write anything there.
+The firewall sees the CDN's address, so blocking it would cut off everyone. Traffic from CDN ranges only produces alerts from web rules, and SSH rules keep working. Nexus never reads `X-Forwarded-For` from logs, because a client can write anything there.
 
-Your own reverse proxy or a large NAT looks the same. An address with 200 successful requests from 10 different browsers in the last hour gets alerts from web rules, not blocks. Add your proxy to the allowlist anyway, so it is protected from its first request.
+An address with 200 successful requests from 10 different browsers in the last hour also gets alerts instead of web blocks. Add your own proxy to the allowlist anyway.
 
-To read the client address behind your own Caddy, enable a JSON access log and set `NEXUS_WEB_LOG_FORMAT=caddy-json` and `NEXUS_WEB_LOGS=<path>`. The address comes from Caddy's `client_ip`, so your `trusted_proxies` setting must be right. A client that reached you through a proxy only produces alerts, because the firewall cannot see its address.
+Behind your own Caddy, enable a JSON access log and set `NEXUS_WEB_LOG_FORMAT=caddy-json` and `NEXUS_WEB_LOGS=<path>`. The client address comes from Caddy's `client_ip`, so your `trusted_proxies` setting must be right.
 
-## Agent permissions and central compromise
+## Limits
 
-The agent runs as the `nexus-agent` user with `CAP_NET_ADMIN` and `CAP_DAC_READ_SEARCH`. It reads logs and manages one nftables table, `inet nexus`. It connects out to central and opens no port. Central can send it only three commands: unblock an IP, update the allowlist, change the mode. Central cannot run commands, write files, update the agent or request a block. [SECURITY.md](SECURITY.md) covers what an attacker controlling central could still do.
-
-## SQLite or Postgres
-
-Central stores data in SQLite by default, in one worker process. That suits a small fleet. For more servers, set `DATABASE_URL=postgresql+psycopg://user:pass@host/nexus` in `.env`.
-
-## CloudWatch (optional)
-
-Set `INGESTION_SOURCE=cloudwatch` with `AWS_REGION` and `EC2_INSTANCE_IDS` to also score CloudWatch metrics. See `deploy/cloudwatch-agent.json` and `deploy/latency_probe.sh`. Blocking still needs an agent.
+- **It cannot stop a large DDoS. Use Cloudflare or a similar service.** A flood that fills your network link has done its damage before a firewall on that server sees it.
+- It is not a WAF, and it does not block at the CDN.
+- It cannot detect an attack that leaves no trace in its logs or connection samples.
 
 ## Configuration
 
@@ -105,22 +115,25 @@ Set `INGESTION_SOURCE=cloudwatch` with `AWS_REGION` and `EC2_INSTANCE_IDS` to al
 | `ALERT_COOLDOWN_SECONDS` | 900 | Minimum gap between alerts for the same rule |
 | `CRITICAL_SCORE` | 0.85 | ML score that sends a Slack alert. It never blocks |
 | `RETENTION_DAYS` | 30 | How long history is kept |
-| `RATE_LIMIT_PER_MINUTE` | 300 | Requests per minute per client IP |
+| `RATE_LIMIT_PER_MINUTE` | 300 | Requests per minute per client address |
+| `DATABASE_URL` | SQLite | Set `postgresql+psycopg://user:pass@host/nexus` for a larger fleet |
 
-`/metrics` serves Prometheus metrics behind the dashboard's basic auth.
+Agent thresholds are in [threshold tuning](docs/threshold-tuning.md). `/metrics` serves Prometheus metrics behind the dashboard's basic auth.
+
+To also score CloudWatch metrics, set `INGESTION_SOURCE=cloudwatch` with `AWS_REGION` and `EC2_INSTANCE_IDS`. Blocking still needs an agent.
 
 ## Tests
 
-```bash
-scripts/test.sh          # unit tests
-scripts/test.sh --nft    # real nftables in a container
-scripts/test.sh --e2e    # installers in systemd containers
-scripts/test.sh --panel  # panel in a real browser
-tests/e2e/run.sh         # real attacks and customers, on SQLite and Postgres
-```
+| Command | What it runs |
+|---|---|
+| `scripts/test.sh` | Unit tests |
+| `scripts/test.sh --nft` | Real nftables in a container |
+| `scripts/test.sh --panel` | The panel in a real browser |
+| `scripts/test.sh --e2e` | Installers in systemd containers |
+| `tests/e2e/run.sh` | Real attacks and customers on SQLite and Postgres |
 
-The scenarios change one kernel-wide setting while they run, `net.netfilter.nf_log_all_netns`, and restore it afterwards.
+`tests/e2e/run.sh` changes one kernel-wide setting, `net.netfilter.nf_log_all_netns`, and restores it afterwards.
 
 ## License
 
-[MIT](LICENSE). The bundled Archivo font uses the [SIL Open Font License](frontend/fonts/OFL.txt).
+[MIT](LICENSE). Bundled third-party files keep their own licenses: [Chart.js](https://github.com/chartjs/Chart.js) under MIT and the [Archivo font](frontend/fonts/OFL.txt) under the SIL Open Font License.

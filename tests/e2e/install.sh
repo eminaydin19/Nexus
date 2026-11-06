@@ -55,7 +55,7 @@ expect "dashboard needs the password" test "$(curl -s -o /dev/null -w '%{http_co
 
 hostile() { ! curl -fsS -H 'Host: evil.example' -H 'X-Forwarded-Host: evil.example' "$API/install-agent.sh" | grep -q evil.example; }
 expect "hostile Host header never reaches the script" hostile
-empty_url() { curl -fsS "$API/install-agent.sh" | grep -q "^EMBEDDED_URL=''$"; }
+empty_url() { local script; script="$(curl -fsS "$API/install-agent.sh")" && grep -q "^EMBEDDED_URL=''$" <<<"$script"; }
 expect "without PUBLIC_URL the script embeds no address" empty_url
 
 expect "the image has the postgres driver" docker compose exec -T nexus python -c 'import psycopg'
