@@ -85,7 +85,7 @@ export default {
       return eventRow(r, ctx, offer ? customerButton(r, ctx, `event:${r.id}`) : null);
     });
     return [
-      h("div", "state", h("h1", "", "Events"), h("p", "lede", "What the rules did and what the anomaly model noticed. The anomaly model never blocks anyone.")),
+      h("div", "state", h("h1", "", "Events"), h("p", "lede", "What the rules and anomaly models found. A score alone never blocks anyone.")),
       filterBar(ctx),
       section("Newest first", data.rows.length === LIMIT ? `Showing the latest ${LIMIT}` : null, list(rows, filtered ? "No events match these filters." : "No events yet. They appear here as your servers report them.")),
     ];
