@@ -18,7 +18,7 @@ Central can send an agent only these commands: unblock an IP, replace the allowl
 - Switch agents to `enforce` or to `off`, unless `NEXUS_MAX_MODE=observe` in `/etc/nexus-agent.env` limits that server. Central cannot change that file.
 - Read everything agents reported, including log lines kept as evidence and client IP addresses.
 
-Central cannot run commands on a server, write files there, update the agent, or tell an agent to block an address. Blocks come only from the agent's own log evidence.
+Central cannot run commands on a server, write files there, update the agent, or tell an agent to block an address. Blocks come only from the agent's own log evidence. The per-IP anomaly model ships inside the agent package, so central cannot change it either.
 
 ## Hardening a deployment
 

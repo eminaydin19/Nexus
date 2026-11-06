@@ -15,7 +15,8 @@ No AWS account is needed. MIT licensed.
 | Port scan | Alert. A full short block only with log evidence from the same IP, because a scan's source can be spoofed |
 | Connection flood from one IP | Rate limit, never a block: many customers can share one address |
 | Distributed flood | Alert only |
-| Server metrics out of pattern (ML ensemble) | Alert only. A score never blocks anyone |
+| Few or slow attempts under the rule thresholds (per-IP anomaly model) | Alert by default. With `NEXUS_RULE_ANOMALY_BLOCK=1`, blocks the attacked port for 15 minutes, only with log evidence too. [Measured on simulated data only](docs/anomaly-evaluation.md) |
+| Server metrics out of pattern (ML ensemble) | Alert only. These scores name no address, so they never block anyone |
 
 Blocks always expire, and the kernel holds the timer, so they end even if the agent crashes. Blocking and detection run on the server, so protection continues while central is down.
 
@@ -72,11 +73,15 @@ Blocks stay narrow:
 
 See [threshold tuning](docs/threshold-tuning.md) to change any threshold.
 
+The per-IP anomaly model never blocks on its score alone. It needs at least 3 suspicious log events from the address, three times that for an address with earned trust, and every protection above still applies. To test it safely, set the flag and keep the server in `observe`: its decisions appear under Watch and nobody is blocked.
+
 ## Behind a CDN or proxy
 
 The firewall sees the CDN's address, so blocking it would cut off everyone. When traffic comes from CDN ranges, web rules on that server only alert. SSH rules keep working. Nexus never reads `X-Forwarded-For` from logs, because a client can write anything there.
 
 Your own reverse proxy or a large NAT looks the same. An address with 200 successful requests from 10 different browsers in the last hour gets alerts from web rules, not blocks. Add your proxy to the allowlist anyway, so it is protected from its first request.
+
+To read the client address behind your own Caddy, enable a JSON access log and set `NEXUS_WEB_LOG_FORMAT=caddy-json` and `NEXUS_WEB_LOGS=<path>`. The address comes from Caddy's `client_ip`, so your `trusted_proxies` setting must be right. A client that reached you through a proxy only produces alerts, because the firewall cannot see its address.
 
 ## Agent permissions and central compromise
 

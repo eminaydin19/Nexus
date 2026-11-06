@@ -73,6 +73,7 @@ class AgentConfig:
     allowlist: Tuple[str, ...]
     allow_insecure: bool
     rules: RuleConfig
+    web_log_format: str = "combined"
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None, sshd_config: str = "/etc/ssh/sshd_config") -> "AgentConfig":
@@ -88,7 +89,11 @@ class AgentConfig:
         rules.ssh_ports = tuple(sorted(set(_ports("NEXUS_SSH_PORTS", env.get("NEXUS_SSH_PORTS")) or rules.ssh_ports)
                                        | set(_sshd_ports(sshd_config))))
         rules.web_ports = _ports("NEXUS_WEB_PORTS", env.get("NEXUS_WEB_PORTS")) or rules.web_ports
+        web_log_format = env.get("NEXUS_WEB_LOG_FORMAT", "combined").strip()
+        if web_log_format not in ("combined", "caddy-json"):
+            raise ValueError("NEXUS_WEB_LOG_FORMAT must be combined or caddy-json")
         return cls(
+            web_log_format=web_log_format,
             url=url,
             key=key,
             node_id=env.get("NEXUS_NODE_ID"),

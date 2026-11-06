@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from . import __version__
 from .client import Client, ClientError, Command
+from .anomaly import load_models
 from .collectors import (
     WEB_LOGS, LineQueue, LogCollectors, read_connections, sample_connections, sample_metrics, ssh_peers, web_peers,
 )
@@ -25,7 +26,8 @@ from .config import (
 )
 from .enforcer import MAX_TTL, MODES, Enforcer
 from .parsers import (
-    normalize_ip, parse_scan_line, parse_ssh_line, parse_web_line, ssh_line_is_stale, web_line_is_stale,
+    caddy_line_is_stale, normalize_ip, parse_caddy_line, parse_scan_line, parse_ssh_line, parse_web_line, ssh_line_is_stale,
+    web_line_is_stale,
 )
 from .protect import Protector, _parse_nets
 from .rules import Decision, RuleEngine
@@ -257,10 +259,11 @@ class Agent:
             elif off:
                 continue
             elif source == "web":
-                if web_line_is_stale(line, now):
+                caddy = self.cfg.web_log_format == "caddy-json"
+                if (caddy_line_is_stale if caddy else web_line_is_stale)(line, now):
                     self.stale_lines += 1
                     continue
-                event = parse_web_line(line, now)
+                event = (parse_caddy_line if caddy else parse_web_line)(line, now)
             else:
                 event = None
                 hit = parse_scan_line(line)
@@ -530,7 +533,7 @@ def build_agent(cfg: AgentConfig) -> Agent:
     client = Client(cfg.url, cfg.key, cfg.allow_insecure)
     protector = Protector(central_ip=resolve_host(urlsplit(cfg.url).hostname), gateway=read_gateways(),
                           resolvers=read_resolvers())
-    agent = Agent(cfg, client, protector, RuleEngine(cfg.rules, protector), Enforcer("observe"))
+    agent = Agent(cfg, client, protector, RuleEngine(cfg.rules, protector, models=load_models()), Enforcer("observe"))
     # The binary alone proves nothing: containers and LXC ship it with no journald, which would leave scans unread.
     journalctl = shutil.which("journalctl") if os.path.exists(JOURNAL_SOCKET) else None
     agent.collectors = LogCollectors(agent.lines, web_logs=WEB_LOGS + cfg.web_logs, journalctl=journalctl)

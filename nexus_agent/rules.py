@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Tuple
 from urllib.parse import unquote_plus
 
+from .anomaly import Behavior
 from .parsers import LogEvent
 
 log = logging.getLogger("nexus_agent.rules")
@@ -41,8 +42,11 @@ _RULES = {
     "web_exploit": "block_port",
     "port_scan": "block_all",
     "conn_flood": "rate_limit",
+    "anomaly_ssh": "block_port",
+    "anomaly_web": "block_port",
 }
-_WEB_RULES = frozenset(("web_login_bruteforce", "web_probe", "web_exploit"))
+_WEB_RULES = frozenset(("web_login_bruteforce", "web_probe", "web_exploit", "anomaly_web"))
+_SSH_USER = re.compile(r"(?:Invalid user|authenticating user|Failed \S+ for(?: invalid user)?) (\S*) ")
 
 _DATA = Path(__file__).parent / "data"
 
@@ -115,6 +119,10 @@ class RuleConfig:
     ttl_web_exploit: int = 3600
     ttl_port_scan: int = 900
     ttl_conn_flood: int = 600
+    ttl_anomaly_ssh: int = 900
+    ttl_anomaly_web: int = 900
+    anomaly_block: int = 0
+    anomaly_min_evidence: int = 3
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "RuleConfig":
@@ -150,8 +158,10 @@ class RuleConfig:
 
 
 class RuleEngine:
-    def __init__(self, cfg: RuleConfig, protector, clock=time.time):
+    def __init__(self, cfg: RuleConfig, protector, clock=time.time, models: Optional[dict] = None):
         self._cfg = cfg
+        self._models = models or {}
+        self._behavior = Behavior(cfg.max_tracked_ips, clock)
         self._p = protector
         self._clock = clock
         self._lock = threading.RLock()
@@ -181,6 +191,7 @@ class RuleEngine:
                     del od[key]
             self._bad.pop(ident, None)
             self._conn_suppressed.discard(ident)
+            self._behavior.forget(ident)
 
     def feed(self, event: LogEvent) -> List[Decision]:
         with self._lock:
@@ -191,10 +202,18 @@ class RuleEngine:
             if event.kind == "ssh_fail":
                 self._mark_bad(event.ip)
                 # No trust multiplier: web traffic is cheap to farm and says nothing about who owns SSH access.
-                return self._hit("ssh_bruteforce", event.ip, (self._ssh_key(event),), event.raw, self._cfg.ssh_fail_threshold,
-                                 tag=event.password_try)
+                out = self._hit("ssh_bruteforce", event.ip, (self._ssh_key(event),), event.raw, self._cfg.ssh_fail_threshold,
+                                tag=event.password_try)
+                user = _SSH_USER.search(event.raw)
+                self._behavior.note_ssh(_ident(event.ip), user.group(1) if user else None, "Invalid user" in event.raw,
+                                        event.src_port, event.password_try)
+                return out or self._anomaly("ssh", event.ip, 1, None)
             if event.kind == "web":
-                return self._web(event)
+                out = self._web(event)
+                if event.via_proxy:
+                    # Blocking the client's address at the firewall would do nothing, and the proxy's would cut off everyone.
+                    return [Decision(d.rule, d.ip, "alert", (), 0, d.evidence) for d in out]
+                return out
             return []
 
     def feed_scan(self, ip: str, port: int) -> List[Decision]:
@@ -260,6 +279,37 @@ class RuleEngine:
         p.note_web(ev)
         if ev.path is None or ev.status is None:
             return []
+        out = self._web_rules(ev)
+        path = ev.path.partition("?")[0]
+        norm = path.rstrip("/")
+        # Status is ignored for a probe: an app that answers every path with 200 still shows who asked for /.env.
+        evidence = (path.lower() in _PROBE_PATHS or bool(exploit_hits(ev.path))
+                    or (ev.method == "POST" and norm in self._login and ev.status in (401, 403)))
+        self._behavior.note_web(_ident(ev.ip), path, ev.status, ev.user_agent, evidence)
+        if out or not evidence:
+            return out
+        return self._anomaly("web", ev.ip, p.threshold_multiplier(ev.ip), ev.user_agent)
+
+    def _anomaly(self, channel: str, ip: str, mult: int, ua: Optional[str]) -> List[Decision]:
+        """A block needs log evidence and odd behavior together, and passes every protection in _fire."""
+        model = self._models.get(channel)
+        ident = _ident(ip)
+        evidence = self._behavior.evidence(channel, ident)
+        if model is None or evidence < self._cfg.anomaly_min_evidence * mult:
+            return []
+        row = self._behavior.features(channel, ident)
+        score = model.score(row)
+        if score < model.threshold:
+            return []
+        detail = "score=%.3f threshold=%.3f evidence=%d %s" % (
+            score, model.threshold, evidence, " ".join("%s=%.2f" % pair for pair in zip(model.features, row)))
+        out = self._fire("anomaly_" + channel, ip, self._clock(), detail, ua)
+        if not self._cfg.anomaly_block:
+            return [Decision(d.rule, d.ip, "alert", (), 0, d.evidence) for d in out]
+        return out
+
+    def _web_rules(self, ev: LogEvent) -> List[Decision]:
+        p = self._p
         mult = p.threshold_multiplier(ev.ip)
         path, _, _query = ev.path.partition("?")
         out = []  # type: List[Decision]
@@ -348,7 +398,7 @@ class RuleEngine:
         ttl = min(base * 2 ** min(repeats, 10), MAX_TTL)
         self._remember(self._offense, key, [repeats + 1, now])
         self._remember(self._active, key, now + ttl)
-        ports = self._cfg.ssh_ports if rule == "ssh_bruteforce" else self._cfg.web_ports if web else ()
+        ports = self._cfg.ssh_ports if rule in ("ssh_bruteforce", "anomaly_ssh") else self._cfg.web_ports if web else ()
         return [Decision(rule, ip, action, tuple(ports), ttl, evidence)]
 
     def _remember(self, od: OrderedDict, key, value) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import socket
 import time
 
 import pytest
@@ -511,8 +512,13 @@ def test_verify_bot_called_only_when_threshold_crossed():
     assert calls == ["Googlebot"]
 
 
+class NoPtrRecord:
+    def gethostbyaddr(self, ip):
+        raise socket.herror(1, "Unknown host")
+
+
 def test_unverified_bot_ua_still_blocked():
-    eng, _, _ = mk()
+    eng, _, _ = mk(resolver=NoPtrRecord())
     assert len(all_decisions(eng, lambda i: web(probe(i).path, 404, ua="Googlebot/2.1"), 10)) == 1
 
 
@@ -664,3 +670,136 @@ def test_one_browser_with_many_requests_is_not_shared():
     eng, _, prot = mk()
     _browsing(eng, IP, requests=500, agents=1)
     assert not prot.is_shared(IP)
+
+
+class Always:
+    """A model whose score sits above its threshold for any row, to test the gate on its own."""
+    threshold = 0.5
+    features = ("f",)
+
+    def __init__(self, score=0.9):
+        self._score = score
+
+    def score(self, row):
+        return self._score
+
+
+def anomalous(models=None, block=1, **kw):
+    clock = Clock()
+    prot = Protector(clock=clock, **kw)
+    models = {"ssh": Always(), "web": Always()} if models is None else models
+    return RuleEngine(RuleConfig(anomaly_block=block), prot, clock, models), clock, prot
+
+
+def try_ssh(eng, port, user="amy", ip=IP):
+    line = "sshd[1]: Invalid user %s from %s port %d" % (user, ip, port)
+    return eng.feed(LogEvent("ssh_fail", ip, 0, raw=line, src_port=port))
+
+
+def test_slow_ssh_attacker_under_rule_threshold_is_blocked_on_ssh_port_only():
+    eng, _, _ = anomalous()
+    assert try_ssh(eng, 1) == [] and try_ssh(eng, 2) == []
+    d = try_ssh(eng, 3)[0]
+    assert (d.rule, d.action, d.ports, d.ttl) == ("anomaly_ssh", "block_port", (22,), 900)
+    assert "score=0.900" in d.evidence and "evidence=3" in d.evidence
+
+
+def test_flag_off_only_alerts():
+    eng, _, _ = anomalous(block=0)
+    try_ssh(eng, 1), try_ssh(eng, 2)
+    d = try_ssh(eng, 3)[0]
+    assert (d.rule, d.action, d.ports, d.ttl) == ("anomaly_ssh", "alert", (), 0)
+
+
+def test_low_score_means_no_decision_however_much_evidence():
+    eng, _, _ = anomalous({"ssh": Always(0.1), "web": Always(0.1)})
+    assert [d for i in range(9) for d in try_ssh(eng, i)] == []
+
+
+def test_no_model_changes_nothing():
+    eng, _, _ = anomalous({})
+    assert [d for i in range(9) for d in try_ssh(eng, i)] == []
+
+
+def test_one_connection_is_not_three_pieces_of_evidence():
+    eng, _, _ = anomalous()
+    assert [d for _ in range(3) for d in try_ssh(eng, 1)] == []
+
+
+def test_score_alone_never_blocks_a_clean_web_visitor():
+    eng, _, _ = anomalous()
+    assert all_decisions(eng, lambda i: web("/page%d" % i, 200, ua="ua"), 100) == []
+
+
+@pytest.mark.parametrize("status", [200, 404])
+def test_probes_fire_whatever_the_app_answers(status):
+    eng, _, _ = anomalous()
+    paths = ["/.env", "/phpmyadmin", "/pma"]
+    got = [d for p in paths for d in eng.feed(web(p, status))]
+    assert [(d.rule, d.action, d.ports) for d in got] == [("anomaly_web", "block_port", (80, 443))]
+
+
+@pytest.mark.parametrize("kw, ip", [
+    ({"allowlist": [IP]}, IP),
+    ({"central_ip": [IP]}, IP),
+    ({"gateway": [IP]}, IP),
+])
+def test_protected_addresses_are_never_blocked(kw, ip):
+    eng, _, _ = anomalous(**kw)
+    assert [d for i in range(9) for d in try_ssh(eng, i, ip=ip)] == []
+
+
+def test_recent_ssh_login_keeps_admin_unblocked():
+    eng, _, _ = anomalous()
+    eng.feed(LogEvent("ssh_ok", IP, 0, raw="ok"))
+    assert [d for i in range(9) for d in try_ssh(eng, i)] == []
+
+
+def test_cdn_and_shared_addresses_only_alert():
+    eng, _, _ = anomalous()
+    eng.set_behind_cdn(True)
+    got = [d for p in ("/.env", "/phpmyadmin", "/pma") for d in eng.feed(web(p, 200))]
+    assert [d.action for d in got] == ["alert"]
+
+    eng, _, prot = anomalous()
+    _browsing(eng, IP)
+    assert prot.is_shared(IP)
+    got = all_decisions(eng, lambda i: web(["/.env", "/phpmyadmin", "/pma", "/myadmin", "/wso.php", "/c99.php", "/shell.php",
+                                            "/.git/config", "/.git/HEAD"][i % 9], 200), 9)
+    assert got and {d.action for d in got} == {"alert"}
+
+
+def test_trusted_visitor_needs_three_times_the_evidence():
+    eng, _, prot = anomalous()
+    for _ in range(20):
+        eng.feed(web("/", 200, ua="ua"))
+    assert prot.threshold_multiplier(IP) == 3
+    paths = ["/.env", "/phpmyadmin", "/pma", "/myadmin", "/wso.php", "/c99.php", "/shell.php", "/.git/config"]
+    assert [d for p in paths for d in eng.feed(web(p, 200, ua="ua"))] == []
+
+
+def test_forget_clears_anomaly_evidence():
+    eng, _, _ = anomalous()
+    try_ssh(eng, 1), try_ssh(eng, 2)
+    eng.forget(IP)
+    assert try_ssh(eng, 3) == []
+
+
+def test_rule_decision_takes_priority_over_anomaly():
+    eng, _, _ = anomalous({"ssh": Always(0.1), "web": Always(0.1)})
+    got = [d for i in range(10) for d in try_ssh(eng, i)]
+    assert [d.rule for d in got] == ["ssh_bruteforce"]
+
+
+def test_client_behind_a_proxy_only_alerts():
+    eng, _, _ = anomalous()
+    got = [d for p in ("/.env", "/phpmyadmin", "/pma") for d in eng.feed(LogEvent("web", IP, 0, "GET", p, 404, via_proxy=True))]
+    assert [d.action for d in got] == ["alert"]
+
+
+def test_ssh_user_is_read_from_every_line_shape():
+    eng, _, _ = anomalous({})
+    for port, line in enumerate(("Invalid user bob from %s port 1" % IP, "Failed password for invalid user amy from %s port 2" % IP,
+                                 "Connection closed by authenticating user root %s port 3 [preauth]" % IP)):
+        eng.feed(LogEvent("ssh_fail", IP, 0, raw="sshd[1]: " + line, src_port=port))
+    assert eng._behavior._ips[("ssh", IP)].users == {"bob", "amy", "root"}

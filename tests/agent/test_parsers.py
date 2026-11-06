@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import time
 from pathlib import Path
 
 import pytest
 
 from nexus_agent.parsers import (
-    LogEvent, normalize_ip, parse_ssh_line, parse_web_line, ssh_line_is_stale, web_line_is_stale,
+    LogEvent, caddy_line_is_stale, normalize_ip, parse_caddy_line, parse_ssh_line, parse_web_line, ssh_line_is_stale, web_line_is_stale,
 )
 
 FIX = Path(__file__).parent / "fixtures"
@@ -281,3 +282,40 @@ def test_ssh_certificate_login_is_ok_event():
 def test_scope_only_on_ipv6():
     assert normalize_ip("1.1.1.1%junk") is None
     assert normalize_ip("fe80::1%eth0") == "fe80::1"
+
+
+def caddy(**request):
+    base = {"client_ip": "203.0.113.9", "remote_ip": "203.0.113.9", "method": "GET", "uri": "/.env?x=1",
+            "headers": {"User-Agent": ["curl/8"], "X-Forwarded-For": ["8.8.8.8"]}}
+    return json.dumps({"ts": NOW - 1, "status": 404, "request": {**base, **request}})
+
+
+def test_caddy_line_uses_client_ip_and_never_a_header():
+    ev = parse_caddy_line(caddy(), NOW)
+    assert (ev.ip, ev.method, ev.path, ev.status, ev.user_agent) == ("203.0.113.9", "GET", "/.env?x=1", 404, "curl/8")
+    assert not ev.via_proxy
+
+
+def test_caddy_line_behind_a_proxy_is_marked():
+    assert parse_caddy_line(caddy(remote_ip="173.245.48.1"), NOW).via_proxy
+
+
+@pytest.mark.parametrize("line", [
+    "", "{", "[]", "5", '{"request": 5}', '{"status": 200}', caddy(client_ip="nope"), caddy(client_ip=5), caddy(uri=5),
+    json.dumps({"status": "200", "request": {"client_ip": "203.0.113.9", "method": "GET", "uri": "/"}}),
+    json.dumps({"status": True, "request": {"client_ip": "203.0.113.9", "method": "GET", "uri": "/"}}),
+    '203.0.113.9 - - [05/Nov/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "-"',
+])
+def test_bad_caddy_lines_are_ignored(line):
+    assert parse_caddy_line(line, NOW) is None
+
+
+def test_caddy_line_with_odd_headers_still_parses():
+    assert parse_caddy_line(caddy(headers=5), NOW).user_agent is None
+    assert parse_caddy_line(caddy(headers={"User-Agent": [5]}), NOW).user_agent is None
+
+
+def test_caddy_staleness():
+    assert not caddy_line_is_stale(caddy(), NOW)
+    assert caddy_line_is_stale(caddy(), NOW + 3600)
+    assert not caddy_line_is_stale("nonsense", NOW)

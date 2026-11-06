@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import ipaddress
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ class LogEvent:
     user_agent: Optional[str] = None  # raw is truncated, so the agent string is kept separately
     src_port: Optional[int] = None  # ssh: tells which lines belong to the same connection
     password_try: bool = False  # ssh: a "Failed ..." line, one real try among several on a connection
+    via_proxy: bool = False  # web: the client reached us through a proxy, so the firewall cannot see its address
 
 
 def normalize_ip(s: str) -> Optional[str]:
@@ -127,6 +129,43 @@ def parse_web_line(line: str, now: float) -> Optional[LogEvent]:
     method, path = (req.group(1), req.group(2)) if req else (None, None)
     ua = m.group(5)
     return LogEvent("web", ip, now, method, path, int(m.group(3)), line[:MAX_RAW], None if ua in (None, "-") else ua)
+
+
+def _caddy_record(line) -> Optional[dict]:
+    line = _prepare(line)
+    if line is None:
+        return None
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) and isinstance(record.get("request"), dict) else None
+
+
+def parse_caddy_line(line: str, now: float) -> Optional[LogEvent]:
+    """Caddy computes client_ip from its trusted_proxies setting, so a client cannot choose it with a header."""
+    record = _caddy_record(line)
+    if record is None:
+        return None
+    request, status = record["request"], record.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        return None
+    ip = normalize_ip(request.get("client_ip"))
+    uri, method = request.get("uri"), request.get("method")
+    if ip is None or not isinstance(uri, str) or not isinstance(method, str):
+        return None
+    headers = request.get("headers")
+    agents = headers.get("User-Agent") if isinstance(headers, dict) else None
+    ua = agents[0] if isinstance(agents, list) and agents and isinstance(agents[0], str) else None
+    peer = normalize_ip(request.get("remote_ip"))
+    raw = "%s %s %s %d" % (ip, method, uri, status)
+    return LogEvent("web", ip, now, method, uri, status, raw[:MAX_RAW], ua, via_proxy=peer is not None and peer != ip)
+
+
+def caddy_line_is_stale(line: str, now: float) -> bool:
+    record = _caddy_record(line)
+    ts = record.get("ts") if record else None
+    return isinstance(ts, (int, float)) and not isinstance(ts, bool) and now - ts > MAX_LINE_AGE
 
 
 def parse_scan_line(line: str) -> Optional[Tuple[str, int]]:

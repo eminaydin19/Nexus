@@ -6,6 +6,8 @@ const RULES = new Map([
   ["conn_flood", "Too many connections"],
   ["distributed_flood", "Flood from many addresses"],
   ["port_scan", "Port scan"],
+  ["anomaly_ssh", "Unusual SSH login behavior"],
+  ["anomaly_web", "Unusual web behavior"],
   ["breaker", "Blocking paused for safety"],
 ]);
 const SERVER_WIDE_RULES = new Set(["distributed_flood", "breaker"]);

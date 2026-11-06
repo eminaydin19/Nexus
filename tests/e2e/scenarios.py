@@ -895,3 +895,47 @@ def test_hostile_text_in_an_event_does_not_stall_ingest():
     assert r.status_code == 200, r.text[:300]
     assert events(time.time() - 60, ATTACKER, "web_probe"), "stored"
     assert agent_pid(), "no agent is running"
+
+
+# -- anomaly path ------------------------------------------------------------------------------------------------------
+
+ANOMALY_ON = {"NEXUS_RULE_ANOMALY_BLOCK": "1"}
+
+
+def test_anomaly_slow_ssh_attacker_under_the_rule_threshold_gets_a_real_block():
+    fresh_agent(env=ANOMALY_ON)
+    t0 = time.time()
+    # Eight different usernames: below the 10 tries the ssh_bruteforce rule needs.
+    for user in ("oracle", "postgres", "ftp", "guest", "hadoop", "jenkins", "minecraft", "support"):
+        if port_blocked(ATTACKER, SSH_PORT):
+            break
+        ssh("attacker", user, "wrong-password")
+    wait(lambda: port_blocked(ATTACKER, SSH_PORT), 30, "the attacker blocked on SSH by the anomaly path")
+    wait(lambda: events(t0, ip=ATTACKER, rule="anomaly_ssh"), 20, "anomaly_ssh on the panel")
+    assert not events(t0, ip=ATTACKER, rule="ssh_bruteforce")
+    assert tcp_open("attacker", WEB_PORT), "a block covers only the attacked port"
+    assert not all_blocked(ATTACKER)
+    metric("anomaly_ssh", seconds_to_block=time.time() - t0)
+
+
+def test_anomaly_few_probes_under_the_rule_threshold_get_a_real_block_and_customer_is_unharmed():
+    fresh_agent(env=ANOMALY_ON)
+    t0 = time.time()
+    # A rule needs 10 listed paths. Six, sent by a client that fetches nothing else.
+    probe("attacker", PROBES[:6])
+    wait(lambda: port_blocked(ATTACKER, WEB_PORT), 30, "the attacker blocked on the web ports by the anomaly path")
+    wait(lambda: events(t0, ip=ATTACKER, rule="anomaly_web"), 20, "anomaly_web on the panel")
+    assert not events(t0, ip=ATTACKER, rule="web_probe")
+    assert http("customer") == "200", "the customer still gets pages"
+    assert not port_blocked(CUSTOMER, WEB_PORT)
+    metric("anomaly_web", seconds_to_block=time.time() - t0)
+
+
+def test_anomaly_customer_mistyping_ssh_three_times_is_not_blocked():
+    fresh_agent(env=ANOMALY_ON)
+    started = time.time()
+    ssh_failures("customer", CUSTOMER, 3)
+    assert wait(lambda: ssh("customer", "customer", "customer-pass") == 0, 90 / SCALE, "login despite sshd penalties", 2)
+    control_scanner_blocked()
+    assert_no_kernel_rows(CUSTOMER)
+    assert not events(started, CUSTOMER)
