@@ -9,3 +9,4 @@ data/
 !nexus_agent/data/
 .panel-out/
 .scenario-out/
+.omc/
