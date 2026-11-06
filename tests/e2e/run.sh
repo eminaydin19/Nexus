@@ -24,7 +24,7 @@ teardown() {
     compose down -v --remove-orphans >/dev/null 2>&1 || true
 }
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     teardown
     if [ -n "$ORIGINAL_SYSCTL" ]; then

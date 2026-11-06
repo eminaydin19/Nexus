@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -616,9 +617,10 @@ def test_venv_check_uses_the_chosen_interpreter(tmp_path):
 def test_missing_curl_stops_before_packages(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    stub(bin_dir, "python3", f'exec {sys.executable} "$@"')
     r = agent_shell(
         tmp_path,
-        NO_HOST_CHECKS + f'PATH={bin_dir}:/usr/local/bin; command() {{ [ "$2" != curl ] && builtin command "$@"; }}; '
+        NO_HOST_CHECKS + f'PATH={bin_dir}; command() {{ [ "$2" != curl ] && builtin command "$@"; }}; '
         "main --token t --url https://n.example.com",
         path=f"{bin_dir}:/usr/local/bin:/usr/bin:/bin",
     )
