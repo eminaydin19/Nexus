@@ -1,10 +1,12 @@
 .env
 .git
 .venv
-__pycache__
-*.py[cod]
+**/__pycache__
+**/*.py[cod]
 .pytest_cache
-data
+.omc
+.superpowers
+/data
 tests
 deploy
 *.md

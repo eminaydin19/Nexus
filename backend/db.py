@@ -74,6 +74,7 @@ class Anomaly(Base):
     if_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     lstm_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     vae_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transformer_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     flags: Mapped[list] = mapped_column(JSON, default=list)
     contributions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
@@ -94,41 +95,129 @@ class Anomaly(Base):
                 "iforest": self.if_score,
                 "lstm": self.lstm_score,
                 "vae": self.vae_score,
+                "transformer": self.transformer_score,
             },
             "flags": self.flags or [],
             "contributions": self.contributions or {},
         }
 
 
-class DefenseEvent(Base):
-    __tablename__ = "defense_events"
+class SecurityEvent(Base):
+    __tablename__ = "security_events"
+    __table_args__ = (Index("ix_security_events_node_ts", "node_id", "ts"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128))
     ts: Mapped[float] = mapped_column(Float, index=True)
-    type: Mapped[str] = mapped_column(String(32))
-    mode: Mapped[str] = mapped_column(String(16))
-    node_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    rule: Mapped[str] = mapped_column(String(64), index=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    action: Mapped[str] = mapped_column(String(16))
+    ports: Mapped[list] = mapped_column(JSON, default=list)
+    ttl: Mapped[int] = mapped_column(Integer, default=0)
+    evidence: Mapped[str] = mapped_column(String(500), default="")
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
-    score: Mapped[float | None] = mapped_column(Float, nullable=True)
-    detail: Mapped[str] = mapped_column(String(400), default="")
 
     def as_dict(self) -> dict:
         return {
             "id": self.id,
+            "node_id": self.node_id,
             "ts": self.ts,
-            "type": self.type,
-            "mode": self.mode,
-            "node": self.node_id,
+            "rule": self.rule,
             "ip": self.ip,
+            "action": self.action,
+            "ports": self.ports or [],
+            "ttl": self.ttl,
+            "evidence": self.evidence,
+            "simulated": self.simulated,
             "ok": self.ok,
-            "score": self.score,
-            "detail": self.detail,
         }
 
 
-# Columns added after the first release: (table, column, DDL type).
-_ADDITIVE_COLUMNS = [("anomalies", "contributions", "JSON")]
+class ActiveBlock(Base):
+    __tablename__ = "active_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    ip: Mapped[str] = mapped_column(String(45))
+    rule: Mapped[str] = mapped_column(String(64))
+    ports: Mapped[list] = mapped_column(JSON, default=list)
+    until: Mapped[float] = mapped_column(Float)
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
+    kind: Mapped[str] = mapped_column(String(16), default="block_all", server_default="block_all")
+
+    def as_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "ip": self.ip,
+            "rule": self.rule,
+            "ports": self.ports or [],
+            "until": self.until,
+            "simulated": self.simulated,
+            "kind": self.kind or "block_all",
+        }
+
+
+class AgentCommand(Base):
+    __tablename__ = "agent_commands"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    type: Mapped[str] = mapped_column(String(16))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[float] = mapped_column(Float)
+    acked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class Agent(Base):
+    __tablename__ = "agents"
+
+    node_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[float] = mapped_column(Float)
+    first_seen: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_seen: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revoked_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), default="observe")
+    max_mode: Mapped[str] = mapped_column(String(16), default="observe")
+    version: Mapped[str] = mapped_column(String(32), default="")
+    capabilities: Mapped[dict] = mapped_column(JSON, default=dict)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+    allowlist: Mapped[list] = mapped_column(JSON, default=list)
+
+    def as_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "name": self.name,
+            "created_at": self.created_at,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "revoked_at": self.revoked_at,
+            "mode": self.mode,
+            "max_mode": self.max_mode,
+            "version": self.version,
+            "capabilities": self.capabilities,
+            "config": self.config,
+            "allowlist": self.allowlist,
+        }
+
+
+class EnrollToken(Base):
+    __tablename__ = "enroll_tokens"
+
+    token_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[float] = mapped_column(Float)
+    expires_at: Mapped[float] = mapped_column(Float)
+    used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+_ADDITIVE_COLUMNS = [
+    ("anomalies", "contributions", "JSON"),
+    ("anomalies", "transformer_score", "FLOAT"),
+    ("active_blocks", "kind", "VARCHAR(16) DEFAULT 'block_all'"),
+]
 
 
 def _migrate() -> None:

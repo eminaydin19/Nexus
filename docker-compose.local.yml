@@ -1,0 +1,4 @@
+services:
+  nexus:
+    ports:
+      - "${HTTP_BIND:-127.0.0.1:8000}:8000"

@@ -1,0 +1,13 @@
+ARG BASE=ubuntu:22.04
+FROM ${BASE}
+ARG EXTRA=""
+
+RUN if command -v apt-get >/dev/null; then \
+        apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus python3 curl ca-certificates rsyslog procps $EXTRA && rm -rf /var/lib/apt/lists/*; \
+    else \
+        dnf install -y --allowerasing systemd python3 curl ca-certificates rsyslog procps-ng shadow-utils $EXTRA; \
+    fi \
+    && systemctl mask getty.target console-getty.service systemd-firstboot.service systemd-networkd-wait-online.service
+
+STOPSIGNAL SIGRTMIN+3
+ENTRYPOINT ["/sbin/init"]

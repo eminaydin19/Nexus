@@ -17,10 +17,36 @@ jobs:
           cache-dependency-path: requirements*.txt
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-dev.txt psutil requests
       - name: Run tests
         run: python -m pytest -q
+
+  nft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real nftables tests
+        run: scripts/test.sh --nft
+
+  panel:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Panel in a real browser
+        run: scripts/test.sh --panel
+
+  scenarios:
+    runs-on: ubuntu-latest
+    needs: [test, nft]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Attack and customer scenarios on SQLite and Postgres
+        run: tests/e2e/run.sh
 
   docker:
     runs-on: ubuntu-latest

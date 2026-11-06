@@ -2,7 +2,9 @@ import base64
 import secrets
 import time
 from collections import deque
+from urllib.parse import urlsplit
 
+from starlette.datastructures import MutableHeaders
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -10,10 +12,8 @@ from backend.metrics import counters
 
 
 def client_ip(scope: Scope, trust_proxy: bool = False) -> str:
-    """Best-effort client address. Only trusts X-Forwarded-For when explicitly enabled."""
     if trust_proxy:
         forwarded = dict(scope.get("headers", [])).get(b"x-forwarded-for", b"").decode("latin-1")
-        # The last hop is the one appended by our own proxy; earlier entries are client-controlled.
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
             return parts[-1]
@@ -21,34 +21,33 @@ def client_ip(scope: Scope, trust_proxy: bool = False) -> str:
     return client[0] if client else "unknown"
 
 
-class ApiKeyMiddleware:
-    """Requires a shared secret on machine-to-machine endpoints (X-API-Key or Bearer)."""
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+)
 
-    def __init__(self, app: ASGIApp, api_key: str, protected_paths: tuple[str, ...] = ("/api/ingest",)):
+
+class SecurityHeadersMiddleware:
+
+    def __init__(self, app: ASGIApp):
         self.app = app
-        self._key = api_key.encode()
-        self._paths = protected_paths
-
-    def _authorized(self, scope: Scope) -> bool:
-        headers = dict(scope["headers"])
-        supplied = headers.get(b"x-api-key", b"")
-        if not supplied:
-            scheme, _, token = headers.get(b"authorization", b"").decode("latin-1").partition(" ")
-            if scheme.lower() == "bearer":
-                supplied = token.encode()
-        return secrets.compare_digest(supplied, self._key)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and scope["path"] in self._paths and not self._authorized(scope):
-            counters.inc("nexus_auth_failures_total")
-            response = JSONResponse({"detail": "invalid or missing API key"}, status_code=401)
-            await response(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
             return
-        await self.app(scope, receive, send)
+
+        async def with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+                headers["X-Content-Type-Options"] = "nosniff"
+            await send(message)
+
+        await self.app(scope, receive, with_headers)
 
 
 class RateLimitMiddleware:
-    """Sliding-window limiter keyed by client IP. In-memory, so single-process only."""
 
     def __init__(
         self,
@@ -74,7 +73,6 @@ class RateLimitMiddleware:
             del self._hits[key]
 
     def check(self, key: str, now: float | None = None) -> float | None:
-        """Record a hit. Returns seconds to wait when over budget, otherwise None."""
         now = time.monotonic() if now is None else now
         self._sweep(now)
         hits = self._hits.setdefault(key, deque())
@@ -123,12 +121,33 @@ class BasicAuthMiddleware:
         return user_ok and password_ok
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] not in ("http", "websocket") or scope["path"] in self._exempt or self._authorized(scope):
+        if scope["type"] == "lifespan" or (scope["type"] == "http" and (scope["path"] in self._exempt or self._authorized(scope))):
             await self.app(scope, receive, send)
             return
-        if scope["type"] == "websocket":
-            await receive()
+        if scope["type"] != "http":
             await send({"type": "websocket.close", "code": 1008})
             return
         response = Response("Unauthorized", status_code=401, headers={"WWW-Authenticate": 'Basic realm="Nexus"'})
         await response(scope, receive, send)
+
+
+class OriginCheckMiddleware:
+
+    UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
+
+    def __init__(self, app: ASGIApp, trust_proxy: bool = False):
+        self.app = app
+        self.trust_proxy = trust_proxy
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope["method"] in self.UNSAFE:
+            headers = dict(scope["headers"])
+            origin = headers.get(b"origin", b"").decode("latin-1")
+            host = headers.get(b"host", b"")
+            if self.trust_proxy:
+                host = headers.get(b"x-forwarded-host", host).split(b",")[0].strip()
+            if origin and urlsplit(origin).netloc.lower() != host.decode("latin-1").lower():
+                counters.inc("nexus_auth_failures_total")
+                await JSONResponse({"detail": "cross-origin request rejected"}, status_code=403)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)

@@ -1,6 +1,8 @@
+import re
 from pathlib import Path
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,20 +39,21 @@ class Settings(BaseSettings):
     dashboard_user: str = ""
     dashboard_password: str = ""
 
-    # Shared secret agents must send in the X-API-Key header (or Bearer token) to /api/ingest.
-    ingest_api_key: str = ""
-    # Per-client request budget per minute (0 disables rate limiting).
     rate_limit_per_minute: int = 300
-    # Honour X-Forwarded-For. Only enable behind a trusted reverse proxy (e.g. Caddy).
     trust_proxy_headers: bool = False
+    public_url: str = ""
 
-    # Active defense. "dry_run" only logs/records what it would do; "enforce" runs firewall commands.
-    defense_mode: Literal["off", "dry_run", "enforce"] = "dry_run"
-    defense_firewall: Literal["auto", "iptables", "nftables", "pfctl"] = "auto"
-    defense_block_seconds: int = 300
-    defense_safe_mode_seconds: int = 60
-    # Comma separated IPs/CIDRs that must never be blocked.
-    defense_allowlist: str = "127.0.0.1,::1"
+    @field_validator("public_url")
+    @classmethod
+    def _origin_only(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if value and not re.fullmatch(r"https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:\d+)?", value):
+            raise ValueError("PUBLIC_URL must look like https://host[:port]")
+        return value
+
+    def require_dashboard_credentials(self) -> None:
+        if not (self.dashboard_user and self.dashboard_password):
+            raise RuntimeError("DASHBOARD_USER and DASHBOARD_PASSWORD must be set")
 
     @property
     def data_path(self) -> Path:
@@ -65,10 +68,6 @@ class Settings(BaseSettings):
     @property
     def bundle_path(self) -> Path:
         return self.data_path / "models" / "ensemble.joblib"
-
-    @property
-    def allowlist(self) -> list[str]:
-        return [i.strip() for i in self.defense_allowlist.split(",") if i.strip()]
 
     @property
     def instance_ids(self) -> list[str]:

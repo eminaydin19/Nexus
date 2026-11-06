@@ -137,7 +137,6 @@ class CloudWatchSource:
                         "; ".join(f"{key} ({_HINTS[key]})" for key in missing),
                     )
             
-            # Use 0.0 fallback for any missing metric, including cpu if it's somehow completely missing
             timestamp = got["cpu"][0] if got["cpu"] else time.time()
             if timestamp <= self._last_ts.get(iid, 0.0):
                 continue

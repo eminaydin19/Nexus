@@ -9,3 +9,4 @@ numpy>=2.0
 scikit-learn>=1.5
 joblib>=1.4
 torch>=2.4
+psycopg[binary]>=3.2
