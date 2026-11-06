@@ -1,5 +1,3 @@
-"""Minimal Prometheus text exposition (no external dependency)."""
-
 import threading
 from collections import defaultdict
 
@@ -7,7 +5,6 @@ CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 
 
 class Counters:
-    """Thread-safe process-wide counters, optionally labelled."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

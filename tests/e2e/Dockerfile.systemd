@@ -1,4 +1,3 @@
-# A bare server with systemd. python3-venv and nftables are left out on purpose: the installer must bring them.
 ARG BASE=ubuntu:22.04
 FROM ${BASE}
 ARG EXTRA=""

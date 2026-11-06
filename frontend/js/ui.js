@@ -7,11 +7,6 @@ export function h(tag, cls, ...children) {
 
 export const pill = ({ cls, text }) => h("span", `pill ${cls}`, text);
 
-/*
- * One action at a time across the whole page, from the click until its dialog is closed and its request done, so one
- * confirmation can never fire a second action on a server the operator was not shown. A flag, not b.disabled: disabling
- * the focused button would drop keyboard focus to the top of the page. Keyed, so a polling redraw keeps the busy state.
- */
 let inFlight = null;
 
 async function runAction(button, action) {
@@ -81,11 +76,6 @@ function restoreFocus(key) {
   (target || main()).focus({ preventScroll: true });
 }
 
-/*
- * Polling redraws the page every few seconds. Nodes marked data-keep (top-level only) stay in place untouched, so an
- * open select, half-typed form or chart survives. Everything else is replaced, and focus follows data-key so a keyboard
- * user is not thrown to the top, and never lands on a different row's button.
- */
 export function swapView(view, next) {
   const key = view.contains(document.activeElement) ? focusedKey() : null;
   const kept = new Map([...view.children].filter((c) => c.dataset.keep).map((c) => [c.dataset.keep, c]));
@@ -104,7 +94,6 @@ export function swapView(view, next) {
 
 let dialogBusy = false;
 
-/* Resolves with the value of the button that closed it, or "" for Escape. Never replaces a dialog that is open. */
 export function showDialog(form) {
   if (dialogBusy) return Promise.resolve("");
   dialogBusy = true;
@@ -143,7 +132,6 @@ export function dialogButton(text, value, { ghost = false, danger = false, autof
   return b;
 }
 
-/* Closes without submitting, so a required field cannot hold it open and Enter goes to the form's primary button. */
 export function dialogCancel(text) {
   const b = h("button", "ghost", text);
   b.type = "button";

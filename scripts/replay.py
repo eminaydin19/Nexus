@@ -1,4 +1,3 @@
-"""Run log lines through the agent's real parsers and rules, with no firewall, and return the decisions."""
 from __future__ import annotations
 
 import sys
@@ -34,7 +33,6 @@ def _parse(source: str, line: str, ts: float):
 
 
 def _fail2ban(lines, maxretry: int, findtime: float, bantime: float) -> List[Stamped]:
-    """The sshd jail's counting: failed lines per address inside findtime, and no ban while one is active."""
     hits = {}  # type: Dict[str, List[float]]
     banned_until = {}  # type: Dict[str, float]
     out = []
@@ -53,7 +51,6 @@ def _fail2ban(lines, maxretry: int, findtime: float, bantime: float) -> List[Sta
 
 def replay(lines: Iterable[Tuple[float, str, str]], system: str, models: Optional[dict] = None, maxretry: int = 5,
            findtime: float = 600.0, bantime: float = 600.0, allowlist=()) -> List[Stamped]:
-    """`rules` is today's engine, `hybrid` adds the evidence-gated model, `model` blocks on the score alone."""
     if system == "fail2ban":
         return _fail2ban(lines, maxretry, findtime, bantime)
     if system not in SYSTEMS:
@@ -83,7 +80,6 @@ def replay(lines: Iterable[Tuple[float, str, str]], system: str, models: Optiona
 
 
 def blocked(stamped: Iterable[Stamped]) -> Dict[str, float]:
-    """Address to the time of its first block. Alerts are not blocks."""
     first = {}  # type: Dict[str, float]
     for item in stamped:
         if item.decision.action != "alert":

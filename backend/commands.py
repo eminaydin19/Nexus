@@ -14,7 +14,6 @@ def enqueue(db: Session, node_id: str, type: CommandType, payload: dict, commit:
     if type not in _TYPES:
         raise ValueError(f"unsupported command type: {type}")
     if type == "mode":
-        # A server coming back from offline must apply only the latest decision, not replay every change of mind.
         db.query(AgentCommand).filter(
             AgentCommand.node_id == node_id, AgentCommand.type == "mode", AgentCommand.acked_at.is_(None)
         ).delete(synchronize_session=False)

@@ -1,9 +1,3 @@
-"""Per-IP behavior features and a pure-Python Isolation Forest scorer.
-
-The agent has no numpy or scikit-learn. training/train_anomaly.py fits the forest offline and exports it as JSON. A block
-needs evidence and an odd behavior together. The model sees what share of an address's requests were suspicious, never how
-many: the count is the gate's job, and the share is what separates a scanner from a customer who hit a few odd paths.
-"""
 from __future__ import annotations
 
 import json
@@ -61,7 +55,6 @@ class Forest:
 
 
 def load_models(path: Optional[Path] = None) -> Dict[str, Forest]:
-    """Models per channel. Any problem means no model: rules keep working and the anomaly path stays silent."""
     try:
         raw = json.loads(Path(path or MODEL_FILE).read_text())
         models = {channel: Forest(raw[channel]) for channel in FEATURES}
@@ -86,7 +79,6 @@ class _Counts:
 
     def tick(self, now: float) -> None:
         if self.last is not None:
-            # Welford's running variance: a list of gaps per IP would cost memory an attacker controls.
             gap = max(now - self.last, 0.0)
             self.gap_n += 1
             delta = gap - self.gap_mean
@@ -105,7 +97,6 @@ class _Counts:
 
 
 class Behavior:
-    """Counters per (channel, ip), reset hourly. Slow attacks stay in view without keeping any request."""
 
     def __init__(self, max_ips: int = 100000, clock: Callable[[], float] = time.time):
         self._max = max_ips
@@ -138,7 +129,6 @@ class Behavior:
 
     def note_ssh(self, ip: str, user: Optional[str], invalid: bool, port: Optional[int], password_try: bool) -> None:
         c = self._entry("ssh", ip)
-        # "Invalid user" and "Connection closed" can be one try on one connection. Only further passwords on it add a try.
         if port is not None and port in c.ports and not password_try:
             return
         if port is not None and len(c.ports) < MAX_PORTS:

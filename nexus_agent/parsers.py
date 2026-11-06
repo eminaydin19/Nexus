@@ -11,13 +11,10 @@ from typing import Optional, Tuple
 MAX_LINE = 16 * 1024
 MAX_RAW = 300
 
-# The sshd header is anchored at line start so text inside a username or URL can never
-# pose as a header; a line from another program fails here.
 _SSH_HEADER = (
     r"(?:(?:[A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ )?"
     r"sshd(?:-session)?\[\d+\]: "
 )
-# Publickey lines end with the key type and fingerprint, which have a fixed shape.
 _SSH_TAIL = r"(?: ssh2(?:: [A-Za-z0-9-]+ SHA256:\S+)?)?\Z"
 _SSH_FAIL = (
     re.compile(_SSH_HEADER + r"Failed \S+ for .* from (\S+) port (\d{1,5})" + _SSH_TAIL),
@@ -27,22 +24,17 @@ _SSH_FAIL = (
 _SSH_OK = re.compile(
     _SSH_HEADER
     + r"Accepted (?:password|publickey|keyboard-interactive/pam) for .* from (\S+) port (\d{1,5})"
-    # A certificate login appends its ID, serial and CA, and it must still earn the admin's 24 hours of protection.
     + r"(?: ssh2(?:: [A-Za-z0-9-]+ SHA256:\S+(?: ID .* \(serial \d+\) CA [A-Za-z0-9-]+ SHA256:\S+)?)?)?\Z"
 )
-# Classify on the text right after the header: a username may contain "Accepted password"
-# or "Failed password", so searching the whole line would let it flip the kind.
 _SSH_CLASSIFY = re.compile(_SSH_HEADER + r"(Failed |Invalid user |Connection closed by authenticating user |Accepted )")
 
 _QUOTED = r'"((?:[^"\\]|\\.)*)"'
 _WEB = re.compile(
     r"(\S+) \S+ \S+ \[[^\]\n]*\] " + _QUOTED + r" (\d{3}) (?:\d+|-)"
-    # Trailing fields are common additions to the combined format (request time, X-Forwarded-For). Never read them.
     r"(?: " + _QUOTED + " " + _QUOTED + r"(?: .*)?)?\Z"
 )
 _REQUEST = re.compile(r"([A-Z]+) (\S+)(?: HTTP/\d(?:\.\d)?)?\Z")
 
-# Anchored like the sshd header: a local `logger` line carries its own tag instead of "kernel:", so it cannot pose as a scan.
 _SCAN_HEAD = re.compile(
     r"(?:(?:(?:[A-Z][a-z]{2} +\d{1,2} \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT\S+) \S+ )?"
     r"kernel: (?:\[ *\d+\.\d+\] )?)?nexus-scan "
@@ -59,23 +51,22 @@ _WEB_TIME = re.compile(r"\S+ \S+ \S+ \[(\d{2})/([A-Z][a-z]{2})/(\d{4}):(\d\d):(\
 
 @dataclass(frozen=True)
 class LogEvent:
-    kind: str  # "ssh_fail" | "ssh_ok" | "web"
+    kind: str
     ip: str
     ts: float
     method: Optional[str] = None
     path: Optional[str] = None
     status: Optional[int] = None
     raw: str = ""
-    user_agent: Optional[str] = None  # raw is truncated, so the agent string is kept separately
-    src_port: Optional[int] = None  # ssh: tells which lines belong to the same connection
-    password_try: bool = False  # ssh: a "Failed ..." line, one real try among several on a connection
-    via_proxy: bool = False  # web: the client reached us through a proxy, so the firewall cannot see its address
+    user_agent: Optional[str] = None
+    src_port: Optional[int] = None
+    password_try: bool = False
+    via_proxy: bool = False
 
 
 def normalize_ip(s: str) -> Optional[str]:
     if not isinstance(s, str) or len(s) > 64:
         return None
-    # Only an IPv6 address has a zone.
     if ":" in s:
         s = s.split("%", 1)[0]
     try:
@@ -143,7 +134,6 @@ def _caddy_record(line) -> Optional[dict]:
 
 
 def parse_caddy_line(line: str, now: float) -> Optional[LogEvent]:
-    """Caddy computes client_ip from its trusted_proxies setting, so a client cannot choose it with a header."""
     record = _caddy_record(line)
     if record is None:
         return None
@@ -206,7 +196,6 @@ def _ssh_line_time(line: str, now: float) -> Optional[float]:
         d, hh, mi, ss = map(int, m.groups()[1:])
         year = time.localtime(now).tm_year
         ts = time.mktime((year, mo, d, hh, mi, ss, 0, 0, -1))
-        # Syslog has no year, so a December line read in January would otherwise land in the future.
         return time.mktime((year - 1, mo, d, hh, mi, ss, 0, 0, -1)) if ts > now + 86400 else ts
     return None
 
@@ -215,7 +204,7 @@ def ssh_line_is_stale(line: str, now: float) -> bool:
     try:
         ts = _ssh_line_time(line, now)
     except (KeyError, ValueError, OverflowError):
-        return False  # no parseable timestamp counts as now
+        return False
     return ts is not None and now - ts > MAX_LINE_AGE
 
 

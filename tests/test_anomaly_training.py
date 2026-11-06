@@ -29,7 +29,6 @@ def test_simulation_is_deterministic_and_ordered():
 
 def test_every_simulated_line_passes_the_real_parsers():
     records = simulate(9, customers=30, attacks=2)
-    # "Connection closed by invalid user" is the second line of a try, and the agent's parser ignores it.
     lines = [r for r in records if "by invalid user" not in r[2]]
     for ts, source, line, _, ip in lines:
         event = (parse_ssh_line if source == "ssh" else parse_web_line)(line, ts)

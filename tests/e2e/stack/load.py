@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Real TCP and HTTP load. Writes per-second counts to --out as it runs, so a scenario can read any phase of it."""
 import argparse
 import asyncio
 import json
@@ -20,9 +19,9 @@ ap.add_argument("--out", required=True)
 ap.add_argument("--timeout", type=float, default=4.0)
 args = ap.parse_args()
 
-seconds = {}  # int second -> [ok, errors, slow]
+seconds = {}
 state = {"held_open": 0, "held_lost": 0, "started": time.time()}
-SLOW = 0.9  # a dropped SYN is retransmitted after 1 s, so this marks a request that a firewall delayed
+SLOW = 0.9
 
 
 def record(ok, took):
@@ -68,7 +67,7 @@ async def holder():
                         raise ConnectionError
                     while (await asyncio.wait_for(reader.readline(), args.timeout)) not in (b"\r\n", b""):
                         pass
-                    await reader.readexactly(5)  # "page\n"
+                    await reader.readexactly(5)
                     await asyncio.sleep(25 + random.random() * 10)
             finally:
                 state["held_open"] -= 1

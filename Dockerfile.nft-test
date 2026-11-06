@@ -1,6 +1,5 @@
 FROM python:3.12-slim
 
-# Runs the real-nft integration tests; needs NET_ADMIN and SYS_ADMIN (network namespaces).
 RUN apt-get update && apt-get install -y --no-install-recommends nftables iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir pytest

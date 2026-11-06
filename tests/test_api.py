@@ -62,5 +62,5 @@ def test_migration_adds_contributions_column(tmp_path, monkeypatch):
         conn.execute(text("CREATE TABLE anomalies (id INTEGER PRIMARY KEY, node_id TEXT)"))
     monkeypatch.setattr(db, "engine", engine)
     db._migrate()
-    db._migrate()  # idempotent
+    db._migrate()
     assert "contributions" in {c["name"] for c in inspect(engine).get_columns("anomalies")}

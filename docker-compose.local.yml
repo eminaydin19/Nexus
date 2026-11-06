@@ -1,4 +1,3 @@
-# No-domain install: publish nexus on loopback only, for an SSH tunnel and an agent on this machine.
 services:
   nexus:
     ports:

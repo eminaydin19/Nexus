@@ -40,7 +40,6 @@ def test_retrain_loop_survives_short_data(monkeypatch):
 
 
 def _run_ticks(monkeypatch, ready, error, ticks):
-    """Run the retrain loop for `ticks` hourly ticks on a fake clock; return the number of train() calls."""
     calls = []
     clock = [0.0]
 

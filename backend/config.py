@@ -39,18 +39,14 @@ class Settings(BaseSettings):
     dashboard_user: str = ""
     dashboard_password: str = ""
 
-    # Per-client request budget per minute (0 disables rate limiting).
     rate_limit_per_minute: int = 300
-    # Honour X-Forwarded-For. Only enable behind a trusted reverse proxy (e.g. Caddy).
     trust_proxy_headers: bool = False
-    # The address agents enroll with. Set by install.sh, never derived from a request.
     public_url: str = ""
 
     @field_validator("public_url")
     @classmethod
     def _origin_only(cls, value: str) -> str:
         value = value.strip().rstrip("/")
-        # This value lands inside a shell script that people pipe into sudo bash.
         if value and not re.fullmatch(r"https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:\d+)?", value):
             raise ValueError("PUBLIC_URL must look like https://host[:port]")
         return value

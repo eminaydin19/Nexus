@@ -1,13 +1,4 @@
 #!/usr/bin/env bash
-# Attack and customer scenarios: real central, agent, sshd, nginx, nft, attacks and customers, on SQLite then Postgres.
-#   tests/e2e/run.sh                      both databases
-#   tests/e2e/run.sh sqlite|postgres      one database
-#   tests/e2e/run.sh --red                everything up except the agent; every scenario must fail
-#   E2E_SELECT=expr tests/e2e/run.sh ...  passed to pytest -k
-#
-# Needs Docker. Inside a container's network namespace the kernel drops nft "log" output unless the host sets
-# net.netfilter.nf_log_all_netns=1, so this sets it for the run and restores it. It is one kernel-wide setting; on
-# Docker Desktop that kernel is its VM, and on a native Linux host it is that host.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -30,11 +21,10 @@ compose() { docker compose -p "$PROJECT" -f "$HERE/docker-compose.e2e.yml" --pro
 vm_sysctl() { docker run --rm --net=host --privileged --entrypoint sysctl "$TOOLS_IMAGE" "$@"; }
 
 teardown() {
-    # -p above is the only project this can touch; volumes of any other project are out of its reach.
     compose down -v --remove-orphans >/dev/null 2>&1 || true
 }
 
-# shellcheck disable=SC2317  # Called by the trap below.
+# shellcheck disable=SC2317
 cleanup() {
     teardown
     if [ -n "$ORIGINAL_SYSCTL" ]; then
@@ -56,7 +46,6 @@ for backend in "${BACKENDS[@]}"; do
     printf '\n=== %s\n' "$backend"
     export E2E_DATABASE_URL=""
     if [ "$backend" = postgres ]; then
-        # The form .env.example documents for DATABASE_URL.
         export E2E_DATABASE_URL="postgresql+psycopg://nexus:e2e-db-password@postgres/nexus"
         compose up -d postgres
         for _ in $(seq 60); do

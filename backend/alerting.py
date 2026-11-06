@@ -46,7 +46,6 @@ class SlackNotifier:
         )
 
     async def notify_event(self, event: dict) -> bool:
-        # Keyed per (node, rule) so a routine block cannot mute a flood alert; the prefix keeps it apart from ML keys.
         if not self.enabled or not self._due(f"event:{event['node_id']}:{event['rule']}"):
             return False
         e = {k: _escape(str(v)) for k, v in event.items() if k != "ports"}
@@ -60,5 +59,4 @@ class SlackNotifier:
 
 
 def _escape(text: str) -> str:
-    # Evidence is attacker-controlled log text; Slack treats & < > as markup.
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

@@ -1,12 +1,3 @@
-"""Compare the ML ensemble with ECOD on simulated server metrics.
-
-Run inside the test image, from the repo root:
-    docker run --rm -v "$PWD":/app -w /app --entrypoint python nexus-test scripts/bench_ml.py
-
-The data is simulated, not recorded from production: three server profiles with daily and weekly load, nightly backups,
-cron spikes, benign bursts, a benign deploy shift and one incident left in the training history. The last days are never
-seen in training, so false alarm rates are measured on future data.
-"""
 import argparse
 import json
 import pickle
@@ -20,13 +11,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-STEP = 5.0  # seconds, the agent's SEND_INTERVAL
+STEP = 5.0
 PER_DAY = int(86400 / STEP)
 TAIL_Q = 99.5
 
 
 class ECOD:
-    """Empirical cumulative distribution outlier detection (Li et al. 2022), on per-node scaled features."""
 
     def __init__(self, x: np.ndarray):
         self.sorted = np.sort(np.asarray(x, dtype=np.float64), axis=0)
@@ -46,7 +36,6 @@ class ECOD:
 
 
 def ar1(rng: np.random.Generator, n: int, sigma: float, phi: float = 0.97) -> np.ndarray:
-    # scipy.signal.lfilter would be shorter but is only a transitive dependency.
     noise = rng.normal(0, sigma * np.sqrt(1 - phi**2), n)
     out = np.empty(n)
     value = 0.0
@@ -90,7 +79,6 @@ def simulate(profile: str, days: int, seed: int) -> np.ndarray:
         mem = 35 + 15 * hourly + 8 * cron + ar1(rng, n, 0.8, 0.99)
         net = (50 + 800 * cron + 1500 * hourly) * rng.lognormal(0, 0.4, n)
         lat = 2 * (1 + cron) * rng.lognormal(0, 0.25, n)
-    # Rare slow requests are ordinary; every real latency series has them.
     lat = lat * np.where(rng.random(n) < 0.002, rng.uniform(3, 6, n), 1.0)
     return np.column_stack([np.clip(cpu, 0, 100), np.clip(mem, 0, 100), np.maximum(net, 0), np.maximum(lat, 0.1)])
 
@@ -113,7 +101,6 @@ def inject(x: np.ndarray, scenario: str, start: int, rng: np.random.Generator) -
     elif scenario == "subtle_cpu":
         out[start:end, 0] = np.minimum(out[start:end, 0] + 15, 100)
     elif scenario == "dead_quiet":
-        # The process died: traffic and CPU fall to almost nothing at a time they should not.
         out[start:end, 0] = rng.uniform(0, 1, size)
         out[start:end, 2] = rng.uniform(0, 5, size)
     return out, end
@@ -123,7 +110,6 @@ SCENARIOS = ("cpu_saturated", "memory_leak", "exfiltration", "latency_spike", "s
 
 
 def episodes_per_day(flagged: np.ndarray, days: int, in_a_row: int = 3) -> float:
-    """How many alarms a rule "fire after N consecutive points, once per run" would send."""
     edges = np.flatnonzero(np.diff(np.concatenate([[0], flagged.astype(np.int8), [0]])))
     starts, ends = edges[::2], edges[1::2]
     return float(np.sum(ends - starts >= in_a_row)) / days
@@ -154,7 +140,6 @@ def run(seed: int, train_days: int, test_days: int, epochs: int, injections: int
     history = {p: x[: train_days * PER_DAY].copy() for p, x in full.items()}
     future = {p: x[train_days * PER_DAY :].copy() for p, x in full.items()}
 
-    # An incident nobody flagged stays in the training history, and a deploy moves a baseline after training ended.
     history["web"], _ = inject(history["web"], "exfiltration", (train_days - 2) * PER_DAY, np.random.default_rng(seed))
     future["web"][:, 1] = np.minimum(future["web"][:, 1] + 4, 100)
 
@@ -191,7 +176,6 @@ def run(seed: int, train_days: int, test_days: int, epochs: int, injections: int
     for name, (fn, thresholds) in models.items():
         fpr = {p: float(np.mean(clean[name][p] >= thresholds[p])) for p in profiles}
         episodes = {p: episodes_per_day(clean[name][p] >= thresholds[p], test_days) for p in profiles}
-        # The same false alarm budget for both, so recall is compared fairly: 0.5% of future points on every node.
         matched = {p: float(np.percentile(clean[name][p], TAIL_Q)) for p in profiles}
         per_scenario = {}
         for scenario in SCENARIOS:
@@ -201,12 +185,10 @@ def run(seed: int, train_days: int, test_days: int, epochs: int, injections: int
                 for _ in range(injections):
                     start = int(rng.integers(window, len(future[p]) - 2000))
                     raw, end = inject(future[p], scenario, start, rng)
-                    # Only the part that the injection can change is rescored, with a window of context before it.
                     begin = max(0, start - window)
                     scores = fn(p, raw[begin:end])[start - begin :]
                     own = scores >= thresholds[p]
                     same = scores >= matched[p]
-                    # An event counts as caught only if a fifth of its points fire, so chance alarms do not count.
                     own_hits.append(own.mean() >= 0.2)
                     matched_hits.append(same.mean() >= 0.2)
                     own_points.append(own.mean())
@@ -240,7 +222,6 @@ def run(seed: int, train_days: int, test_days: int, epochs: int, injections: int
 
 
 def peak_rss_mb() -> float:
-    # Not ru_maxrss: on Linux it survives exec, so a child reports its parent's peak.
     for line in Path("/proc/self/status").read_text().splitlines():
         if line.startswith("VmHWM:"):
             return int(line.split()[1]) / 1024
@@ -248,7 +229,6 @@ def peak_rss_mb() -> float:
 
 
 def serve(name: str, path: str) -> None:
-    """Fresh process per model, so peak memory holds only what serving that model imports and loads."""
     sample = np.array([40.0, 60.0, 1500.0, 25.0])
     calls = 2000
     if name == "ensemble":

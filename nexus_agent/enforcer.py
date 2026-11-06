@@ -23,17 +23,15 @@ MODES = ("off", "observe", "enforce")
 MAX_TTL = 86400
 BREAKER_TTL = 600
 BREAKER_WINDOW = 300
-MAX_ACTIVE_REPORT = 1000  # ingest limit on active_blocks
-MAX_PORTS_REPORT = 16  # BlockIn.ports limit
+MAX_ACTIVE_REPORT = 1000
+MAX_PORTS_REPORT = 16
 V6_MASK = "ffff:ffff:ffff:ffff::"
 BLOCK_SETS = ("port4", "port6", "all4", "all6", "limit4", "limit6")
 NEW_CONN_SETS = ("seen4", "seen6")
-# One bit of the conntrack mark, so tools that use other bits keep working.
 SEEN_BIT = "0x40000000"
 _KIND = {"port": "block_port", "all": "block_all", "limit": "rate_limit"}
 _SET_FOR = {"block_port": "port", "block_all": "all", "rate_limit": "limit"}
 
-# (set, address text, port or 0) -> (until, rule)
 Key = Tuple[str, str, int]
 
 
@@ -42,7 +40,7 @@ class ApplyResult:
     ok: bool
     simulated: bool
     detail: str = ""
-    ttl: int = field(default=0, compare=False)  # what was really applied, after caps and any breaker downgrade
+    ttl: int = field(default=0, compare=False)
 
 
 @dataclass
@@ -62,12 +60,10 @@ def run_command(argv: List[str], input_text: Optional[str] = None, timeout: floa
         return 127, ""
     except subprocess.TimeoutExpired:
         return 124, "timeout"
-    # stderr only on failure: nft warnings must not corrupt the JSON that callers parse.
     return p.returncode, p.stdout if p.returncode == 0 else p.stdout + p.stderr
 
 
 def _address(ip: str) -> Tuple[str, str]:
-    """Return ("4"|"6", text); IPv6 collapses to its /64 network address."""
     if not isinstance(ip, str) or "%" in ip:
         raise ValueError("invalid ip: %r" % (ip,))
     addr = ipaddress.ip_address(ip)
@@ -101,8 +97,6 @@ def _setup_script(with_rules: bool) -> str:
     if with_rules:
         s6 = "ip6 saddr & ffff:ffff:ffff:ffff::"
         rate = "limit rate over 100/second burst 200 packets"
-        # Counts each connection once, when the handshake completes. "established" alone is not enough: a forged SYN makes
-        # the real owner of that address answer our SYN-ACK with a RST, and only "assured" leaves that packet out.
         first = ("ct status assured ct direction original ct mark & %s == 0 meta l4proto tcp ct mark set ct mark | %s"
                  % (SEEN_BIT, SEEN_BIT))
         lines += [
@@ -116,7 +110,6 @@ def _setup_script(with_rules: bool) -> str:
             "update @meter6 { %s %s } drop" % (s6, s6, rate),
             "add rule inet nexus prerouting meta nfproto ipv4 %s update @seen4 { ip saddr counter }" % first,
             "add rule inet nexus prerouting meta nfproto ipv6 %s update @seen6 { %s counter }" % (first, s6),
-            # Only SYNs addressed to this host from outside: forwarded and loopback traffic is not a scan of us.
             'add rule inet nexus prerouting fib daddr type local iif != "lo" ct state new tcp flags syn '
             'tcp dport != @listening '
             'limit rate 50/second log prefix "nexus-scan "',
@@ -143,8 +136,6 @@ class Enforcer:
         self._listening: Optional[frozenset] = None
         self._lock = threading.RLock()
 
-    # -- breaker -----------------------------------------------------------
-
     def _cur(self) -> Dict[Key, Tuple[float, str]]:
         return self._sim if self.mode == "observe" else self._live
 
@@ -168,8 +159,6 @@ class Enforcer:
                     self._open = False
             return self._open
 
-    # -- kernel ------------------------------------------------------------
-
     def _exec(self, argv: List[str], input_text: Optional[str] = None) -> Tuple[bool, int, str]:
         rc, out = self._run(argv, input_text)
         return rc == 0 or "File exists" in out, rc, out
@@ -190,7 +179,6 @@ class Enforcer:
                     self.capable = False
                     return False
             elif "No such file" not in out:
-                # Adding rules without knowing the chain is empty would duplicate them.
                 log.error("cannot inspect chain (%s): %s", rc, out.strip())
                 self.capable = False
                 return False
@@ -211,7 +199,6 @@ class Enforcer:
             return True
 
     def teardown(self) -> bool:
-        # Only for --uninstall: on agent stop the blocks must stay and expire in the kernel.
         with self._lock:
             ok, rc, out = self._exec(["nft", "delete", "table", "inet", TABLE])
             if not ok and "No such file" in out:
@@ -225,7 +212,6 @@ class Enforcer:
             return ok
 
     def _read_kernel(self, set_name: Optional[str] = None) -> Optional[List[Tuple[str, str, int, float, str]]]:
-        """Block elements as (set, addr, port, seconds left, rule); [] when nft or the table is absent, None on error."""
         what = ["set", "inet", TABLE, set_name] if set_name else ["table", "inet", TABLE]
         rc, out = self._run(["nft", "-j", "list"] + what)
         if rc == 127 or (rc != 0 and "No such file" in out):
@@ -241,7 +227,6 @@ class Enforcer:
                     continue
                 for el in s.get("elem", []):
                     el = el.get("elem", el) if isinstance(el, dict) else el
-                    # An element with no timeout has no "val": the element itself is the concat.
                     val = el.get("val", el) if isinstance(el, dict) else el
                     expires = float(el.get("expires", 0)) if isinstance(el, dict) else 0.0
                     rule = el.get("comment", "") if isinstance(el, dict) else ""
@@ -254,8 +239,6 @@ class Enforcer:
             log.error("unparseable nft output for table inet %s", TABLE)
             return None
         return rows
-
-    # -- public API --------------------------------------------------------
 
     def apply(self, d: Decision) -> ApplyResult:
         if d.action == "alert":
@@ -299,19 +282,16 @@ class Enforcer:
     def _write(self, keys: List[Key], addr: str, ttl: int, rule: str, now: float, detail: str) -> ApplyResult:
         setname = keys[0][0]
         left = {(a, p): e for _, a, p, e, _ in self._read_kernel(setname) or []}
-        # nft reports whole seconds, so a block re-applied right away would otherwise be rewritten every time.
         todo = [k for k in keys if left.get((k[1], k[2]), -1) < ttl - 1]
         for k in keys:
             if k not in todo and k not in self._live:
                 self._live[k] = (now + left[(k[1], k[2])], rule)
         if not todo:
-            return ApplyResult(True, False, detail)  # a live block is never shortened
-        # The comment is the kernel's copy of why: it survives an agent restart, when memory of the rule does not.
+            return ApplyResult(True, False, detail)
         items = "{ %s }" % ", ".join(
             '%s timeout %ds comment "%s"' % (self._elem(k), ttl, _safe_comment(rule)) for k in todo)
         replace = [k for k in todo if (k[1], k[2]) in left]
         if replace:
-            # Delete + add in one transaction extends a timeout on every kernel; a plain re-add may keep the old one.
             script = "".join("delete element inet %s %s { %s }\n" % (TABLE, setname, self._elem(k)) for k in replace)
             ok, rc, out = self._exec(["nft", "-f", "-"], script + "add element inet %s %s %s\n" % (TABLE, setname, items))
         else:
@@ -333,7 +313,6 @@ class Enforcer:
         return [(name, addr, p) for p in ports] if action == "block_port" else [(name, addr, 0)]
 
     def active(self, limit: Optional[int] = MAX_ACTIVE_REPORT, strict: bool = False) -> Optional[List[BlockIn]]:
-        """With strict, None means the kernel could not be read; otherwise that reads as no kernel blocks."""
         with self._lock:
             self._prune()
             now = self._clock()
@@ -359,7 +338,6 @@ class Enforcer:
     def remove(self, ip: str) -> bool:
         fam, addr = _address(ip)
         with self._lock:
-            # Every mode reads the kernel: blocks outlive a mode change and must stay removable.
             rows = self._read_kernel()
             if rows is None:
                 return False
@@ -369,7 +347,6 @@ class Enforcer:
                                  for s, a, p in targets)
                 rc, out = self._run(["nft", "-f", "-"], script)
                 if rc != 0:
-                    # An element may have expired since the listing and aborted the whole transaction; go one by one.
                     for s, a, p in targets:
                         done, rc, out = self._exec(
                             ["nft", "delete", "element", "inet", TABLE, s, "{ %s }" % self._elem((s, a, p))])
@@ -382,7 +359,6 @@ class Enforcer:
             return True
 
     def new_connections(self) -> Dict[str, int]:
-        """Completed handshakes per source since its set element appeared. {} when unread: a miss, never a false alarm."""
         out = {}  # type: Dict[str, int]
         with self._lock:
             if self.mode != "enforce":
@@ -445,7 +421,6 @@ class Enforcer:
                 self._lift()
 
     def lift_leftovers(self) -> bool:
-        """Drop blocks a previous run left in the kernel, without creating the table or enabling anything."""
         with self._lock:
             return self._lift()
 
@@ -465,7 +440,6 @@ class Enforcer:
                     self._sim.clear()
                     self._lift_pending = False
             elif self.mode == "enforce" or self._lift_pending:
-                # Leaving enforce must lift blocks: a flipped-off switch that keeps dropping customers is worse than a miss.
                 ok = self._lift()
             self._events.clear()
             self._open = False

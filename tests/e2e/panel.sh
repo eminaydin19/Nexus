@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Runs the panel in a real browser against a real backend with seeded data. Output lands in $PANEL_OUT.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 OUT="${PANEL_OUT:-$PWD/.panel-out}"
@@ -33,7 +32,6 @@ run_pass() {
         nexus-panel-e2e npx playwright test panel.spec.mjs --workers=1 --reporter=list --output="/out/results-$pass" "$@"
 }
 
-# The clean pass has no attacker text, so its Overview can serve as the README screenshot.
 status=0
 run_pass clean 0 https://nexus.example "$@" || status=1
 run_pass xss 1 "" "$@" || status=1

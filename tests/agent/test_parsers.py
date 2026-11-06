@@ -219,7 +219,6 @@ def test_web_user_agent_absent_is_none():
     assert parse_web_line('198.51.100.7 - - [t] "GET /a HTTP/1.1" 200 1 "-" "-"', 0).user_agent is None
 
 
-
 def _syslog(age):
     return time.strftime("%b %e %H:%M:%S", time.localtime(NOW - age))
 

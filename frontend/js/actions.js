@@ -116,7 +116,6 @@ async function withdrawMode(server, mode, replaced, ctx) {
   await ctx.refresh();
 }
 
-/* What the server is doing now is the pressed button; a request still on its way is stated next to it, and can be replaced. */
 export function modeControl(server, ctx) {
   const problem = enforceProblem(server);
   const pendingMode = server.pending.filter((c) => c.type === "mode").at(-1)?.payload?.mode;

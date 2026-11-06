@@ -1,8 +1,3 @@
-"""Attack and customer scenarios against the whole system. Run by tests/e2e/run.sh, inside the runner container.
-
-Every negative check ("not blocked") is followed by a positive control from another source, processed after it,
-so a dead agent can never pass a scenario and no fixed sleep is needed to know the agent has read the lines.
-"""
 from __future__ import annotations
 
 import concurrent.futures
@@ -17,7 +12,6 @@ import requests
 
 PROJECT = os.environ["E2E_PROJECT"]
 BACKEND = os.environ.get("E2E_BACKEND", "sqlite")
-# RED run: everything is up except the agent, so each scenario must fail on its first agent-dependent check.
 AGENT_DOWN = os.environ.get("E2E_AGENT_DOWN") == "1"
 SCALE = float(os.environ.get("E2E_TIMEOUT_SCALE", "1"))
 
@@ -36,8 +30,6 @@ EXPLOITS = ["' OR 1=1 --", "../../../etc/passwd", "1 UNION SELECT password FROM 
             "$(cat /etc/shadow)", "${jndi:ldap://x/a}", "/proc/self/environ", "x onerror=alert(1)"]
 TOOLS = ("attacker", "customer", "nat_customer", "cdn", "scanner")
 
-
-# -- plumbing ----------------------------------------------------------------
 
 def container(service: str) -> str:
     return f"{PROJECT}-{service}-1"
@@ -103,7 +95,6 @@ BLOCK_SETS = ("port4", "port6", "all4", "all6", "limit4", "limit6")
 
 
 def kernel() -> dict:
-    """Block set name -> [(addr, port, seconds left)], from the kernel itself. {} when the table does not exist."""
     r = run("target", "nft", "-j", "list", "table", "inet", "nexus")
     if r.returncode:
         assert "No such file" in r.stderr, r.stderr
@@ -143,7 +134,6 @@ def assert_no_kernel_rows(ip: str) -> None:
 
 
 def http(service: str, path: str = "/") -> str:
-    """Status code of one real request; 000 means the connection never got through."""
     r = run(service, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "2", "--max-time", "4",
             f"http://{TARGET}{path}")
     return r.stdout.strip()
@@ -177,7 +167,6 @@ def failed_password_lines(ip: str) -> int:
 
 
 def ssh_fail_until_blocked(service: str, ip: str, timeout: float = 240) -> int:
-    """Failed logins with a real client until the kernel holds the block. sshd's own penalties may delay some."""
     attempts, deadline = 0, time.monotonic() + timeout * SCALE
     while time.monotonic() < deadline:
         if port_blocked(ip, SSH_PORT):
@@ -188,7 +177,6 @@ def ssh_fail_until_blocked(service: str, ip: str, timeout: float = 240) -> int:
 
 
 def ssh_failures(service: str, ip: str, count: int, timeout: float = 240) -> None:
-    """At least count real Failed password lines from this address, whatever sshd's penalties delay."""
     base, deadline = failed_password_lines(ip), time.monotonic() + timeout
     while failed_password_lines(ip) - base < count:
         assert time.monotonic() < deadline, f"sshd logged too few failures for {ip}"
@@ -216,7 +204,6 @@ class Load:
                 "success_pct": round(100.0 * ok / total, 3) if total else None}
 
     def stop(self) -> dict:
-        # Never through a shell: pkill -f would match that shell's own command line.
         run(self.service, "pkill", "-TERM", "-f", "--", f"--out {self.out}")
         wait(lambda: run(self.service, "pgrep", "-f", "--", f"--out {self.out}").returncode != 0, 10 / SCALE, "load stopped", 0.1)
         return self.read()
@@ -225,8 +212,6 @@ class Load:
 def customer_load(name: str = "customer") -> Load:
     return Load("customer", name, "--rate", "10")
 
-
-# -- agent lifecycle ---------------------------------------------------------
 
 NODE: dict = {}
 
@@ -264,7 +249,6 @@ def wait_reported(mode: str, since: float | None = None, timeout: float = 25) ->
 
 
 def fresh_agent(mode: str = "enforce", env: dict | None = None) -> None:
-    """A clean agent as after a new install: no firewall table, no engine memory, no remembered logins."""
     stop_agent()
     run("target", "python", "-m", "nexus_agent", "uninstall", check=True)
     write_state(mode)
@@ -309,10 +293,8 @@ def clean():
         run(tool, "pkill", "-x", "sshpass")
         run(tool, "pkill", "-x", "ssh")
         run(tool, "pkill", "-f", "socket.create_connection")
-    # A client blocked mid-login can no longer close its connection, so sshd would hold the session until LoginGraceTime.
     run("target", "pkill", "-f", "sshd-session")
     wait(lambda: run("target", "pgrep", "-f", "sshd-session").returncode != 0, 15 / SCALE, "old ssh sessions gone", 0.2)
-    # sshd's own per-source penalties would otherwise carry from one scenario into the next.
     sh("target", "pkill -x sshd; sleep 0.2; /usr/sbin/sshd", check=True)
     central_up()
     api_json("PUT", f"/api/agents/{NODE['id']}/allowlist", json=[])
@@ -320,8 +302,6 @@ def clean():
     yield
     docker("start", container("central"))
 
-
-# -- the attacker range must be blockable, before anything else means anything ---------------------------------------
 
 def test_00_attacker_address_is_not_protected_and_really_gets_blocked():
     code = ("from nexus_agent.protect import Protector;"
@@ -334,8 +314,6 @@ def test_00_attacker_address_is_not_protected_and_really_gets_blocked():
     assert http("attacker") == "000", "a kernel row exists but packets still pass"
     metric("attacker_really_blocked", kernel=rows_for(ATTACKER))
 
-
-# -- the brief's scenarios -------------------------------------------------------------------------------------------
 
 def test_ssh_attacker_blocked_on_22_but_web_still_works():
     base = failed_password_lines(ATTACKER)
@@ -354,12 +332,11 @@ def test_ssh_attacker_blocked_on_22_but_web_still_works():
 
 
 def test_unauthenticated_ssh_connection_gives_no_immunity():
-    """An open port 22 connection used to count as an active session, which exempted its owner from every rule."""
     hold = ("import socket, time\n"
             f"s = [socket.create_connection(({TARGET!r}, {SSH_PORT})) for _ in range(3)]\n"
             "time.sleep(60)")
     run("attacker", "python3", "-c", hold, detach=True, check=True)
-    time.sleep(6)  # one sample of the connection table, which nothing outside the agent can observe
+    time.sleep(6)
     scanned_until_blocked("attacker", ATTACKER)
     assert http("attacker") == "000"
     metric("preauth_no_immunity", kernel=rows_for(ATTACKER))
@@ -371,7 +348,7 @@ def test_web_scanner_blocked_customer_sees_zero_errors():
     assert http("scanner") == "000", "web block must really drop packets"
     assert ssh("scanner", "customer", "customer-pass") == 0, "a web block must leave ssh working"
     assert not all_blocked(SCANNER)
-    time.sleep(3)  # customer traffic keeps measuring after the block lands, which no state change can signal
+    time.sleep(3)
     load.stop()
     stats = load.totals()
     metric("web_scanner_customer_traffic", **stats, kernel=rows_for(SCANNER))
@@ -381,14 +358,11 @@ def test_web_scanner_blocked_customer_sees_zero_errors():
 
 
 def test_high_volume_nat_ip_rate_limited_not_blocked():
-    """One address past the open-connection limit: slowed, never blocked, nobody behind it hurt, no growing TTL."""
-    # This traffic earns web trust, which triples the open-connection limit: 1100 must clear 3 x 300.
     fresh_agent(env={"NEXUS_RULE_TTL_CONN_FLOOD": "8", "NEXUS_RULE_MAX_CONN_PER_IP": "300"})
     started = int(time.time())
     load = Load("nat_customer", "nat-over", "--rate", "20", "--hold", "1100", "--ramp", "25")
     wait(lambda: load.read()["held_open"] >= 1100, 60, "1100 connections held open")
     limit_at = wait(lambda: limited(NAT) and int(time.time()), 30, "a rate limit on the address")
-    # Past two expiries, so a doubling TTL would have to show in the events below.
     wait(lambda: len(events(started, NAT, "conn_flood")) >= 3, 90, "conn_flood fired three times")
     assert not port_blocked(NAT, WEB_PORT) and not all_blocked(NAT), "volume alone must never block"
     data = load.stop()
@@ -410,7 +384,6 @@ def test_nat_office_250_connections_20_new_per_second_sees_no_limit_and_no_error
     hold = Load("nat_customer", "nat-hold", "--hold", "250", "--ramp", "10")
     wait(lambda: hold.read()["held_open"] >= 250, 40, "250 connections held open")
     during_start = int(time.time())
-    # Long enough for several samples of the connection table and several expiries of a short TTL.
     wait(lambda: int(time.time()) - during_start >= 45, 60, "during phase", 1)
     during_end = int(time.time())
     seen_limit = limited(NAT)
@@ -421,7 +394,6 @@ def test_nat_office_250_connections_20_new_per_second_sees_no_limit_and_no_error
     conn_events = events(t0, NAT, "conn_flood")
     metric("nat_office_250", before=before, during=during, after=after, held_open=held["held_open"],
            held_lost=held["held_lost"], limited=seen_limit, ttls=[e["ttl"] for e in conn_events])
-    # Control: the same counters do see a flood; otherwise "no limit" above could mean a blind rule.
     flood = Load("attacker", "flood-control", "--rate", "400")
     wait(lambda: limited(ATTACKER), 40, "control: a real flood gets limited")
     flood.stop()
@@ -458,7 +430,6 @@ def test_true_flood_from_one_ip_is_slowed_and_customer_unharmed():
 
 
 def test_connect_only_flood_is_slowed_too():
-    """No request, nothing in any log: the handshake is the only evidence."""
     fresh_agent()
     flood = Load("attacker", "flood-connect", "--rate", "500", "--connect-only")
     wait(lambda: limited(ATTACKER), 40, "a rate limit on the connect-only flood")
@@ -468,7 +439,6 @@ def test_connect_only_flood_is_slowed_too():
 
 
 def test_spoofed_syn_flood_cannot_get_the_customer_limited():
-    """Half-open SYNs carry a forged source; only completed handshakes may count toward a limit."""
     load = customer_load()
     r = run("attacker", "timeout", "12", "hping3", "-q", "-S", "-a", CUSTOMER, "-p", str(WEB_PORT), "-i", "u2000", TARGET,
             timeout=30)
@@ -517,7 +487,7 @@ def test_blocks_continue_with_central_stopped():
     docker("stop", container("central"))
     try:
         assert http("attacker") == "000", "an existing block must survive central going down"
-        scanned_until_blocked("scanner", SCANNER)  # a new detection, with central unreachable
+        scanned_until_blocked("scanner", SCANNER)
         assert http("scanner") == "000"
         assert agent_pid(), "the agent must keep running"
     finally:
@@ -554,7 +524,6 @@ now = time.time()
 for i in range(280):
     post({'timestamp': now - (OFFSET + i) * 60, 'cpu_pct': 20 + i % 5, 'memory_pct': 40 + i % 3, 'net_kbps': 100 + i % 7, 'latency_ms': 5 + i % 2})
 """
-    # Training needs 500 rows and central allows one address 300 requests a minute, so two addresses send them.
     for service, offset in (("cdn", "0"), ("nat_customer", "280")):
         run(service, "python3", "-c", seed.replace("OFFSET", offset), check=True, timeout=120)
     trained = requests.post(CENTRAL + "/api/retrain", auth=AUTH, timeout=280)
@@ -573,15 +542,12 @@ print(json.dumps(answers))
     critical = [a for a in rows if a["severity"] == "critical"]
     assert critical, f"no critical score to test with: {rows[:3]}"
     assert not server()["pending"]
-    # The real agent shares this node: a control, then nothing may have appeared for anyone else.
     scanned_until_blocked("scanner", SCANNER)
     table = kernel()
     assert {r[0] for found in table.values() for r in found} == {SCANNER}, table
     assert http("customer") == "200" and http("attacker") == "200"
     metric("ml_critical_no_block", critical_anomalies=len(critical), top_score=critical[0]["scores"]["ensemble"], kernel=table)
 
-
-# -- customer false positives: none of these may produce a block -----------------------------------------------------
 
 def control_scanner_blocked() -> None:
     scanned_until_blocked("scanner", SCANNER)
@@ -618,7 +584,7 @@ def test_logged_in_customer_visiting_many_pages_is_not_blocked():
     r = run("customer", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}\n", f"http://{TARGET}/page/[1-400]", timeout=60)
     codes = r.stdout.split()
     assert len(codes) == 400 and set(codes) == {"200"}, set(codes)
-    for _ in range(4):  # a slip on the way in
+    for _ in range(4):
         run("customer", "curl", "-s", "-o", "/dev/null", "-X", "POST", f"http://{TARGET}/login")
     control_scanner_blocked()
     assert_no_kernel_rows(CUSTOMER)
@@ -627,14 +593,12 @@ def test_logged_in_customer_visiting_many_pages_is_not_blocked():
 
 def test_customer_pasting_code_into_a_search_box_is_not_blocked():
     started = time.time()
-    # A developer's forum search: three attack patterns at once, refreshed, then edited and searched again.
     pastes = ['<script>alert(1)</script>'] * 2
     pastes += ['<script>$("#a").load("../api/x")</script>'] * 4
     pastes += ['<script>$("#b").load("../api/y")</script>', '<script>$("#b").load("../api/z")</script>']
     for text in pastes:
         run("customer", "curl", "-s", "-o", "/dev/null", "--get", "--data-urlencode", f"q={text}", f"http://{TARGET}/search",
             check=True)
-    # Control: a real injection tool, same rule, same window.
     for i, payload in enumerate(EXPLOITS):
         run("attacker", "curl", "-s", "-o", "/dev/null", "--get", "--data-urlencode", f"id={i}{payload}", f"http://{TARGET}/search")
     wait(lambda: port_blocked(ATTACKER, WEB_PORT), 30, "control: an injection tool gets blocked")
@@ -648,13 +612,11 @@ def test_customer_refreshing_a_404_is_not_blocked():
     r = run("customer", "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}\n", f"http://{TARGET}/no-such-page?[1-300]", timeout=60)
     assert set(r.stdout.split()) == {"404"} and len(r.stdout.split()) == 300
     for _ in range(50):
-        http("customer", "/.env")  # a bookmarked scan path refreshed over and over is still one path
+        http("customer", "/.env")
     control_scanner_blocked()
     assert_no_kernel_rows(CUSTOMER)
     metric("customer_refreshing_404", refreshes=350)
 
-
-# -- spoofing and port scans -----------------------------------------------------------------------------------------
 
 def scan_log_count(src: str) -> int:
     return int(sh("target", f"grep -c 'nexus-scan .*SRC={src} ' /var/log/kern.log").stdout.strip() or 0)
@@ -685,7 +647,7 @@ def test_real_scan_alone_alerts_and_scan_plus_probe_blocks_all():
     assert {e["action"] for e in rows} == {"alert"}, rows
     assert_no_kernel_rows(SCANNER)
     assert http("scanner") == "200" and tcp_open("scanner", SSH_PORT), "a scan alone must not cost any access"
-    assert http("scanner", "/.env") == "404"  # one handshake-proven probe, far below web_probe's own threshold
+    assert http("scanner", "/.env") == "404"
     run("scanner", *nmap, check=True, timeout=60)
     wait(lambda: all_blocked(SCANNER), 20, "scan plus a proven probe gives block_all")
     assert http("scanner") == "000" and not tcp_open("scanner", SSH_PORT)
@@ -694,8 +656,6 @@ def test_real_scan_alone_alerts_and_scan_plus_probe_blocks_all():
     metric("real_scan", alert_only_events=len(rows), kernel_log_lines=scan_log_count(SCANNER), kernel=rows_for(SCANNER),
            kernel_log_source="rsyslog imkmsg with net.netfilter.nf_log_all_netns=1 on the Docker VM")
 
-
-# -- panel API with a real agent -------------------------------------------------------------------------------------
 
 def test_panel_mode_block_customer_and_leaving_enforce():
     fresh_agent(mode="observe")
@@ -706,7 +666,6 @@ def test_panel_mode_block_customer_and_leaving_enforce():
     scanned_until_blocked("scanner", SCANNER)
     assert http("attacker") == "000"
 
-    # "This is a customer" lifts the real block, and from then on the address cannot be blocked.
     answer = api_json("POST", "/api/customers", json={"ip": ATTACKER})
     assert answer["status"] == "sent" and answer["sent"] == [NODE["id"]], answer
     wait(lambda: not rows_for(ATTACKER), 20, "the customer's block is lifted in the kernel")
@@ -719,7 +678,6 @@ def test_panel_mode_block_customer_and_leaving_enforce():
     assert http("attacker") == "200"
     assert port_blocked(SCANNER, WEB_PORT), "the other block stays"
 
-    # Leaving enforce lifts every block.
     api_json("PUT", f"/api/agents/{NODE['id']}/mode", json={"mode": "observe"})
     wait_reported("observe")
     assert not any(kernel().values()), kernel()
@@ -732,7 +690,6 @@ def test_panel_refuses_enforce_above_max_mode():
     r = api("PUT", f"/api/agents/{NODE['id']}/mode", json={"mode": "enforce"})
     assert r.status_code == 409 and "max_mode" in r.json()["detail"], r.text
     assert server()["reported_mode"] == "observe" and server()["max_mode"] == "observe"
-    # And a state file asking for enforce is clamped too, with the reason reported to the panel.
     stop_agent()
     write_state("enforce")
     t0 = time.time()
@@ -758,10 +715,8 @@ def test_observe_mode_gives_watch_rows_and_no_kernel_elements():
     metric("observe_watch", watch_rows=len(rows), kernel=kernel())
 
 
-# -- restarts --------------------------------------------------------------------------------------------------------
-
 def test_agent_restart_keeps_kernel_blocks_and_state():
-    assert ssh("customer", "customer", "customer-pass") == 0  # a login to remember
+    assert ssh("customer", "customer", "customer-pass") == 0
     api_json("POST", "/api/customers", json={"ip": NAT})
     wait(lambda: NAT in sh("target", f"cat {STATE}").stdout, 20, "allowlist saved by the agent")
     scanned_until_blocked("attacker", ATTACKER)
@@ -784,7 +739,6 @@ def test_agent_restart_keeps_kernel_blocks_and_state():
     metric("agent_restart", before=before, after=after, reported=s["reported_mode"], state_keys=sorted(state), panel_row=row)
     assert row["rule"] == "web_probe", f"the panel lost why this address is blocked: {row}"
     assert row["evidence"], f"the panel lost the evidence: {row}"
-    # What the state file protects still protects, in the kernel.
     probe("nat_customer")
     ssh_failures("customer", CUSTOMER, 12)
     scanned_until_blocked("scanner", SCANNER)
@@ -824,8 +778,6 @@ def test_offline_agent_applies_only_the_newest_queued_mode():
     metric("offline_newest_mode", queued=len(ids), delivered=len(pending), reported=s["reported_mode"])
 
 
-# -- log flood -------------------------------------------------------------------------------------------------------
-
 FLOOD_LINES = """
 import time
 t = time.strftime('%d/%b/%Y:%H:%M:%S +0000', time.gmtime(time.time() - {age}))
@@ -850,12 +802,10 @@ def test_log_flood_of_old_lines_blocks_nobody_and_detection_resumes():
     assert pid, "no agent is running"
     load = customer_load()
     rss_before, _ = rss_kb(pid)
-    # An hour old and naming the customer on a probe path: read as news, these would block the customer.
     flood_log(3600, CUSTOMER, "/.env", 404)
     flood_end = time.monotonic()
     scanned_until_blocked("scanner", SCANNER, timeout=60)
     resumed = round(time.monotonic() - flood_end, 1)
-    # Fresh, benign and just as large.
     flood_log(0, "198.51.100.78", "/page/fresh", 200)
     probe("attacker")
     wait(lambda: port_blocked(ATTACKER, WEB_PORT), 60, "detection after a fresh flood")
@@ -872,8 +822,6 @@ def test_log_flood_of_old_lines_blocks_nobody_and_detection_resumes():
     assert peak < 200_000, f"agent peaked at {peak} kB"
 
 
-# -- central under concurrency and hostile fields ----------------------------------------------------------------------
-
 def test_concurrent_customer_posts_lose_nothing():
     wanted = [f"198.18.7.{i}" for i in range(1, 25)]
     with concurrent.futures.ThreadPoolExecutor(12) as pool:
@@ -888,7 +836,6 @@ def test_concurrent_customer_posts_lose_nothing():
 
 
 def test_hostile_text_in_an_event_does_not_stall_ingest():
-    """Evidence is log text. A byte the database cannot store must not refuse the batch, or every later event is stuck."""
     body = {"cpu_pct": 1, "memory_pct": 1, "net_kbps": 1, "latency_ms": 1,
             "events": [{"rule": "web_probe", "ip": ATTACKER, "action": "alert", "evidence": "nul\x00byte ' -- \U0001f600"}]}
     r = requests.post(CENTRAL + "/api/ingest", json=body, headers={"X-API-Key": NODE["key"]}, timeout=20)
@@ -897,15 +844,12 @@ def test_hostile_text_in_an_event_does_not_stall_ingest():
     assert agent_pid(), "no agent is running"
 
 
-# -- anomaly path ------------------------------------------------------------------------------------------------------
-
 ANOMALY_ON = {"NEXUS_RULE_ANOMALY_BLOCK": "1"}
 
 
 def test_anomaly_slow_ssh_attacker_under_the_rule_threshold_gets_a_real_block():
     fresh_agent(env=ANOMALY_ON)
     t0 = time.time()
-    # Eight different usernames: below the 10 tries the ssh_bruteforce rule needs.
     for user in ("oracle", "postgres", "ftp", "guest", "hadoop", "jenkins", "minecraft", "support"):
         if port_blocked(ATTACKER, SSH_PORT):
             break
@@ -921,7 +865,6 @@ def test_anomaly_slow_ssh_attacker_under_the_rule_threshold_gets_a_real_block():
 def test_anomaly_few_probes_under_the_rule_threshold_get_a_real_block_and_customer_is_unharmed():
     fresh_agent(env=ANOMALY_ON)
     t0 = time.time()
-    # A rule needs 10 listed paths. Six, sent by a client that fetches nothing else.
     probe("attacker", PROBES[:6])
     wait(lambda: port_blocked(ATTACKER, WEB_PORT), 30, "the attacker blocked on the web ports by the anomaly path")
     wait(lambda: events(t0, ip=ATTACKER, rule="anomaly_web"), 20, "anomaly_web on the panel")

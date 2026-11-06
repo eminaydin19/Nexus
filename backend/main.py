@@ -60,7 +60,6 @@ _now = time.monotonic
 
 
 async def _continuous_learning() -> None:
-    # Hourly attempts while no model exists; with a model, at most one attempt (even a failed one) per day.
     last_attempt: float | None = None
     while True:
         await asyncio.sleep(RETRAIN_CHECK_SECONDS)
@@ -136,14 +135,10 @@ async def lifespan(app: FastAPI):
                 await background
 
 
-# The API docs pages load scripts from a CDN, which the panel's Content-Security-Policy forbids.
 app = FastAPI(title="Nexus", version="2.0.0", lifespan=lifespan, docs_url=None, redoc_url=None)
-
-# Middleware order: the last one added is outermost, so requests hit the rate limiter first.
 
 
 def basic_exempt_paths() -> tuple[str, ...]:
-    # These authenticate with an agent key or enroll token instead of dashboard credentials.
     return ("/healthz", "/api/ingest", "/api/agents/enroll", "/install-agent.sh", "/agent.tar.gz")
 
 
@@ -176,7 +171,6 @@ MAX_JSON_FIELD_BYTES = 8192
 
 
 def _sane_ts(ts: float | None, now: float) -> float:
-    # A wrong agent clock must not write rows far in the past or future, where retention and charts would lose them.
     return now if ts is None or abs(ts - now) > MAX_CLOCK_SKEW_SECONDS else ts
 
 
@@ -185,7 +179,6 @@ def _canonical_ip(value: str) -> str:
 
 
 def _storable(value):
-    # Log text can hold a NUL or a lone surrogate. Postgres refuses both, and a refused batch would block every later event.
     return value.replace("\x00", "").encode("utf-8", "replace").decode() if isinstance(value, str) else value
 
 
@@ -245,9 +238,7 @@ class IngestPayload(BaseModel):
 
 
 def _apply_ingest(node_id: str, payload: IngestPayload, now: float) -> tuple[list[dict], list[dict]]:
-    """Persist what the agent reported and return (stored events, commands still pending)."""
     with SessionLocal() as db:
-        # Ack first so a command acknowledged in this request is never sent back.
         ack(db, node_id, payload.acked_commands)
         agent = db.get(Agent, node_id)
         if payload.version is not None:
@@ -283,7 +274,6 @@ async def healthz():
 
 @app.get("/install-agent.sh")
 def install_agent_script():
-    # settings.public_url only: a request's Host header could make a victim's server enroll with an attacker.
     script = (ROOT_DIR / "install-agent.sh").read_text().replace("__NEXUS_PUBLIC_URL__", settings.public_url, 1)
     return Response(script, media_type="text/x-shellscript", headers={"Cache-Control": "no-store"})
 

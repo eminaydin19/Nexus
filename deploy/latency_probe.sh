@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Optional, for INGESTION_SOURCE=cloudwatch only: publishes the request latency central reads from CloudWatch.
-# Usage: latency_probe.sh <url> [interval-seconds]
 set -euo pipefail
 
 url="${1:?usage: latency_probe.sh <url> [interval-seconds]}"

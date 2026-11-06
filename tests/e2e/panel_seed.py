@@ -1,9 +1,3 @@
-"""Real example data for the panel test: enrolls agents over the API and keeps them checking in like real ones.
-
-History a live agent cannot produce on demand (eight-day-old enrollment, an hour of metrics) goes straight to the DB.
-The XSS rows with a bad `ip` also go straight to the DB, because ingest validates addresses.
-"""
-
 import os
 import random
 import sys

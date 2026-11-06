@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Nexus central installer. Run from a checkout: ./install.sh [--domain nexus.example.com]
-# Nothing runs until the last line, and a cut anywhere in that line is a syntax error, so a truncated download changes nothing.
 
 DEFAULT_PROJECT="nexus-defense"
 REPO_DIR=""
@@ -45,7 +43,6 @@ parse_args() {
     done
 }
 
-# Compose finds its files relative to the directory, so only this subshell ever leaves /.
 compose() {
     (cd "$REPO_DIR" && docker compose "$@")
 }
@@ -93,7 +90,6 @@ resolve_project() {
     PROJECT="${PROJECT:-$DEFAULT_PROJECT}"
 }
 
-# Same project name from another directory: compose would replace those containers and take over their volumes.
 check_project_owner() {
     local dir real
     while IFS= read -r dir; do
@@ -134,7 +130,6 @@ port_busy() {
 
 check_ports() {
     local port
-    # On a re-run those ports belong to our own Caddy.
     [ -z "$(compose --profile https ps -q --status running caddy 2>/dev/null)" ] || return 0
     for port in 80 443; do
         ! port_busy "$port" || die "port $port is already in use; Caddy needs ports 80 and 443 for HTTPS"
@@ -174,7 +169,6 @@ apply_domain_settings() {
     fi
 }
 
-# A re-run without --domain keeps the operator's choices. It only fills in what the no-domain path cannot do without.
 keep_existing_settings() {
     [ -z "$DOMAIN" ] || return 0
     env_default TRUST_PROXY_HEADERS false
@@ -205,7 +199,6 @@ write_env() {
 }
 
 start() {
-    # Only ever up: down -v or a volume prune would destroy the customer's data on a re-run.
     compose up -d --build --wait --wait-timeout 300 ||
         die "the containers did not become healthy; see: docker compose logs nexus. The dashboard password is stored in $ENV_FILE"
 }
@@ -265,7 +258,6 @@ main() {
     parse_args "$@"
     REPO_DIR="$(cd "$source_dir" && pwd -P)"
     ENV_FILE="$REPO_DIR/.env"
-    # Python puts the current directory on sys.path, and this may run as root: a planted secrets.py would run.
     cd /
     [ -f "$REPO_DIR/docker-compose.yml" ] ||
         die "run this from a Nexus checkout: git clone https://github.com/eminaydin19/Nexus.git && cd Nexus && ./install.sh"

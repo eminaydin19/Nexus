@@ -33,7 +33,6 @@ export const blockAddress = (block) => (isServerWide(block) ? "Server-wide" : bl
 
 const portsText = (ports) => `${ports.length === 1 ? "port" : "ports"} ${ports.join(", ")}`;
 const capital = (s) => s[0].toUpperCase() + s.slice(1);
-/* Keeps acronyms and raw rule codes as they are. */
 const inSentence = (name) => (/^[A-Z][a-z]/.test(name) ? name[0].toLowerCase() + name.slice(1) : name);
 
 export function blockScope(block, left) {
@@ -69,7 +68,6 @@ function eventPill(e) {
 
 export const isAnomaly = (row) => "culprit" in row;
 
-/* One event or ML anomaly as the same row content. Anomalies never block, so they say so. */
 export function describeRow(row) {
   if (isAnomaly(row)) {
     const score = row.scores?.ensemble;

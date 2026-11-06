@@ -44,7 +44,6 @@ function attentionRow(a, now) {
   return h("li", "row attention", pill(c.p), body, h("div", "acts", link));
 }
 
-/* The one row shape for events, on Overview and on Events. Everything here may be attacker text. */
 export function eventRow(row, ctx, action) {
   const d = describeRow(row);
   const detail = h("div", "stack", h("div", "what", d.what), h("div", "meta", h("span", "who", d.who), d.code ? " " : null, d.code ? h("span", "code", d.code) : null), d.evidence ? h("div", "ev", d.evidence) : null);

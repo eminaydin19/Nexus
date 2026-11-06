@@ -1,15 +1,10 @@
-"""Simulated server traffic as real log lines, so they pass through the agent's real parsers.
-
-Every source is labeled. Customers include the hard cases the top rule cares about: an admin mistyping a password, a
-key-juggling SSH client, someone forgetting a web password, and a developer poking at /.env.
-"""
 from __future__ import annotations
 
 import random
 import time
 from typing import Iterator, List, Tuple
 
-Record = Tuple[float, str, str, str, str]  # ts, source, line, label, ip
+Record = Tuple[float, str, str, str, str]
 
 DAY = 86400.0
 START = 1_780_000_000.0
@@ -71,8 +66,6 @@ class _Sim:
         port = self.rng.randrange(1024, 65535)
         self.ssh(ts, ip, "Connection closed by authenticating user %s %s port %d [preauth]" % (user, ip, port), label)
 
-    # -- customers ---------------------------------------------------------
-
     def browser_session(self, ip=None, label="customer_browser", ts=None):
         r, ip, ts = self.rng, ip or self.ip(), ts or self.when()
         ua = r.choice(BROWSERS)
@@ -115,7 +108,6 @@ class _Sim:
             ts += r.uniform(4, 45)
 
     def admin_keys(self):
-        # A client offering wrong keys, then giving up and retrying: same user, seconds apart.
         r, ip, ts = self.rng, self.ip(), self.when()
         user = r.choice(("emin", "root", "deploy"))
         for _ in range(r.randint(3, 6)):
@@ -123,13 +115,10 @@ class _Sim:
             ts += r.uniform(2, 120)
 
     def admin_wrong_user(self):
-        # Trying a few usernames on a server whose account name was forgotten.
         r, ip, ts = self.rng, self.ip(), self.when()
         for user in r.sample(("emin", "eminaydin", "ubuntu", "admin"), r.randint(3, 4)):
             self.try_invalid(ts, ip, user, "customer_ssh_wrong_user")
             ts += r.uniform(8, 120)
-
-    # -- attacks -----------------------------------------------------------
 
     def ssh_fast(self):
         r, ip, ts = self.rng, self.ip(), self.when()
@@ -170,7 +159,6 @@ class _Sim:
             ts += r.uniform(0.05, 0.5)
 
     def web_spa_scan(self):
-        # The pattern measured on the real server: scanning for files, and the app answers 200 to everything.
         r, ip, ts = self.rng, self.ip(), self.when()
         for path in r.sample(PROBES, r.randint(4, 15)):
             self.web(ts, ip, "GET", path, 200, r.choice(("curl/8.5", "python-requests/2.31", "-")), "attack_web_spa_scan")
@@ -191,7 +179,6 @@ class _Sim:
 
 
 def simulate(seed: int, days: int = 7, customers: int = 300, attacks: int = 40) -> List[Record]:
-    """Time-ordered records. Counts are per kind: `customers` browser sessions and a share of each harder kind."""
     sim = _Sim(seed, days)
     for _ in range(customers):
         sim.browser_session()

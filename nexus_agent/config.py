@@ -53,7 +53,6 @@ def _sshd_ports(path: str, seen: Optional[set] = None) -> Tuple[int, ...]:
                     ports.append(int(m.group(1)))
                 inc = _SSHD_INCLUDE.match(line.split("#", 1)[0].rstrip())
                 for pattern in inc.group(1).split() if inc else ():
-                    # sshd resolves relative includes against /etc/ssh, the main config's directory.
                     pattern = os.path.join(os.path.dirname(real), pattern.strip(chr(34)))
                     for found in sorted(glob.glob(pattern)):
                         ports.extend(_sshd_ports(found, seen))
@@ -83,7 +82,6 @@ class AgentConfig:
             raise ValueError("NEXUS_URL and NEXUS_API_KEY must be set")
         max_mode = env.get("NEXUS_MAX_MODE", "enforce").strip()
         if max_mode not in MODES:
-            # A typo in the local safety limit must not silently leave enforce allowed.
             raise ValueError("NEXUS_MAX_MODE must be one of %s" % ", ".join(MODES))
         rules = RuleConfig.from_env(env)
         rules.ssh_ports = tuple(sorted(set(_ports("NEXUS_SSH_PORTS", env.get("NEXUS_SSH_PORTS")) or rules.ssh_ports)
@@ -119,7 +117,7 @@ def read_gateways(path: str = "/proc/net/route") -> List[str]:
                 if len(cols) < 4 or cols[1] != "00000000":
                     continue
                 try:
-                    if int(cols[3], 16) & 2:  # RTF_GATEWAY
+                    if int(cols[3], 16) & 2:
                         out.append(socket.inet_ntoa(struct.pack("<L", int(cols[2], 16))))
                 except (ValueError, struct.error):
                     continue
@@ -153,7 +151,6 @@ def resolve_host(host: Optional[str], timeout: float = 2.0, getaddrinfo=socket.g
         except Exception as exc:
             log.warning("cannot resolve central host: %s", exc)
 
-    # A daemon thread, because getaddrinfo has no timeout and a pool would hold process exit on a hung lookup.
     t = threading.Thread(target=work, daemon=True, name="nexus-resolve")
     t.start()
     t.join(timeout)

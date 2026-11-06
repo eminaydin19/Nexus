@@ -1,5 +1,3 @@
-# Attack and customer scenarios. tests/e2e/run.sh owns this project; never bring it up under another name.
-# 203.0.113.0/24 is routable as far as the Protector knows, so no address here is exempt from blocking by range.
 name: nexus-scenarios
 
 x-tool: &tool
@@ -22,8 +20,6 @@ services:
       DASHBOARD_USER: admin
       DASHBOARD_PASSWORD: e2e-dashboard-password
       DATABASE_URL: ${E2E_DATABASE_URL:-}
-      # Every anomaly counts as critical, so the "critical score blocks nobody" scenario does not depend on what a short
-      # training run on this stack's mixed traffic can reach.
       CRITICAL_SCORE: "0.5"
     volumes:
       - central-data:/data

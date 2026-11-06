@@ -1,5 +1,3 @@
-"""Read models for the web panel, plus the one write that spans every server."""
-
 import ipaddress
 import time
 from typing import Annotated
@@ -25,7 +23,6 @@ router = APIRouter(prefix="/api")
 
 
 def _network(ip: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
-    """The range a block on this address covers. None for text that is not an address."""
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -36,7 +33,6 @@ def _network(ip: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
 
 
 def _cover(ip: str) -> str:
-    """How an address is shown: IPv6 as the /64 a block on it actually covers."""
     network = _network(ip)
     return str(network) if network is not None and network.version == 6 else ip
 
@@ -77,7 +73,6 @@ def events(
 
 
 def _evidence_by_block(db: Session, now: float) -> dict[tuple, str]:
-    # Blocks live at most a day, so a day of events holds the line behind each one; ascending ts leaves the newest.
     rows = (
         db.query(SecurityEvent.node_id, SecurityEvent.rule, SecurityEvent.ip, SecurityEvent.evidence)
         .filter(SecurityEvent.ts >= now - DAY_SECONDS)
@@ -135,7 +130,6 @@ def watch_summary(db: Session, agent: Agent, now: float, pending_commands: list[
     )
     allowlist = agent.allowlist or []
     covered = {g.ip: _covered(_network(g.ip), allowlist) for g in groups}
-    # What enforcing would newly do: allowlisted addresses are never blocked, and a server-wide row is not an address.
     reviewable = [g for g in groups if not covered[g.ip] and g.ip not in SERVER_WIDE_ADDRESSES]
     blocks = [g for g in reviewable if g.action in BLOCK_ACTIONS]
     limits = [g for g in reviewable if g.action == "rate_limit"]
@@ -205,7 +199,6 @@ def _attention(view: dict, now: float) -> list[dict]:
         return {"type": kind, "node_id": view["node_id"], "name": view["name"], **extra}
 
     if view["status"] in ("offline", "never"):
-        # An offline agent's last report is stale, so only the silence itself is worth a call.
         return [item("offline", last_seen=view["last_seen"], created_at=view["created_at"])]
     config = view["config"] or {}
     found = []
@@ -286,14 +279,12 @@ def _customer_network(text: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
             network = ipaddress.ip_network(text, strict=False)
         except ValueError:
             return None
-        # An IPv6 block covers the whole /64, so anything narrower would leave the customer blockable through a neighbour.
         if network.version == 6 and network.prefixlen > 64:
             network = network.supernet(new_prefix=64)
     return None if network is None or network.network_address.is_unspecified else network
 
 
 def _on_every_server(db: Session, change) -> tuple[list[str], list[str]]:
-    """One transaction under the allowlist lock; a savepoint per server keeps one failure from undoing the others."""
     sent, failed = [], []
     with ALLOWLIST_LOCK:
         for agent in _live_agents(db, for_update=True):
@@ -320,7 +311,6 @@ def mark_customer(body: CustomerRequest, db: Session = Depends(_db)):
     if network is None:
         raise HTTPException(400, "invalid IP address or range")
     entry = str(network)
-    # A range names no single address, so its blocks are lifted by the agent when the new allowlist arrives.
     address = None
     if "/" not in body.ip:
         address = str(network.network_address) if network.version == 4 else str(ipaddress.ip_address(body.ip))

@@ -22,9 +22,7 @@ MAX_ALLOWLIST = 1000
 NODE_ID_PATTERN = r"^[A-Za-z0-9._:@-]+$"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:@-]")
 _ENROLL_ATTEMPTS = 5
-# Outlasts the agent's worst healthy gap: 60 s of backoff plus one send stalling for 20 s.
 OFFLINE_AFTER_SECONDS = 90
-# Serializes allowlist read-modify-writes. Enough with SQLite only because the Dockerfile runs one uvicorn worker.
 ALLOWLIST_LOCK = threading.Lock()
 
 
@@ -56,7 +54,6 @@ def enroll(db: Session, token: str, hostname: str) -> tuple[str, str]:
     token_hash = _hash(token)
     for _ in range(_ENROLL_ATTEMPTS):
         now = time.time()
-        # The conditional UPDATE is the single-use gate: only one concurrent caller sees rowcount 1.
         claimed = db.execute(
             update(EnrollToken)
             .where(
@@ -76,7 +73,6 @@ def enroll(db: Session, token: str, hostname: str) -> tuple[str, str]:
         try:
             db.commit()
         except IntegrityError:
-            # Another enrollment took the same node_id between check and insert; retry with a new suffix.
             db.rollback()
             continue
         return node_id, api_key
@@ -125,7 +121,6 @@ def _status(agent: Agent, now: float) -> str:
 
 
 def server_view(agent: Agent, now: float, pending_commands: dict[str, list[dict]]) -> dict:
-    """agent.mode is what was requested; config.mode is what the agent says it is really doing."""
     reported = (agent.config or {}).get("mode")
     return {
         **agent.as_dict(),

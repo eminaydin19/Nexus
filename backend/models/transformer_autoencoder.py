@@ -18,10 +18,8 @@ class _PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x is [batch, seq_len, d_model]
-        # pe is [max_len, 1, d_model]
         pe = self.pe[:x.size(1)]
-        pe = pe.transpose(0, 1) # [1, seq_len, d_model]
+        pe = pe.transpose(0, 1)
         return x + pe
 
 

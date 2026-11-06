@@ -1,7 +1,3 @@
-"""Integration tests against the real kernel. Run with: scripts/test.sh --nft
-
-Guarded by NEXUS_NFT_TESTS so a developer running pytest as root on a real host never touches its firewall.
-"""
 from __future__ import annotations
 
 import json
@@ -198,11 +194,11 @@ def test_restart_keeps_blocks(net):
     second = net.enforcer()
     assert second.setup()
     got = second.active()
-    assert [(b.ip, b.ports, b.rule) for b in got] == [(CLI4, [22, 80], "test_rule")]  # the kernel keeps why, in the element comment
+    assert [(b.ip, b.ports, b.rule) for b in got] == [(CLI4, [22, 80], "test_rule")]
     assert not net.connect(SRV4, 22, CLI4)
     after = net.nft("-j", "list", "chain", "inet", "nexus", "prerouting").stdout
     assert len(json.loads(after)["nftables"]) == len(json.loads(before)["nftables"])
-    assert second.apply(dec(ip="10.9.0.9")).ok  # still usable after restart
+    assert second.apply(dec(ip="10.9.0.9")).ok
 
 
 def test_breaker_state_seeded_after_restart(net):
@@ -250,7 +246,7 @@ def test_block_applies_before_dnat(net):
     assert enf.setup()
     assert net.connect(SRV4, 2222, CLI4)
     assert enf.apply(dec(ports=(9090,))).ok
-    assert net.connect(SRV4, 2222, CLI4)  # the rule sees the published port, not the DNAT target
+    assert net.connect(SRV4, 2222, CLI4)
     assert enf.apply(dec(ports=(2222,))).ok
     assert not net.connect(SRV4, 2222, CLI4)
 
@@ -285,7 +281,6 @@ def test_rate_limit_is_per_ip_and_not_a_block(net):
     assert enf.apply(dec("rate_limit", ip=CLI4B, ports=())).ok
     assert net.connect(SRV4, 8080, CLI4)
     out = ns_run(CLI, sys.executable, "-c", FLOOD, CLI4, SRV4, CLI4B).stdout.split()
-    # a shared limit would starve the second address while the first one floods
     assert 0 < int(out[0]) < 450 and out[1] == "True"
 
 

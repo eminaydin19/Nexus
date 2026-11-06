@@ -5,7 +5,6 @@ import { modeState, serverName } from "./wording.js";
 
 const EVERYWHERE = "";
 
-/* Read first, right before writing, so entries added elsewhere since this page last refreshed are never wiped. */
 async function changeAllowlist(nodeId, change) {
   const { agents } = await api.agents();
   const server = agents.find((a) => a.node_id === nodeId);

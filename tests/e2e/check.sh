@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Runs inside a systemd container against a live central. Needs CENTRAL and PASSWORD.
 set -uo pipefail
 
 FAILS=0
@@ -121,7 +120,6 @@ HELD_PORT="$(cat /root/held_port)"
 
 logger -t nexus-e2e "journal-sentinel-$HELD_PORT"
 logger -p authpriv.info -t sshd "auth-sentinel-$HELD_PORT"
-# The agent asks journalctl for -u ssh -u sshd, so the sentinel has to come from a unit of that name.
 systemd-run --quiet --wait --unit=sshd --service-type=oneshot echo "unit-sentinel-$HELD_PORT"
 AUTH_LOG=/var/log/auth.log
 [ -e "$AUTH_LOG" ] || AUTH_LOG=/var/log/secure

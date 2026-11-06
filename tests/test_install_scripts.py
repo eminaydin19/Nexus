@@ -31,9 +31,6 @@ def stub(directory, name, body="exit 0"):
     return path
 
 
-# -- compose and image ------------------------------------------------------
-
-
 def compose(name="docker-compose.yml"):
     return yaml.safe_load(read(name))
 
@@ -52,7 +49,6 @@ def test_local_override_binds_loopback_by_default():
 
 def test_compose_pins_images_and_project_name():
     cfg = compose()
-    # Distinctive, or another stack named "nexus" (Sonatype, say) would take over these containers and volumes.
     assert cfg["name"] == "nexus-defense"
     for service in cfg["services"].values():
         tag = service["image"].rpartition(":")[2]
@@ -66,9 +62,6 @@ def test_image_ships_what_the_endpoints_serve():
     ignore = read(".dockerignore").split()
     assert "**/__pycache__" in ignore
     assert "psycopg[binary]" in read("requirements.txt")
-
-
-# -- endpoints --------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -162,12 +155,8 @@ def test_agent_tarball_is_stable(client):
     assert client.get("/agent.tar.gz").content == client.get("/agent.tar.gz").content
 
 
-# -- install.sh -------------------------------------------------------------
-
-
 @pytest.fixture
 def central(tmp_path):
-    """A checkout copy with a docker stub that logs its arguments."""
     shutil.copy(ROOT / "install.sh", tmp_path)
     shutil.copy(ROOT / "docker-compose.yml", tmp_path)
     bin_dir = tmp_path / "bin"
@@ -354,7 +343,7 @@ def test_install_from_a_hostile_cwd_runs_nothing_from_it(central, tmp_path_facto
     marker = hostile / "RAN"
     for name in ("secrets", "venv", "pip", "os"):
         (hostile / f"{name}.py").write_text(f"open({str(marker)!r}, 'w')\n")
-    stub(central / "bin", "openssl", "exit 1")  # force the Python path
+    stub(central / "bin", "openssl", "exit 1")
     env = {"PATH": f"{central}/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(central)}
     r = subprocess.run(["/bin/bash", str(central / "install.sh")], cwd=hostile, env=env, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, timeout=30)
@@ -365,7 +354,7 @@ def test_install_from_a_hostile_cwd_runs_nothing_from_it(central, tmp_path_facto
 
 
 def test_non_tty_does_not_prompt(central):
-    r = run_install(central)  # stdin is /dev/null; a prompt would take the empty answer silently
+    r = run_install(central)
     assert "domain" not in r.stdout.split("Nexus is running")[0].lower()
 
 
@@ -432,11 +421,7 @@ def test_install_never_prompts_for_aws():
     assert "get.docker.com" not in text
 
 
-# -- install-agent.sh -------------------------------------------------------
-
-
 def agent_shell(tmp_path, body, path=None, env=None, timeout=30):
-    """Source the installer without its last line, point its paths into tmp_path, then run body."""
     lib = tmp_path / "lib.sh"
     lib.write_text("".join(read("install-agent.sh").splitlines(True)[:-1]))
     prelude = f"""
@@ -608,7 +593,7 @@ def test_python_search_prefers_plain_python3(tmp_path):
 def test_venv_package_follows_family_and_interpreter(tmp_path, manager, python, package):
     bin_dir = tmp_path / "bin"
     log = tmp_path / "pkg.log"
-    stub(bin_dir, python, "exit 1")  # the venv module is missing
+    stub(bin_dir, python, "exit 1")
     stub(bin_dir, "nft")
     stub(bin_dir, manager, f'echo "$*" >> {log}')
     r = agent_shell(tmp_path, f"PYTHON={python}; ensure_packages", path=str(bin_dir))
@@ -619,7 +604,7 @@ def test_venv_package_follows_family_and_interpreter(tmp_path, manager, python, 
 def test_venv_check_uses_the_chosen_interpreter(tmp_path):
     bin_dir = tmp_path / "bin"
     log = tmp_path / "pkg.log"
-    stub(bin_dir, "python3", "exit 1")  # would say venv is missing
+    stub(bin_dir, "python3", "exit 1")
     stub(bin_dir, "python3.9")
     stub(bin_dir, "nft")
     stub(bin_dir, "apt-get", f'echo "$*" >> {log}')
@@ -725,7 +710,7 @@ def test_env_token_wins_over_flag(tmp_path):
 
 def test_other_distro_gets_instructions_and_nothing_changes(tmp_path):
     bin_dir = tmp_path / "bin"
-    stub(bin_dir, "python3", "exit 1")  # no ensurepip, no apt, no dnf, no nft on this PATH
+    stub(bin_dir, "python3", "exit 1")
     r = agent_shell(tmp_path, "ensure_packages; echo CONTINUED", path=str(bin_dir))
     assert r.returncode != 0 and "CONTINUED" not in r.stdout
     assert "python3-venv" in r.stderr and "nftables" in r.stderr
@@ -810,7 +795,6 @@ def test_uninstall_works_when_partly_installed(tmp_path):
     for tool in ("systemctl", "userdel"):
         stub(bin_dir, tool, f'echo "{tool} $*" >> {log}')
     getent_says(tmp_path, MARKED)
-    # The venv is gone, so the table must still go through nft itself.
     stub(bin_dir, "nft", f'echo "nft $*" >> {log}; exit 0')
     (tmp_path / "state").mkdir()
     (tmp_path / "opt").mkdir()
@@ -840,7 +824,6 @@ def test_uninstall_runs_agent_uninstall_after_stop(tmp_path):
     calls = log.read_text().splitlines()
     stop = calls.index("systemctl stop nexus-agent")
     teardown = calls.index("python -m nexus_agent uninstall")
-    # A running enforcing agent would recreate the table right after it was deleted.
     assert stop < teardown
 
 
@@ -860,7 +843,6 @@ def test_enroll_command_has_no_token_argument():
 
 
 def full_flow_lib(tmp_path):
-    """Everything real except what needs root, systemd or central. The fake package answers enroll."""
     return f"""
 require_root() {{ :; }}; require_systemd() {{ :; }}; require_curl() {{ :; }}; ensure_user() {{ :; }}; ensure_packages() {{ :; }}
 check_existing_user() {{ :; }}; start_service() {{ :; }}; wait_for_report() {{ :; }}; report() {{ echo REPORTED; }}
@@ -966,9 +948,6 @@ def test_report_does_not_claim_reporting_without_proof(tmp_path, state):
     assert "journalctl -u nexus-agent" in r.stdout
 
 
-# -- truncation -------------------------------------------------------------
-
-
 @pytest.mark.parametrize("script", ["install.sh", "install-agent.sh"])
 def test_last_line_is_the_only_entry(script):
     assert read(script).rstrip("\n").splitlines()[-1] == '{ main "$@"; }'
@@ -983,8 +962,6 @@ def test_truncated_download_runs_nothing(tmp_path, script):
         stub(bin_dir, tool, f'echo "{tool}" >> {log}')
     text = read(script)
     body = text.encode()
-    # Every line end, and every byte of the last line: `main` alone would run with its arguments lost.
-    # Only the final newline may be missing, since the whole script has arrived by then.
     cuts = {m.end() for m in re.finditer(rb"\n", body)} | set(range(len(body) - 20, len(body)))
     cuts -= {len(body), len(body) - 1}
     target = tmp_path / "cut.sh"
@@ -994,9 +971,6 @@ def test_truncated_download_runs_nothing(tmp_path, script):
                            capture_output=True, text=True, cwd=tmp_path, timeout=10)
         assert not log.exists(), f"{script} cut at byte {cut} ran {log.read_text()}"
         assert r.stdout == "", f"{script} cut at byte {cut} printed {r.stdout!r}"
-
-
-# -- unit and other deploy files --------------------------------------------
 
 
 def test_embedded_unit_matches_deploy_file():
@@ -1046,7 +1020,6 @@ def test_cloudwatch_config_matches_what_central_queries():
     assert cfg["metrics"]["namespace"] == defaults["cloudwatch_memory_namespace"].default
     assert defaults["cloudwatch_memory_metric"].default in cfg["metrics"]["metrics_collected"]["mem"]["measurement"]
     assert cfg["metrics"]["append_dimensions"] == {"InstanceId": "${aws:InstanceId}"}
-    # Central queries by InstanceId alone; a host dimension would make every lookup miss.
     assert cfg["agent"]["omit_hostname"] is True
     probe = read("deploy/latency_probe.sh")
     assert defaults["cloudwatch_latency_namespace"].default in probe
@@ -1060,11 +1033,7 @@ def test_default_path_never_needs_aws():
     assert "cloudwatch" not in read("install-agent.sh").lower()
 
 
-# -- shellcheck -------------------------------------------------------------
-
-
 def test_shellcheck_clean():
-    # No skip: this image has it (Dockerfile.test) and CI installs it, so a missing binary must fail.
     assert shutil.which("shellcheck"), "shellcheck is not installed"
     files = ["install.sh", "install-agent.sh", "deploy/latency_probe.sh", "scripts/test.sh", "tests/e2e/install.sh", "tests/e2e/run.sh",
              "tests/e2e/check.sh"]

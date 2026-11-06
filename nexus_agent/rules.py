@@ -28,7 +28,6 @@ FLOOD_RATIO = 5
 FLOOD_MIN_TOTAL = 1000
 FLOOD_ALPHA = 0.05
 MIN_WINDOW_EVENTS = 1000
-# Scanners send hundreds of different URLs; a developer pasting code into a search box sends a few, and refreshes.
 EXPLOIT_MIN_REQUESTS = 5
 NEW_CONN_SUSTAINED_SAMPLES = 2
 EVIDENCE_LINES = 3
@@ -65,7 +64,6 @@ _EXPLOIT = tuple(re.compile(p, re.I) for p in _load_lines("exploit_patterns.txt"
 
 
 def _ident(ip: str) -> str:
-    # An IPv6 block is applied at /64, so a source can rotate inside it; track the whole prefix as one source.
     if ":" not in ip:
         return ip
     try:
@@ -75,7 +73,6 @@ def _ident(ip: str) -> str:
 
 
 def _decode(s: str) -> str:
-    # Bounded, because a request can be encoded any number of times; errors="replace" keeps invalid UTF-8 from raising.
     for _ in range(MAX_DECODES):
         d = unquote_plus(s, errors="replace")
         if d == s:
@@ -93,7 +90,7 @@ def exploit_hits(path_and_query: str) -> Tuple[int, ...]:
 class Decision:
     rule: str
     ip: str
-    action: str  # "block_port" | "block_all" | "rate_limit" | "alert"
+    action: str
     ports: Tuple[int, ...]
     ttl: int
     evidence: str
@@ -168,7 +165,6 @@ class RuleEngine:
         self._login = frozenset(p.rstrip("/") for p in cfg.login_paths)
         self._behind_cdn = False
         self._seq = itertools.count()
-        # (rule, ip) -> deque of (ts, keys, raw); OrderedDict order is least-recently-seen first.
         self._win = OrderedDict()  # type: OrderedDict
         self._active = OrderedDict()  # type: OrderedDict  # (rule, ip) -> expiry of its last Decision
         self._offense = OrderedDict()  # type: OrderedDict  # (rule, ip) -> [count, last_ts]
@@ -201,7 +197,6 @@ class RuleEngine:
                 return []
             if event.kind == "ssh_fail":
                 self._mark_bad(event.ip)
-                # No trust multiplier: web traffic is cheap to farm and says nothing about who owns SSH access.
                 out = self._hit("ssh_bruteforce", event.ip, (self._ssh_key(event),), event.raw, self._cfg.ssh_fail_threshold,
                                 tag=event.password_try)
                 user = _SSH_USER.search(event.raw)
@@ -211,7 +206,6 @@ class RuleEngine:
             if event.kind == "web":
                 out = self._web(event)
                 if event.via_proxy:
-                    # Blocking the client's address at the firewall would do nothing, and the proxy's would cut off everyone.
                     return [Decision(d.rule, d.ip, "alert", (), 0, d.evidence) for d in out]
                 return out
             return []
@@ -222,8 +216,6 @@ class RuleEngine:
             return self._hit("port_scan", ip, (port,), "port %d" % port, self._cfg.scan_ports)
 
     def _ssh_key(self, event: LogEvent) -> tuple:
-        # One wrong password logs "Failed" and then "Connection closed", and an unknown user adds "Invalid user" too:
-        # all one try. Keys that repeat on a connection count once; only further "Failed" lines on it add a try.
         if event.src_port is None:
             return (next(self._seq),)
         dq = self._win.get(("ssh_bruteforce", _ident(event.ip)), ())
@@ -241,7 +233,6 @@ class RuleEngine:
             for ip, n in per_ip.items():
                 if n >= self._cfg.max_conn_per_ip * self._p.threshold_multiplier(ip):
                     over[ip] = "%d concurrent connections" % n
-            # No trust multiplier here: a flood of real requests earns trust from its own first 20 answers.
             streak = {}  # type: Dict[str, int]
             for ip, rate in (new_per_sec or {}).items():
                 if rate >= self._cfg.max_new_conn_rate:
@@ -262,7 +253,6 @@ class RuleEngine:
             return out + self._flood(now, sum(per_ip.values()), syn_recv)
 
     def _flood(self, now: float, total: int, syn_recv: int) -> List[Decision]:
-        # Compare against the old average first: updating it first would let the spike dilute itself.
         avg = self._avg
         spike = avg is not None and total > FLOOD_RATIO * avg and total > FLOOD_MIN_TOTAL
         self._avg = float(total) if avg is None else avg + FLOOD_ALPHA * (total - avg)
@@ -282,7 +272,6 @@ class RuleEngine:
         out = self._web_rules(ev)
         path = ev.path.partition("?")[0]
         norm = path.rstrip("/")
-        # Status is ignored for a probe: an app that answers every path with 200 still shows who asked for /.env.
         evidence = (path.lower() in _PROBE_PATHS or bool(exploit_hits(ev.path))
                     or (ev.method == "POST" and norm in self._login and ev.status in (401, 403)))
         self._behavior.note_web(_ident(ev.ip), path, ev.status, ev.user_agent, evidence)
@@ -291,7 +280,6 @@ class RuleEngine:
         return self._anomaly("web", ev.ip, p.threshold_multiplier(ev.ip), ev.user_agent)
 
     def _anomaly(self, channel: str, ip: str, mult: int, ua: Optional[str]) -> List[Decision]:
-        """A block needs log evidence and odd behavior together, and passes every protection in _fire."""
         model = self._models.get(channel)
         ident = _ident(ip)
         evidence = self._behavior.evidence(channel, ident)
@@ -316,8 +304,6 @@ class RuleEngine:
         norm = path.rstrip("/")
         trusted = mult > 1
         if ev.method == "POST" and norm in self._login:
-            # Stock WordPress answers a failed login with 200 and a good one with 302; other stacks give no
-            # reliable success signal, so trust there comes only from the plain-request rule.
             wp = norm == "/wp-login.php"
             if ev.status in (401, 403) or (wp and ev.status == 200):
                 self._mark_bad(ev.ip, trusted)
@@ -380,8 +366,6 @@ class RuleEngine:
             self.suppressed[why] += 1
             return []
         if rule == "port_scan":
-            # Closed-port SYN sources can be spoofed, so a scan alone never blocks: it needs handshake-proven bad
-            # activity from the same source, and never for an IP the Protector currently trusts.
             bad = self._bad.get(key[1])
             proven = bad is not None and now - bad[0] < WINDOW
             trusted = (self._p.threshold_multiplier(ip) > 1 or self._p.is_shared(ip)
@@ -392,7 +376,6 @@ class RuleEngine:
             self.suppressed["verified-bot"] += 1
             return []
         off = self._offense.get(key)
-        # A slowdown is no punishment: steady traffic from an office would otherwise grow it to a day.
         repeats = off[0] if off and now - off[1] < OFFENSE_MEMORY and rule != "conn_flood" else 0
         action, base = _RULES[rule], getattr(self._cfg, "ttl_" + rule)
         ttl = min(base * 2 ** min(repeats, 10), MAX_TTL)

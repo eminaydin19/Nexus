@@ -41,7 +41,6 @@ DRAIN_INTERVAL = 1
 MAX_BACKOFF = 60
 MAX_EVENTS = 5000
 MAX_LINES_PER_TICK = 20000
-# Ingest model limits; going over them gets the whole request refused.
 MAX_EVENTS_PER_SEND = 500
 MAX_ACKS_PER_SEND = 500
 MAX_PORTS = 16
@@ -59,8 +58,6 @@ SSH_STATE_INTERVAL = 60
 SSH_SILENCE_WARN = 3600
 LAST_SEND_SAVE_INTERVAL = 60
 JOURNAL_SOCKET = "/run/systemd/journal/socket"
-# sshd drops an unauthenticated connection after LoginGraceTime (120 s by default), so one that outlives this is a session.
-# shortcut: a longer LoginGraceTime lets a held unauthenticated connection pass as a session; read sshd_config if that shows up.
 SSH_SESSION_MIN_AGE = 150
 
 
@@ -100,15 +97,12 @@ class Agent:
         self._commands = deque()  # type: deque
         self._handlers = {"unblock": self._cmd_unblock, "allowlist": self._cmd_allowlist, "mode": self._cmd_mode}
 
-    # -- startup ------------------------------------------------------------
-
     def startup(self) -> None:
         mode, self._allow = load_state(self.cfg.state_dir) or ("observe", [])
         self.protector.set_allowlist(list(self.cfg.allowlist) + self._allow)
         self.protector.import_ssh_ok(load_ssh_ok(self.cfg.state_dir))
         self._saved_ssh = self.protector.export_ssh_ok()
         self._next_ssh_save = self.mono() + SSH_STATE_INTERVAL
-        # Before enforce: setup starts the scan log rule, and an unknown listening set would flag every open port.
         self._sample_connections()
         self._next_conn = self.mono() + CONN_INTERVAL
         self._state_mode = self._clamp(mode)
@@ -131,7 +125,6 @@ class Agent:
             self._rejected_reason = "no_nft"
             mode = "observe"
         elif mode == "enforce" and not self._listening:
-            # Until a sample succeeds every open port would look closed to the scan rule.
             self._await_sample = True
             mode = "observe"
         ok = self.enforcer.set_mode(mode)
@@ -159,8 +152,6 @@ class Agent:
         if sent is not None and (saved is None or sent - saved >= LAST_SEND_SAVE_INTERVAL):
             self._persist()
 
-    # -- commands -----------------------------------------------------------
-
     def handle_command(self, cmd: Command) -> None:
         with self._lock:
             if cmd.id in self._acks:
@@ -179,12 +170,11 @@ class Agent:
                 self._acks.append(cmd.id)
 
     def _cmd_unblock(self, payload: Dict) -> bool:
-        # Central keeps "::ffff:a.b.c.d" as sent, and the engine would read that form as an IPv6 /64.
         ip = normalize_ip(payload["ip"])
         if ip is None:
             raise ValueError("invalid ip")
         if not self.enforcer.remove(ip):
-            return False  # no ack, so central redelivers once the kernel answers again
+            return False
         self.engine.forget(ip)
         return True
 
@@ -193,13 +183,12 @@ class Agent:
         if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
             raise ValueError("ips must be a list of strings")
         self._allow = items
-        # Union: local env entries are the operator's own safety net, which central must not be able to remove.
         self.protector.set_allowlist(list(self.cfg.allowlist) + items)
         self._persist()
         nets = _parse_nets(items, "allowlist")
         blocks = self.enforcer.active(limit=None, strict=True)
         if blocks is None:
-            return False  # an unread kernel may still hold a block on an allowed customer, so central must retry
+            return False
         done = True
         for block in blocks:
             if self._now_allowed(block.ip, nets):
@@ -212,7 +201,6 @@ class Agent:
     def _now_allowed(self, ip: str, nets: list) -> bool:
         if self.protector.reason(ip):
             return True
-        # A v6 block is held as its /64 network address, which reason() cannot match to an allowed host inside it.
         if ":" not in ip:
             return False
         block = _parse_nets([ip + "/64"], "block")[0]
@@ -227,14 +215,11 @@ class Agent:
         self._persist()
         return True
 
-    # -- tick ---------------------------------------------------------------
-
     def tick(self) -> None:
         self.enforcer.retry_lift()
         while self._commands:
             self.handle_command(self._commands.popleft())
         self._process_lines()
-        # Here, not in the send thread, so a late send cannot overwrite a newer mode with its older copy.
         self._save_last_send_if_due()
         now = self.mono()
         if now >= self._next_ssh_save:
@@ -267,13 +252,10 @@ class Agent:
             else:
                 event = None
                 hit = parse_scan_line(line)
-                # An empty set means the sample failed, not that every port is closed.
                 if hit and self._listening and hit[1] not in self._listening:
                     self._apply(self.engine.feed_scan(hit[0], hit[1]))
             if event is None:
                 continue
-            # Off means no detection: engine state built now would suppress real decisions after switching back.
-            # A login still has to reach the Protector, or the customer loses recent-SSH trust while off.
             if not off:
                 self._apply(self.engine.feed(event))
             elif event.kind == "ssh_ok":
@@ -294,9 +276,7 @@ class Agent:
         return per_ip, syn_recv
 
     def _note_ssh_sessions(self, conns: list) -> None:
-        # An open connection proves nothing: one held before login would make its owner unblockable on every rule.
         now = self.mono()
-        # Connections older than this agent get the benefit of the doubt: a restart must not expose a long-running admin.
         default = now if self._ssh_seen is not None else now - SSH_SESSION_MIN_AGE
         seen = self._ssh_seen or {}
         self._ssh_seen = {peer: seen.get(peer, default) for peer in ssh_peers(self.cfg.rules.ssh_ports, conns)}
@@ -332,8 +312,6 @@ class Agent:
             self._behind_cdn = value
             self.engine.set_behind_cdn(value)
 
-    # -- decisions ----------------------------------------------------------
-
     def _apply(self, decisions: List[Decision]) -> None:
         for d in decisions:
             try:
@@ -350,7 +328,6 @@ class Agent:
             self._note_breaker()
 
     def _event(self, d: Decision, action: str, ports, ttl, simulated: bool, ok: bool) -> dict:
-        # A failed decision still has to fit the ingest model, or its bad field would get the whole batch refused.
         clean = [p for p in ports if isinstance(p, int) and 0 < p < 65536][:MAX_PORTS]
         return {
             "rule": d.rule,
@@ -380,10 +357,7 @@ class Agent:
                 self.events_dropped += 1
             self._events.append(event)
 
-    # -- sending ------------------------------------------------------------
-
     def send_once(self) -> float:
-        """Send one batch and return the seconds to wait before the next one."""
         with self._lock:
             batch = [self._events.popleft() for _ in range(min(MAX_EVENTS_PER_SEND, len(self._events)))]
             acks = self._acks[:MAX_ACKS_PER_SEND]
@@ -394,7 +368,6 @@ class Agent:
         except ClientError as exc:
             log.warning("central send failed: %s", exc)
             if exc.status in REJECTED_STATUSES:
-                # Retrying the same batch can never succeed and would stall every later event behind it.
                 with self._lock:
                     self.events_dropped += len(batch)
             else:
@@ -463,10 +436,7 @@ class Agent:
             "rules": rules,
         }
 
-    # -- threads ------------------------------------------------------------
-
     def _send_loop(self, stop: threading.Event) -> None:
-        # Its own thread: a blackholed central stalls a send for up to 20s, and detection must not wait for that.
         delay = SEND_INTERVAL
         while not stop.wait(delay):
             try:
@@ -485,7 +455,6 @@ class Agent:
             delay = CDN_REFRESH
 
     def _refresh_network(self) -> bool:
-        """False when any lookup came back empty, which is a reason to retry soon."""
         central, gateway, resolvers = resolve_host(urlsplit(self.cfg.url).hostname), read_gateways(), read_resolvers()
         self.protector.update_network(central, gateway, resolvers)
         return bool(central and gateway and resolvers)
@@ -534,7 +503,6 @@ def build_agent(cfg: AgentConfig) -> Agent:
     protector = Protector(central_ip=resolve_host(urlsplit(cfg.url).hostname), gateway=read_gateways(),
                           resolvers=read_resolvers())
     agent = Agent(cfg, client, protector, RuleEngine(cfg.rules, protector, models=load_models()), Enforcer("observe"))
-    # The binary alone proves nothing: containers and LXC ship it with no journald, which would leave scans unread.
     journalctl = shutil.which("journalctl") if os.path.exists(JOURNAL_SOCKET) else None
     agent.collectors = LogCollectors(agent.lines, web_logs=WEB_LOGS + cfg.web_logs, journalctl=journalctl)
     return agent
@@ -547,8 +515,6 @@ def _run() -> int:
     except ValueError as exc:
         raise SystemExit("nexus-agent: %s" % exc)
     stop = threading.Event()
-    # No teardown on purpose: blocks stay in the kernel and expire by their own timeout.
-    # stop.set runs in a thread: main may hold the event lock inside stop.wait when the signal arrives, which would deadlock.
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: threading.Thread(target=stop.set).start())
     agent.startup()
@@ -560,7 +526,6 @@ def _run() -> int:
 
 
 def _enroll(args: argparse.Namespace) -> int:
-    # Env first: argv is visible to every local user in ps.
     token = os.environ.get("NEXUS_ENROLL_TOKEN") or args.token
     if not token:
         raise SystemExit("nexus-agent: set NEXUS_ENROLL_TOKEN or pass --token")

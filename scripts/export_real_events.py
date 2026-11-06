@@ -1,10 +1,3 @@
-"""Build the script that exports anonymized log events from a server. It writes no file on the server.
-
-python3 scripts/export_real_events.py <web-container>... | ssh root@server python3 - > events.jsonl
-
-Addresses, usernames, non-scanner paths and user agents leave only as HMAC values under a key made for this run and never
-stored. Query strings never leave: only whether a known exploit pattern matched.
-"""
 import sys
 from pathlib import Path
 from typing import List

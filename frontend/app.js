@@ -72,7 +72,6 @@ function setCounts() {
   document.getElementById("nWatch").textContent = watching || "";
 }
 
-/* Redrawing under an operator's text selection would wipe what they are copying. */
 function selectingInPage() {
   const selection = getSelection();
   return selection && !selection.isCollapsed && main.contains(selection.anchorNode);

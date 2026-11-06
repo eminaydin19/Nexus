@@ -44,7 +44,6 @@ class Clock:
 
 
 class FakeNft:
-    """Just enough of nft to hold set elements, so the real Enforcer can list and remove what it added."""
 
     start_failing = False
 
@@ -161,9 +160,6 @@ def event(agent, n):
                  "simulated": False, "ok": True, "ts": 0.0})
 
 
-# -- queue and central outage -------------------------------------------------
-
-
 def test_queue_bounded_drops_oldest_when_central_down(rig):
     rig.client.down = True
     for n in range(5100):
@@ -272,7 +268,7 @@ def test_commands_from_a_response_run_on_next_tick_and_ack_next_send(enforcing):
     enforcing.block()
     enforcing.client.commands = [Command(9, "unblock", {"ip": IP})]
     enforcing.send()
-    assert enforcing.nft.elems  # the sender thread never touches the firewall itself
+    assert enforcing.nft.elems
     enforcing.agent.tick()
     assert not enforcing.nft.elems
     assert enforcing.send()["acked_commands"] == [9]
@@ -283,9 +279,6 @@ def test_command_redelivered_before_ack_is_not_run_twice(enforcing):
     enforcing.block()
     enforcing.agent.handle_command(Command(5, "unblock", {"ip": IP}))
     assert enforcing.nft.elems
-
-
-# -- payload ------------------------------------------------------------------
 
 
 def test_payload_shape(enforcing):
@@ -320,9 +313,6 @@ def test_config_stays_within_ingest_size_limit(tmp_path):
     rules = RuleConfig(ssh_ports=tuple(range(1000, 3000)), web_ports=tuple(range(3000, 5000)))
     rig = Rig(tmp_path, rules=rules)
     assert len(json.dumps(rig.send()["config"])) < 8192
-
-
-# -- commands -----------------------------------------------------------------
 
 
 def test_max_mode_cannot_be_exceeded_by_command(tmp_path):
@@ -388,7 +378,6 @@ def test_unblock_command_removes(enforcing):
     enforcing.agent.handle_command(Command(1, "unblock", {"ip": IP}))
     assert not enforcing.nft.elems
     assert enforcing.send()["acked_commands"] == [1]
-    # forget() cleared the offense count, so the next block starts from the base ttl again.
     enforcing.ssh_fails()
     assert enforcing.agent._events[-1]["ttl"] == 3600
 
@@ -430,7 +419,6 @@ def test_allowlist_command_lifts_existing_block(tmp_path):
     rig.agent.handle_command(Command(1, "allowlist", {"ips": ["203.0.113.9/32"]}))
     assert [k[1] for k in rig.nft.elems] == [other]
     assert load_state(tmp_path) == ("enforce", ["203.0.113.9/32"])
-    # Engine state is gone and the Protector now suppresses it.
     rig.ssh_fails()
     assert [k[1] for k in rig.nft.elems] == [other]
     assert rig.send()["acked_commands"] == [1]
@@ -493,9 +481,6 @@ def test_state_write_failure_keeps_running(tmp_path, monkeypatch):
     assert rig.send()["acked_commands"] == [1]
 
 
-# -- startup ------------------------------------------------------------------
-
-
 def test_metrics_keep_working_on_macos_without_nft(tmp_path):
     rig = Rig(tmp_path, can_enforce=False)
     rig.agent.handle_command(Command(1, "mode", {"mode": "enforce"}))
@@ -534,7 +519,7 @@ def test_startup_clamps_persisted_enforce_and_flushes_leftovers(tmp_path):
     save_state(tmp_path, "enforce", [])
     rig = Rig(tmp_path, max_mode="observe")
     assert rig.enforcer.mode == "observe"
-    assert rig.nft.flushes == 10  # six block sets, two meters and two new-connection counters
+    assert rig.nft.flushes == 10
     assert not any("add table" in s for s in rig.nft.scripts())
 
 
@@ -555,10 +540,7 @@ def test_failed_startup_enforce_is_reported(tmp_path, monkeypatch):
     rig = Rig(tmp_path)
     assert rig.enforcer.mode == "observe"
     assert rig.send()["config"]["enforce_rejected"] is True
-    assert load_state(tmp_path)[0] == "enforce"  # a passing nft problem must not lose the operator's choice
-
-
-# -- decisions ----------------------------------------------------------------
+    assert load_state(tmp_path)[0] == "enforce"
 
 
 def test_alert_from_observe_marks_simulated(rig):
@@ -594,7 +576,6 @@ def test_breaker_downgrade_and_single_breaker_event(tmp_path):
     down = [e for e in events if e["rule"] != "breaker"][2:]
     assert all(e["action"] == "rate_limit" and e["ttl"] == 600 and e["ports"] == [] and e["ok"] for e in down)
     assert [k[0] for k in rig.nft.elems].count("limit4") == 3
-    # A later close and reopen is a new transition.
     rig.clock.t += 400
     rig.agent.tick()
     rig.agent._apply([Decision("r", "203.0.113.%d" % n, "block_port", (22,), 3600, "e") for n in range(10, 13)])
@@ -627,9 +608,6 @@ def test_tick_error_is_contained_and_the_run_loop_continues(rig, monkeypatch):
     rig.agent.collectors = None
     rig.agent.run(stop)
     assert len(calls) == 2
-
-
-# -- logs ---------------------------------------------------------------------
 
 
 def scan(ip, port):
@@ -697,9 +675,6 @@ def test_off_mode_does_not_run_rules(tmp_path):
     assert not rig.agent.lines._q.qsize()
 
 
-# -- connection sampling ------------------------------------------------------
-
-
 def test_connections_feed_active_ssh_listening_and_rules(enforcing, monkeypatch):
     many = [est(80, IP) for _ in range(1000)]
     monkeypatch.setattr(psutil, "net_connections",
@@ -756,13 +731,13 @@ def test_behind_cdn_hysteresis(rig, monkeypatch):
         rig.agent.tick()
         return rig.send()["config"]["behind_cdn"]
 
-    assert sample(peers(19, 0)) is False       # below 20 peers: keeps prior value
-    assert sample(peers(10, 10)) is False      # exactly 50% is not more than 50%
+    assert sample(peers(19, 0)) is False
+    assert sample(peers(10, 10)) is False
     assert sample(peers(11, 10)) is True
     assert rig.engine._behind_cdn is True
-    assert sample(peers(3, 20)) is True        # between 10% and 50%: unchanged
-    assert sample(peers(0, 5)) is True         # below 20 peers: keeps prior value
-    assert sample(peers(2, 18)) is True        # exactly 10% is not under 10%
+    assert sample(peers(3, 20)) is True
+    assert sample(peers(0, 5)) is True
+    assert sample(peers(2, 18)) is True
     assert sample(peers(1, 19)) is False
     assert rig.engine._behind_cdn is False
 
@@ -771,9 +746,6 @@ def test_behind_cdn_known_before_first_decision(tmp_path, monkeypatch):
     monkeypatch.setattr(psutil, "net_connections", lambda kind: peers(30, 0))
     rig = Rig(tmp_path)
     assert rig.engine._behind_cdn is True
-
-
-# -- background ---------------------------------------------------------------
 
 
 def test_cdn_refresh_runs_after_first_delay_then_daily_and_survives_errors(rig, monkeypatch):
@@ -794,18 +766,13 @@ def test_cdn_refresh_runs_after_first_delay_then_daily_and_survives_errors(rig, 
     assert len(calls) == 3
 
 
-# -- whole sequence -----------------------------------------------------------
-
-
 def test_log_lines_to_kernel_block_to_sent_event_to_unblock(tmp_path):
     rig = Rig(tmp_path, mode="enforce")
 
-    # Below threshold nothing happens.
     rig.ssh_fails(n=9)
     assert not rig.nft.elems
     assert rig.send()["events"] == []
 
-    # Tenth failure: real engine decides, real enforcer writes, event and block reach central.
     rig.ssh_fails(n=1)
     assert ("port4", IP, 22) in rig.nft.elems
     p = rig.send()
@@ -814,16 +781,14 @@ def test_log_lines_to_kernel_block_to_sent_event_to_unblock(tmp_path):
         == ("ssh_bruteforce", IP, "block_port", [22], 3600, False, True)
     assert SSH_FAIL.split("\n")[0] % IP in event["evidence"]
     assert p["active_blocks"][0]["ip"] == IP and p["active_blocks"][0]["rule"] == "ssh_bruteforce"
-    assert rig.send()["events"] == []  # delivered once
+    assert rig.send()["events"] == []
 
-    # Central outage: enforcement keeps running, the event waits.
     rig.client.down = True
     rig.ssh_fails("203.0.113.77")
     assert ("port4", "203.0.113.77", 22) in rig.nft.elems
     assert rig.agent.send_once() == 5
     rig.client.down = False
 
-    # Recovery delivers it, with an unblock in the response.
     rig.client.commands = [Command(1, "unblock", {"ip": "203.0.113.77"})]
     assert rig.send()["events"][0]["ip"] == "203.0.113.77"
     rig.agent.tick()
@@ -831,7 +796,6 @@ def test_log_lines_to_kernel_block_to_sent_event_to_unblock(tmp_path):
     assert ("port4", IP, 22) in rig.nft.elems
     assert rig.send()["acked_commands"] == [1]
 
-    # Allowlisting the first IP lifts it and protects it from then on.
     rig.client.commands = [Command(2, "allowlist", {"ips": [IP]})]
     rig.send()
     rig.agent.tick()
@@ -839,9 +803,6 @@ def test_log_lines_to_kernel_block_to_sent_event_to_unblock(tmp_path):
     rig.ssh_fails()
     assert not rig.nft.elems
     assert rig.engine.suppressed["allowlist"] == 1
-
-
-# -- CLI and process ----------------------------------------------------------
 
 
 def test_run_without_url_or_key_exits_with_clear_message(monkeypatch, capsys):
@@ -914,17 +875,14 @@ def test_sigterm_exits_cleanly_without_teardown_and_never_logs_the_key(tmp_path)
         if "agent started" in line:
             break
     assert "agent started" in lines[-1], lines
-    time.sleep(7)  # long enough for at least one failed send to be logged
+    time.sleep(7)
     proc.send_signal(signal.SIGTERM)
     out = proc.stderr.read()
     assert proc.wait(15) == 0
     text = "".join(lines) + out
     assert "super-secret-key" not in text
-    assert "central" in text  # the failed send was logged
+    assert "central" in text
     assert "delete table" not in (trace.read_text() if trace.exists() else "")
-
-
-# -- fix round 1 --------------------------------------------------------------
 
 
 def test_allowlist_not_acked_when_kernel_read_fails_then_lifts_on_redelivery(enforcing):
@@ -1057,13 +1015,13 @@ def test_recent_ssh_survives_restart_and_write_is_throttled(tmp_path, monkeypatc
     monkeypatch.setattr(agent_main, "save_state", lambda *a: writes.append(a) or real(*a))
     rig.agent.lines.put("ssh", ACCEPTED % IP)
     rig.agent.tick()
-    assert writes == []  # within the 60s throttle
+    assert writes == []
     rig.clock.t += 60
     rig.agent.tick()
     assert len(writes) == 1
     rig.clock.t += 60
     rig.agent.tick()
-    assert len(writes) == 1  # unchanged
+    assert len(writes) == 1
     assert Rig(tmp_path).protector.reason(IP) == "recent-ssh"
 
 
@@ -1305,4 +1263,3 @@ def test_journalctl_without_journald_keeps_the_kernel_log_file(tmp_path, monkeyp
     (tmp_path / "absent").write_text("")
     collectors = agent_main.build_agent(agent_main.AgentConfig.from_env()).collectors
     assert "scan" in [name for name, _ in collectors.journals]
-

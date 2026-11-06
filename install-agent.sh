@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Nexus agent installer. Served by central at /install-agent.sh.
-#   curl -fsSL https://<central>/install-agent.sh | NEXUS_ENROLL_TOKEN=<one-time-token> sudo --preserve-env=NEXUS_ENROLL_TOKEN bash
-# Nothing runs until the last line, and a cut anywhere in that line is a syntax error, so a truncated download changes nothing.
 
 EMBEDDED_URL='__NEXUS_PUBLIC_URL__'
 
@@ -12,7 +9,6 @@ ENV_FILE=/etc/nexus-agent.env
 STATE_DIR=/var/lib/nexus-agent
 UNIT_FILE=/etc/systemd/system/nexus-agent.service
 OS_RELEASE=/etc/os-release
-# Marks a user as created here. Anything else named nexus-agent belongs to someone and must stay untouched.
 USER_MARKER="Nexus agent (managed)"
 PYTHON=python3
 REPORT_WAIT=15
@@ -83,7 +79,7 @@ require_systemd() {
 
 python_fix() {
     local release=""
-    # shellcheck disable=SC1090  # the path is the system's os-release
+    # shellcheck disable=SC1090
     [ ! -r "$OS_RELEASE" ] || release="$(. "$OS_RELEASE" 2>/dev/null && printf '%s|%s|%s' "${ID:-}" "${ID_LIKE:-}" "${VERSION_ID:-}")"
     case "$release" in
         ubuntu\|*\|20.04) say "Install it with: apt install python3.9 python3.9-venv" ;;
@@ -121,7 +117,7 @@ check_existing_user() {
         die "a user named $AGENT_USER already exists and this installer did not create it. Nothing was changed. Rename that user, then run the installer again."
 }
 
-# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+# shellcheck disable=SC2016
 NORMALIZE_URL_PY='
 import ipaddress, re, sys
 from urllib.parse import urlsplit
@@ -161,7 +157,6 @@ env_value() {
     [ ! -f "$ENV_FILE" ] || sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
 }
 
-# Sets URL, ENROLLED, HAD_KEY and INSECURE. An enrolled host keeps talking to the central that issued its key.
 resolve_target() {
     local raw
     case "$EMBEDDED_URL" in __*) EMBEDDED_URL="" ;; esac
@@ -196,7 +191,6 @@ venv_package() {
     esac
 }
 
-# Stops before any change on systems without apt or dnf.
 ensure_packages() {
     local manager="" missing=()
     if command -v apt-get >/dev/null 2>&1; then
@@ -211,7 +205,6 @@ ensure_packages() {
         apt)
             say "Installing ${missing[*]} with apt-get"
             apt-get update -qq </dev/null || die "apt-get update failed"
-            # confold keeps a firewall config the operator already has on disk.
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
                 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "${missing[@]}" </dev/null ||
                 die "could not install ${missing[*]}"
@@ -224,7 +217,7 @@ ensure_packages() {
     esac
 }
 
-# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+# shellcheck disable=SC2016
 EXTRACT_PY='
 import hashlib, os, sys, tarfile
 from pathlib import PurePosixPath
@@ -271,7 +264,6 @@ verify_and_extract() {
 download_agent() {
     local proto=https sha
     case "$URL" in http://*) proto=http ;; esac
-    # No -L: the agent itself never follows redirects, so a redirect here would be a misconfigured URL.
     curl -fsS --proto "=$proto" --connect-timeout 10 --max-time 300 \
         -D "$WORKDIR/headers" -o "$WORKDIR/agent.tar.gz" "$URL/agent.tar.gz" ||
         die "could not download the agent from $URL"
@@ -284,7 +276,6 @@ download_agent() {
 install_code() {
     mkdir -p "$INSTALL_DIR"
     chmod 755 "$INSTALL_DIR"
-    # A distribution upgrade can leave a venv whose interpreter is gone.
     if ! "$INSTALL_DIR/venv/bin/python" -c '' >/dev/null 2>&1; then
         "$PYTHON" -m venv --clear "$INSTALL_DIR/venv" || die "could not create the virtualenv"
     fi
@@ -292,7 +283,6 @@ install_code() {
         -r "$WORKDIR/agent/requirements-agent.txt" || die "could not install the agent's Python packages"
     rm -rf "$INSTALL_DIR/nexus_agent.new"
     cp -R "$WORKDIR/agent/nexus_agent" "$INSTALL_DIR/nexus_agent.new"
-    # Whole-directory swap: a leftover __pycache__ could shadow the new sources.
     rm -rf "$INSTALL_DIR/nexus_agent"
     mv "$INSTALL_DIR/nexus_agent.new" "$INSTALL_DIR/nexus_agent"
 }
@@ -311,7 +301,7 @@ ensure_user() {
     done
 }
 
-# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+# shellcheck disable=SC2016
 ENV_FILE_PY='
 import json, os, re, sys
 
@@ -322,7 +312,6 @@ try:
 except (ValueError, KeyError, TypeError):
     sys.exit("nexus-agent: central sent an invalid enrollment answer")
 for value in (node_id, api_key):
-    # Both end up in an EnvironmentFile; a newline could add settings central must not control.
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._:-]+", value):
         sys.exit("nexus-agent: central sent an invalid enrollment answer")
 print("NEXUS_URL=" + url)
@@ -336,7 +325,6 @@ if insecure:
 
 enroll_and_write_env() {
     local answer
-    # The token goes by environment and the answer stays in a variable: argv is world-readable in ps.
     answer="$(cd "$INSTALL_DIR" && NEXUS_ENROLL_TOKEN="$TOKEN" NEXUS_INSECURE="$INSECURE" \
         "$INSTALL_DIR/venv/bin/python" -m nexus_agent enroll --url "$URL")" ||
         die "enrollment failed; check the token (it works once and expires) and the URL"
@@ -350,10 +338,8 @@ enroll_and_write_env() {
         rm -f "$ENV_FILE.tmp"
         die "could not write $ENV_FILE"
     }
-    # A re-enroll keeps the operator's other settings.
     [ ! -f "$ENV_FILE" ] || grep -Ev "$keep" "$ENV_FILE" >>"$ENV_FILE.tmp" || true
     mv "$ENV_FILE.tmp" "$ENV_FILE"
-    # The key is on disk now, so a later failure must keep it: the token cannot be used twice.
     ROLLBACK=0
 }
 
@@ -413,7 +399,6 @@ print(min(mode, limit, key=MODES.index))
 PY
 }
 
-# Restart=always makes a crashing service look active for a moment, so it has to stay up for a few checks.
 wait_for_service() {
     local i stable=0
     for ((i = 0; i < 15; i++)); do
@@ -428,7 +413,7 @@ wait_for_service() {
     return 1
 }
 
-# shellcheck disable=SC2016  # the Python source must reach python3 unexpanded
+# shellcheck disable=SC2016
 LAST_SEND_PY='
 import json, sys
 
@@ -440,7 +425,6 @@ fresh = isinstance(last_send, (int, float)) and not isinstance(last_send, bool) 
 sys.exit(0 if fresh else 1)
 '
 
-# "Active" only means the process runs. A send since this start is what proves central hears it.
 wait_for_report() {
     local i
     REPORTING=0
@@ -512,7 +496,6 @@ on_exit() {
 
 uninstall() {
     local status=0
-    # Stop first: a running agent in enforce mode would create the table again.
     if command -v systemctl >/dev/null 2>&1; then
         systemctl stop "$SERVICE" 2>/dev/null || true
     fi
@@ -541,7 +524,6 @@ uninstall() {
 main() {
     set -euo pipefail
     umask 022
-    # Python puts the current directory on sys.path, and this runs as root: a planted venv.py would run.
     cd /
     PATH="$PATH:/usr/sbin:/sbin"
     parse_args "$@"
@@ -572,7 +554,6 @@ main() {
         install_code
         update_max_mode
     else
-        # A failed re-enroll must leave the working install and its key alone.
         [ -n "$HAD_KEY" ] || ROLLBACK=1
         ensure_user
         install_code

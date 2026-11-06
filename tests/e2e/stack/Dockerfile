@@ -11,7 +11,6 @@ RUN apt-get update \
     && sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config \
     && sed -i 's/^module(load="imklog".*/# imklog would consume \/proc\/kmsg for the whole VM/' /etc/rsyslog.conf
 COPY --from=repo nexus_agent /opt/nexus/nexus_agent
-# The ruling for the CDN scenario: real code path, with a test CIDR in the file the Protector really loads.
 RUN python -c "import json; p='/opt/nexus/nexus_agent/data/cdn_ranges.json'; d=json.load(open(p)); d['ranges']['test']=['203.0.113.33/32']; json.dump(d, open(p,'w'))"
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY rsyslog-kmsg.conf /etc/rsyslog.d/00-kmsg.conf

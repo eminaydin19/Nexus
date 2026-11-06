@@ -12,10 +12,8 @@ from backend.metrics import counters
 
 
 def client_ip(scope: Scope, trust_proxy: bool = False) -> str:
-    """Best-effort client address. Only trusts X-Forwarded-For when explicitly enabled."""
     if trust_proxy:
         forwarded = dict(scope.get("headers", [])).get(b"x-forwarded-for", b"").decode("latin-1")
-        # The last hop is the one appended by our own proxy; earlier entries are client-controlled.
         parts = [p.strip() for p in forwarded.split(",") if p.strip()]
         if parts:
             return parts[-1]
@@ -30,7 +28,6 @@ CONTENT_SECURITY_POLICY = (
 
 
 class SecurityHeadersMiddleware:
-    """Attacker text from logs reaches the panel, so a rendering mistake must still be unable to execute."""
 
     def __init__(self, app: ASGIApp):
         self.app = app
@@ -51,7 +48,6 @@ class SecurityHeadersMiddleware:
 
 
 class RateLimitMiddleware:
-    """Sliding-window limiter keyed by client IP. In-memory, so single-process only."""
 
     def __init__(
         self,
@@ -77,7 +73,6 @@ class RateLimitMiddleware:
             del self._hits[key]
 
     def check(self, key: str, now: float | None = None) -> float | None:
-        """Record a hit. Returns seconds to wait when over budget, otherwise None."""
         now = time.monotonic() if now is None else now
         self._sweep(now)
         hits = self._hits.setdefault(key, deque())
@@ -137,10 +132,6 @@ class BasicAuthMiddleware:
 
 
 class OriginCheckMiddleware:
-    """CSRF guard: rejects state-changing requests whose Origin host differs from the request host.
-
-    Requests without Origin (agents, curl) pass; browsers always send it on cross-site writes.
-    """
 
     UNSAFE = {"POST", "PUT", "PATCH", "DELETE"}
 

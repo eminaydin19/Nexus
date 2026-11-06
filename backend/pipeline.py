@@ -193,6 +193,5 @@ class Pipeline:
         db.query(Metric).filter(Metric.ts < cutoff).delete(synchronize_session=False)
         db.query(Anomaly).filter(Anomaly.ts < cutoff).delete(synchronize_session=False)
         db.query(SecurityEvent).filter(SecurityEvent.ts < cutoff).delete(synchronize_session=False)
-        # Unacked commands stay: an agent that returns after a long outage still needs them.
         db.query(AgentCommand).filter(AgentCommand.acked_at < cutoff).delete(synchronize_session=False)
         db.commit()

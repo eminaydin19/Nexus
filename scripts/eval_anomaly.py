@@ -1,8 +1,3 @@
-"""Compare fail2ban, rules, model and rules + model on data the model and its thresholds never saw.
-
-docker run --rm -v "$PWD":/app -w /app --entrypoint python nexus-test scripts/eval_anomaly.py
-docker run --rm -v "$PWD":/app -w /app --entrypoint python nexus-test scripts/eval_anomaly.py --real events.jsonl
-"""
 from __future__ import annotations
 
 import argparse
@@ -42,7 +37,6 @@ def pct(hits: int, total: int) -> str:
 
 
 def score(labels: Dict[str, str], first_seen: Dict[str, float], lines, models, **jail) -> dict:
-    """Per system: which labeled addresses got blocked. Unlabeled ("unclear") addresses are counted apart."""
     out = {}
     for system in SYSTEMS:
         hit = blocked(replay(lines, system, models, **jail))
@@ -126,7 +120,6 @@ def _ssh_line(row: dict, synthetic: str) -> str:
 
 def _web_line(row: dict, synthetic: str) -> str:
     t = time.gmtime(row["t"])
-    # The real query text never left the server, only that a known pattern matched. This one matches the same way.
     path = row["path"] + ("?id=1+UNION+SELECT+2" if row["exploit"] else "")
     return '%s - - [%02d/%s/%d:%02d:%02d:%02d +0000] "%s %s HTTP/1.1" %d 1 "-" "%s"' % (
         synthetic, t.tm_mday, _MONTHS[t.tm_mon - 1], t.tm_year, t.tm_hour, t.tm_min, t.tm_sec, row["method"], path,

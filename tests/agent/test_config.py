@@ -149,7 +149,7 @@ def test_sshd_include_globs_are_followed(tmp_path):
     d = tmp_path / "sshd_config.d"
     d.mkdir()
     (d / "10-a.conf").write_text("Port 2222\n")
-    (d / "20-b.conf").write_text("Include %s\nPort 2200\n" % (tmp_path / "sshd_config"))  # a loop must end
+    (d / "20-b.conf").write_text("Include %s\nPort 2200\n" % (tmp_path / "sshd_config"))
     (d / "skip.txt").write_text("Port 9999\n")
     assert cfg(tmp_path, sshd="Include sshd_config.d/*.conf\n").rules.ssh_ports == (22, 2200, 2222)
 

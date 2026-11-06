@@ -35,7 +35,6 @@ function select(id, text, options, value, onChange) {
 
 const serverOptions = (ctx) => [["", "All servers"], ...ctx.overview.servers.map((s) => [s.node_id, serverName(s)])];
 
-/* The filter form is kept across polls, so its server list follows here, and only on a change: that would close an open select. */
 function syncServers(ctx) {
   const el = document.getElementById("f-node");
   if (!el) return;

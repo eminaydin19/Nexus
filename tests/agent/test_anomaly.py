@@ -17,7 +17,6 @@ class Clock:
 
 
 def spec(features, threshold=0.5):
-    # One split on feature 0: below 5 goes left to a large leaf, above it to a single sample.
     tree = {"f": [0, -2, -2], "t": [5.0, -2.0, -2.0], "l": [1, -1, -1], "r": [2, -1, -1], "n": [256, 255, 1]}
     return {"threshold": threshold, "features": list(features), "max_samples": 256, "trees": [tree]}
 

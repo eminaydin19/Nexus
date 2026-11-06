@@ -42,7 +42,6 @@ def _base_url(url: str, allow_insecure: bool) -> str:
         raise ValueError("central URL must not contain credentials")
     if parts.scheme != "https" and not allow_insecure and not _is_loopback(parts.hostname):
         raise ValueError("central URL must use https unless it is loopback or insecure mode is set")
-    # Older env files hold the full ingest URL.
     path = parts.path.rstrip("/")
     if path.endswith(INGEST_PATH):
         path = path[: -len(INGEST_PATH)]
@@ -64,7 +63,6 @@ class Client:
     def __init__(self, url: str, key: str, allow_insecure: bool = False):
         self._url = _base_url(url, allow_insecure) + INGEST_PATH
         key = key.strip() if isinstance(key, str) else ""
-        # requests quotes a bad header value in its exception, which would put the key in the log.
         if not key or not key.isascii() or not key.isprintable():
             raise ValueError("invalid API key")
         self._session = requests.Session()

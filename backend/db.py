@@ -213,7 +213,6 @@ class EnrollToken(Base):
     used_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
-# Columns added after the first release: (table, column, DDL type).
 _ADDITIVE_COLUMNS = [
     ("anomalies", "contributions", "JSON"),
     ("anomalies", "transformer_score", "FLOAT"),

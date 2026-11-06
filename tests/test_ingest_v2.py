@@ -116,7 +116,6 @@ def test_evidence_truncated_and_ip_validated(client):
 
 def test_text_postgres_cannot_store_is_cleaned_not_refused(client):
     node, key = make_node(client)
-    # Raw body: the test client would refuse to encode a lone surrogate, but JSON can carry one.
     body = json.dumps({**METRICS, "events": [{**EVENT, "evidence": "a\x00b\ud800c"}]})
     assert client.post("/api/ingest", content=body, headers={**key, "Content-Type": "application/json"}).status_code == 200
     assert client.get("/api/events", params={"node": node}).json()["events"][0]["evidence"] == "ab?c"

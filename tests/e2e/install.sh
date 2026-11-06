@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# Real install on real systemd: scripts/test.sh --e2e [base-image[+extra-package] ...]
-# Needs Docker, privileged containers, and free ports 8000, 80 and 443 on 127.0.0.1.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 TARGETS=("$@")
 [ "${#TARGETS[@]}" -gt 0 ] || TARGETS=(ubuntu:22.04 debian:12 ubuntu:20.04+python3.9 almalinux:8+python39)
-# Their system python3 is too old and no newer one is installed, so the installer must refuse.
 REFUSAL_TARGETS=(ubuntu:20.04 almalinux:8)
 
-# Never the product's own project name: down -v below must only ever hit this test's volumes.
 export COMPOSE_PROJECT_NAME=nexus-e2e
 CHECKOUT="$(mktemp -d "${TMPDIR:-/tmp}/nexus-e2e.XXXXXX")"
 SECOND="$(mktemp -d "${TMPDIR:-/tmp}/nexus-e2e2.XXXXXX")"
@@ -158,7 +154,6 @@ expect "enrolled servers survived" test "$(curl -fsS -u "admin:$PASSWORD" "$API/
 step "install.sh --domain, for real"
 ./install.sh --domain nexus.e2e.test </dev/null >domain.log
 expect "password still unchanged" test "$(sed -n 's/^DASHBOARD_PASSWORD=//p' .env)" = "$PASSWORD"
-# docker compose port prints ":0" for an unpublished port, so ask the container itself.
 expect "nexus is no longer published" test "$(docker inspect -f '{{json .HostConfig.PortBindings}}' "$(docker compose ps -q nexus)")" = "{}"
 redirect() { curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H 'Host: nexus.e2e.test' http://127.0.0.1/ | grep -q '^308 https://nexus.e2e.test/'; }
 expect "caddy answers on port 80 for the domain" redirect

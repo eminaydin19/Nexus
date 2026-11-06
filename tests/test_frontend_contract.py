@@ -81,9 +81,6 @@ def server(client, node):
     return next(a for a in client.get("/api/agents").json()["agents"] if a["node_id"] == node)
 
 
-# Static contract
-
-
 def test_no_dark_theme_left(html, css):
     assert "prefers-color-scheme: dark" not in css and "themeToggle" not in html
 
@@ -188,9 +185,6 @@ def test_a_server_in_backoff_is_not_offline(client):
     assert server(client, node)["status"] == "offline"
 
 
-# Headers
-
-
 @pytest.mark.parametrize("path", ["/", "/style.css", "/app.js", "/api/overview"])
 def test_csp_on_dashboard_responses(client, path):
     csp = client.get(path).headers["content-security-policy"]
@@ -206,9 +200,6 @@ def test_csp_on_auth_challenge(client):
     assert "content-security-policy" in TestClient(client.app).get("/").headers
 
 
-# Auth
-
-
 @pytest.mark.parametrize(
     "method,path", [("GET", "/api/overview"), ("GET", "/api/watch"), ("GET", "/api/watch/x"), ("POST", "/api/customers")]
 )
@@ -219,9 +210,6 @@ def test_new_routes_require_auth(client, method, path):
 def test_customer_route_rejects_cross_origin(client):
     r = client.post("/api/customers", json={"ip": "203.0.113.1"}, headers={"Origin": "https://evil.example"})
     assert r.status_code == 403
-
-
-# Overview
 
 
 def test_overview_shape(client):
@@ -336,9 +324,6 @@ def test_recent_merges_events_and_anomalies(client):
     assert [r["ts"] for r in recent] == sorted((r["ts"] for r in recent), reverse=True)
 
 
-# Attention
-
-
 def test_attention_offline_includes_never_seen(client):
     node, _ = make_node(client)
     assert "offline" in attention(client, node)
@@ -365,7 +350,7 @@ def test_attention_after_seven_days_of_watching_once(client):
     assert list(attention(client, node)) == ["watch_ready"]
     ingest(client, key, config={"mode": "enforce", "max_mode": "enforce"})
     assert attention(client, node) == {}
-    assert server(client, node)["mode"] == "observe"  # nothing switched by itself
+    assert server(client, node)["mode"] == "observe"
 
 
 def test_attention_reports_agent_flags(client):
@@ -381,9 +366,6 @@ def test_attention_reports_agent_flags(client):
     found = attention(client, node)
     assert set(found) == {"enforce_rejected", "lift_pending", "breaker_open", "behind_cdn"}
     assert found["enforce_rejected"]["reason"] == "no_nft"
-
-
-# Blocks
 
 
 def test_blocks_carry_evidence_and_pending_removal(client):
@@ -441,9 +423,6 @@ def test_events_accept_several_actions(client):
     ingest(client, key, events=[SSH, {**SSH, "action": "block_all"}, {**SSH, "action": "alert"}])
     rows = client.get("/api/events", params={"node": node, "action": ["block_port", "block_all"]}).json()["events"]
     assert sorted(r["action"] for r in rows) == ["block_all", "block_port"]
-
-
-# Watch
 
 
 def watch_events(ip="198.51.100.61"):
@@ -516,7 +495,6 @@ def test_enforce_summary_leaves_out_allowlisted_and_server_wide(client):
     body = client.get(f"/api/watch/{node}").json()
     assert (body["would_block"], body["addresses"], body["would_slow"], body["limited_addresses"]) == (2, 1, 1, 1)
     assert "web_probe" not in {r["rule"] for r in body["by_rule"]} and "port_scan" not in {r["rule"] for r in body["by_rule"]}
-    # Server-wide rows stay visible on Watch, but nobody can review them as an address.
     assert {i["ip"] for i in body["items"]} == {"0.0.0.0", "198.51.100.61", "198.51.100.62"}
     assert body["waiting"] == 2
 
@@ -567,9 +545,6 @@ def test_ipv6_rows_carry_the_range_a_block_covers(client):
     assert block["cover"] == "2001:db8:9::/64"
 
 
-# Mode commands
-
-
 def test_a_newer_mode_replaces_the_pending_one(client):
     node, key = make_node(client)
     ingest(client, key, config={"max_mode": "enforce", "mode": "enforce"})
@@ -590,14 +565,11 @@ def test_a_new_mode_leaves_other_pending_commands(client):
     assert types(client, key) == ["unblock", "mode"]
 
 
-@pytest.mark.parametrize("path", ["install.sh", "install-agent.sh", "README.md"])
+@pytest.mark.parametrize("path", ["install.sh", "frontend/js/servers.js", "README.md"])
 def test_printed_enroll_command_keeps_the_token_out_of_ps(path):
     text = (Path(__file__).resolve().parent.parent / path).read_text()
     assert "sudo --preserve-env=NEXUS_ENROLL_TOKEN bash" in text
     assert "sudo bash -s -- --token" not in text and "sudo bash -s -- --url" not in text
-
-
-# Basic auth by scope type
 
 
 async def run_auth(scope_type):
@@ -622,9 +594,6 @@ def test_auth_passes_lifespan_and_refuses_websockets_even_with_credentials():
     assert asyncio.run(run_auth("http"))[0] == ["http"]
     called, sent = asyncio.run(run_auth("websocket"))
     assert called == [] and sent == [{"type": "websocket.close", "code": 1008}]
-
-
-# Customers
 
 
 def types(client, key):
@@ -703,7 +672,6 @@ def test_customer_accepts_a_range_through_the_same_validation(client):
     assert body["entry"] == "198.51.100.0/24" and node in body["sent"]
     assert server(client, node)["allowlist"] == ["192.0.2.0/24", "198.51.100.0/24"]
     commands = ingest(client, key)["commands"]
-    # A range has no single address to unblock; the agent lifts covered blocks when the allowlist arrives.
     assert [c["type"] for c in commands] == ["allowlist", "allowlist"]
     edit_agent(node, allowlist=[])
 
@@ -732,7 +700,6 @@ def test_customer_failure_on_one_server_is_reported_and_keeps_the_rest(client, m
     body = r.json()
     assert bad in body["failed"] and bad not in body["sent"] and good in body["sent"]
     monkeypatch.undo()
-    # The allowlist write and its command stand or fall together.
     assert "203.0.113.60/32" not in server(client, bad)["allowlist"] and server(client, bad)["pending"] == []
     assert "203.0.113.60/32" in server(client, good)["allowlist"]
     assert {p["type"] for p in server(client, good)["pending"]} == {"allowlist", "unblock"}
@@ -760,9 +727,6 @@ def test_watch_item_stays_pending_until_ack_then_leaves(client):
     ids = [c["id"] for c in ingest(client, key)["commands"]]
     ingest(client, key, acked_commands=ids)
     assert "198.51.100.77" not in {i["ip"] for i in client.get(f"/api/watch/{node}").json()["items"]}
-
-
-# Add server
 
 
 def test_token_response_says_where_agents_should_enroll(client, monkeypatch):

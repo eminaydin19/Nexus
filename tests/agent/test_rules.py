@@ -167,7 +167,7 @@ def test_benign_urls_clean(path):
 def test_exploit_decode_limited_and_tolerant():
     assert rules.exploit_hits("/a?x=%25%25%25") == ()
     assert rules.exploit_hits("/a?x=%E0%A4%A<script") != ()
-    assert rules.exploit_hits("/a?x=%25252e%25252e") == (3,)  # decode stops at two layers; the literal %2e%2e still matches
+    assert rules.exploit_hits("/a?x=%25252e%25252e") == (3,)
 
 
 def test_patterns_linear_on_16kb():
@@ -191,7 +191,7 @@ def test_spoof_style_scan_alone_only_alerts():
     assert scan(eng, n=19) == []
     d = eng.feed_scan(IP, 1019)[0]
     assert (d.rule, d.action, d.ports, d.ttl) == ("port_scan", "alert", (), 0)
-    assert scan(eng, n=20)[0].action == "alert"  # alerts again, no offense escalation, never a block
+    assert scan(eng, n=20)[0].action == "alert"
     assert eng._offense == {}
 
 
@@ -228,7 +228,7 @@ def test_trusted_ip_scan_plus_bad_activity_only_alerts():
 def test_trusted_ip_scan_plus_probe_hit_only_alerts():
     eng, _, prot = mk()
     prot.note_login_ok(IP)
-    eng.feed(web("/.env"))  # the probe voids trust, but the hit was seen while trusted
+    eng.feed(web("/.env"))
     assert prot.threshold_multiplier(IP) == 1
     assert scan(eng)[0].action == "alert"
 
@@ -304,7 +304,7 @@ def test_conn_flood_protected_and_cdn_ips_accepted_silently():
     assert eng.feed_connections({"198.18.0.5": 1900, CF: 1900, "127.0.0.1": 1900}, 0) == []
     assert eng.suppressed["allowlist"] == 1 and eng.suppressed["cdn"] == 1 and eng.suppressed["loopback"] == 1
     eng.feed_connections({"198.18.0.5": 1900}, 0)
-    assert eng.suppressed["allowlist"] == 1  # same ongoing episode counted once
+    assert eng.suppressed["allowlist"] == 1
     eng.feed_connections({}, 0)
     eng.feed_connections({"198.18.0.5": 1900}, 0)
     assert eng.suppressed["allowlist"] == 2
@@ -328,10 +328,10 @@ def test_distributed_flood_spike_vs_average_compare_before_update():
     eng, clock, _ = mk()
     for _ in range(5):
         assert eng.feed_connections({"198.51.100.%d" % i: 1 for i in range(100)}, 10) == []
-    spike = {"198.51.100.%d" % (i % 200): 40 for i in range(200)}  # 8000 connections
+    spike = {"198.51.100.%d" % (i % 200): 40 for i in range(200)}
     d = eng.feed_connections(spike, 10)
     assert len(d) == 1 and d[0].rule == "distributed_flood"
-    assert eng.feed_connections(spike, 10) == []  # at most once per 600 s
+    assert eng.feed_connections(spike, 10) == []
     clock.t += 601
     assert len(eng.feed_connections(spike, 10)) == 1
 
@@ -383,7 +383,7 @@ def test_trusted_multiplier_applies_to_exploit():
     prot.note_login_ok(IP)
     pats = ["/a?q=1 union select 2", "/a?q=%27+or+1=1", "/x/../y", "/a?%25252e%25252e", "/a?f=/etc/passwd",
             "/a?c=x;cat+y", "/a?c=$(id)", "/a?<script", "/a?${jndi:ldap://x}"]
-    assert all_decisions(eng, lambda i: web(pats[i], 200), 8) == []  # untrusted would fire at 3
+    assert all_decisions(eng, lambda i: web(pats[i], 200), 8) == []
     assert len(eng.feed(web(pats[8], 200))) == 1
 
 
@@ -482,7 +482,7 @@ def test_cdn_source_web_rules_alert_only_ssh_still_blocks():
     got = all_decisions(eng, lambda i: web(probe(i).path, 404, ip=CF), 10)
     assert got[0].action == "alert" and got[0].ports == () and got[0].ttl == 0
     got = all_decisions(eng, lambda i: ssh_fail(CF), 10)
-    assert got == [] and eng.suppressed["cdn"] == 1  # ssh follows normal protection: cdn is protected
+    assert got == [] and eng.suppressed["cdn"] == 1
 
 
 def test_behind_cdn_mode_web_alert_ssh_and_scan_normal():
@@ -491,7 +491,7 @@ def test_behind_cdn_mode_web_alert_ssh_and_scan_normal():
     got = all_decisions(eng, lambda i: web(["/a?<script", "/a?f=/etc/passwd", "/a/../b", "/c/../b", "/d/../b"][i], 200), 5)
     assert [(d.rule, d.action, d.ports, d.ttl) for d in got] == [("web_exploit", "alert", (), 0)]
     assert all_decisions(eng, lambda i: ssh_fail(), 10)[0].action == "block_port"
-    assert scan(eng, first=3000)[0].action == "block_all"  # the SSH failures above are the handshake evidence
+    assert scan(eng, first=3000)[0].action == "block_all"
     eng.set_behind_cdn(False)
 
 
@@ -526,8 +526,8 @@ def test_memory_cap_evicts_least_recently_seen():
     eng, _, _ = mk(RuleConfig(max_tracked_ips=3))
     for n in range(1, 4):
         eng.feed(ssh_fail("203.0.113.%d" % n))
-    eng.feed(ssh_fail("203.0.113.1"))  # refresh
-    eng.feed(ssh_fail("203.0.113.4"))  # evicts .2
+    eng.feed(ssh_fail("203.0.113.1"))
+    eng.feed(ssh_fail("203.0.113.4"))
     assert len(eng._win) == 3
     assert ("ssh_bruteforce", "203.0.113.2") not in eng._win
     assert ("ssh_bruteforce", "203.0.113.1") in eng._win
@@ -594,8 +594,8 @@ def test_ipv6_rules_key_on_slash_64():
     for i in range(10):
         got += eng.feed(ssh_fail(V6[i]))
     assert len(got) == 1 and got[0].ip == V6[9]
-    assert eng.feed(ssh_fail(V6[10])) == []  # duplicate tracking is per /64 too
-    assert eng.feed(ssh_fail("2001:db8:1:3::1")) == []  # another /64 starts fresh
+    assert eng.feed(ssh_fail(V6[10])) == []
+    assert eng.feed(ssh_fail("2001:db8:1:3::1")) == []
 
 
 def test_ipv6_offense_history_per_64_and_forget_from_any_address():
@@ -652,7 +652,6 @@ def test_unknown_user_try_counts_once_and_repeated_tries_on_one_connection_all_c
     assert [x.rule for x in d] == ["ssh_bruteforce"]
 
 
-
 def _browsing(eng, ip, requests=200, agents=10):
     for i in range(requests):
         eng.feed(LogEvent("web", ip, 0, "GET", "/", 200, user_agent="agent-%d" % (i % agents)))
@@ -673,7 +672,6 @@ def test_one_browser_with_many_requests_is_not_shared():
 
 
 class Always:
-    """A model whose score sits above its threshold for any row, to test the gate on its own."""
     threshold = 0.5
     features = ("f",)
 

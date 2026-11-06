@@ -1,5 +1,3 @@
-"""Against a real uvicorn, because the lost updates only show up with real concurrent requests."""
-
 import os
 import socket
 import subprocess
@@ -86,7 +84,6 @@ def test_parallel_customers_lose_nothing(base):
         assert all(not a.json()["failed"] for a in answers)
     for agent in agents(base):
         assert wanted <= set(agent["allowlist"]), agent["node_id"]
-    # What the agent ends up applying must hold everything too, not only the database.
     for node, key in nodes:
         commands = requests.post(f"{base}/api/ingest", json=METRICS, headers=key).json()["commands"]
         last = [c for c in commands if c["type"] == "allowlist"][-1]
@@ -101,7 +98,6 @@ def test_settings_write_and_customers_do_not_clobber_each_other(base):
     answers = parallel([put, *posts])
     assert [a.status_code for a in answers] == [200] * 8
     allowlist = next(a for a in agents(base) if a["node_id"] == node)["allowlist"]
-    # The PUT replaces the list by design, so only customers that came after it survive; none may be half-applied.
     assert len(allowlist) == len(set(allowlist))
     final = requests.post(f"{base}/api/customers", json={"ip": "100.65.0.99"}, auth=AUTH)
     assert final.status_code == 200

@@ -61,8 +61,8 @@ def test_tail_follows_rename_rotation(tmp_path):
     assert t.read_lines() == ["one"]
     append(p, b"two\n")
     os.rename(str(p), str(tmp_path / "a.log.1"))
-    assert t.read_lines() == ["two"]  # written before the rename, picked up while the new file is absent
-    append(tmp_path / "a.log.1", b"three\n")  # the daemon keeps writing the old inode until reopened
+    assert t.read_lines() == ["two"]
+    append(tmp_path / "a.log.1", b"three\n")
     append(p, b"four\n")
     assert t.read_lines() == ["three", "four"]
     append(p, b"five\n")
@@ -157,7 +157,7 @@ def test_journal_tail_passes_args_restarts_and_stops(tmp_path):
     tail = JournalTail(("-k", "-n", "0"), binary=binary, backoff=0.01)
     th = threading.Thread(target=tail.run, args=(lines.append, stop), daemon=True)
     th.start()
-    assert wait_for(lambda: len(lines) >= 4)  # two runs prove the restart
+    assert wait_for(lambda: len(lines) >= 4)
     stop.set()
     tail.terminate()
     th.join(5)
@@ -192,7 +192,6 @@ def test_journal_tail_drops_overlong_line_whole(tmp_path):
 
 
 def test_journal_format_is_accepted_by_ssh_parser():
-    # journalctl -u ssh -o short-iso output; -o cat would drop the sshd[pid] header the parser anchors on.
     assert "short-iso" in SSH_JOURNAL and "cat" not in SSH_JOURNAL
     line = "2026-11-04T13:22:11+0300 web01 sshd[1234]: Failed password for root from 203.0.113.9 port 4242 ssh2\n"
     assert parse_ssh_line(line, 0.0).ip == "203.0.113.9"
@@ -219,7 +218,7 @@ def test_parse_scan_line_normalizes_mapped_ip():
 
 
 @pytest.mark.parametrize("line", [
-    "Nov  4 13:22:11 web01 root: nexus-scan " + SCAN % ("203.0.113.9", "23"),  # logger from a local user
+    "Nov  4 13:22:11 web01 root: nexus-scan " + SCAN % ("203.0.113.9", "23"),
     "Nov  4 13:22:11 web01 kernel: audit nexus-scan " + SCAN % ("203.0.113.9", "23"),
     "nexus-scan " + SCAN % ("not-an-ip", "23"),
     "nexus-scan " + SCAN % ("203.0.113.9", "0"),
@@ -285,12 +284,12 @@ def test_without_journal_a_late_ssh_file_is_picked_once(tmp_path):
     c = LogCollectors(q, ssh_logs=(a, b), web_logs=(), kern_log=tmp_path / "k", journalctl=None, clock=lambda: now[0])
     a.write_text("x\n")
     b.write_text("y\n")
-    os.utime(str(b), (time.time() - 60, time.time() - 60))  # picked by freshest mtime
+    os.utime(str(b), (time.time() - 60, time.time() - 60))
     c.poll_files()
     assert not list(q.drain(10))
     now[0] = 61
     c.poll_files()
-    assert not list(q.drain(10))  # history stays unread
+    assert not list(q.drain(10))
     append(a, b"live\n")
     append(b, b"other\n")
     c.poll_files()
@@ -324,14 +323,14 @@ def test_sample_connections_counts_only_inbound(monkeypatch):
         listen(22), listen(80),
         conn(80, "203.0.113.9"), conn(80, "::ffff:203.0.113.9"),
         conn(80, "203.0.113.10", "SYN_RECV"),
-        conn(45000, "93.184.216.34"),  # an outbound call must never look like a flood
+        conn(45000, "93.184.216.34"),
         conn(22, "198.51.100.7"),
         conn(22, "198.51.100.8", "TIME_WAIT"),
         Conn(Addr("0.0.0.0", 53), (), "NONE"),
     ]
     monkeypatch.setattr(psutil, "net_connections", lambda kind: conns)
     per_ip, syn_recv, active_ssh, ports = sample_connections((22,))
-    assert per_ip == {"203.0.113.9": 2, "198.51.100.7": 1}  # SYN_RECV sources can be spoofed
+    assert per_ip == {"203.0.113.9": 2, "198.51.100.7": 1}
     assert syn_recv == 1
     assert active_ssh == {"198.51.100.7"}
     assert ports == {22, 80}
@@ -358,7 +357,6 @@ def test_sample_metrics_shape_and_bounds(monkeypatch):
     assert set(first) == {"cpu_pct", "memory_pct", "net_kbps"}
     assert all(isinstance(v, float) for v in first.values())
     assert 0 <= first["cpu_pct"] <= 100 and 0 <= first["memory_pct"] <= 100
-    # A counter reset (interface recreated) must not produce a negative rate, which ingest would refuse.
     Net = namedtuple("Net", "bytes_sent bytes_recv")
     monkeypatch.setattr(collectors, "_last_net", (time.monotonic() - 1, 10 ** 12))
     monkeypatch.setattr(psutil, "net_io_counters", lambda: Net(0, 0))
@@ -400,7 +398,7 @@ def test_old_file_moved_over_the_path_is_not_replayed(tmp_path):
 def test_symlink_swap_to_an_existing_file_starts_at_its_end(tmp_path):
     a, b, link = tmp_path / "a", tmp_path / "b", tmp_path / "link"
     a.write_text("")
-    b.write_text("recent history\n")  # young mtime: only the symlink tells this apart from a rotation
+    b.write_text("recent history\n")
     link.symlink_to(a)
     t = FileTail(link)
     t.read_lines()
@@ -471,12 +469,12 @@ def test_silent_journal_switches_to_fresher_file_at_its_end(tmp_path):
     journal = c.journals[0][1]
     closed = []
     journal.close = lambda: closed.append(1)
-    os.utime(str(tmp_path / "auth.log"))  # rsyslog came back
+    os.utime(str(tmp_path / "auth.log"))
     now[0] = 86400
     c.poll_files()
     assert ssh_sources(c) == ([str(tmp_path / "auth.log")], [])
     assert closed == [1]
-    assert not list(q.drain(10))  # "history" is not read
+    assert not list(q.drain(10))
     append(tmp_path / "auth.log", b"live\n")
     c.poll_files()
     assert list(q.drain(10)) == [("ssh", "live")]
@@ -495,7 +493,7 @@ def test_lines_keep_the_source_and_no_switch_when_current_is_freshest(tmp_path):
     now[0] = 80000 + 86400
     assert c.ssh_idle_seconds() == 86400
     c.poll_files()
-    assert ssh_sources(c)[0] == [str(p)]  # file mtime is newer than the journal's last entry
+    assert ssh_sources(c)[0] == [str(p)]
 
 
 def test_journal_lines_count_as_ssh_activity(tmp_path):
@@ -541,7 +539,7 @@ def test_journal_run_survives_a_sink_error(tmp_path):
 def test_poll_thread_is_restarted_when_dead(tmp_path, caplog):
     c = make_collectors(LineQueue(10), ())
     stop = threading.Event()
-    assert c.ensure_poll_alive(stop) is False  # never started: nothing to restart
+    assert c.ensure_poll_alive(stop) is False
     c._poll_loop = lambda s: None
     c.start(stop)
     c._poll_thread.join(5)

@@ -29,7 +29,7 @@ SSH_OK_TTL = 86400
 BOT_TTL = 3600
 BOT_FAIL_TTL = 60
 DNS_TIMEOUT = 2.0
-HOST_TRY_AGAIN = 2  # h_errno from netdb.h; the socket module does not export it.
+HOST_TRY_AGAIN = 2
 FETCH_TIMEOUT = 10
 MAX_FETCH_BYTES = 10 * 1024 * 1024
 MIN_RANGES = 5
@@ -37,7 +37,6 @@ MIN_RANGES = 5
 _BOT_TOKENS = ("googlebot", "bingbot")
 _BOT_SUFFIXES = (".googlebot.com", ".google.com", ".search.msn.com")
 
-# Not ipaddress.is_private: it also matches the TEST-NET documentation ranges, which must stay blockable.
 _STATIC = (
     ("loopback", ("127.0.0.0/8", "::1/128")),
     ("private", ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "0.0.0.0/8", "::/128")),
@@ -45,7 +44,6 @@ _STATIC = (
     ("cgnat", ("100.64.0.0/10",)),
     ("multicast", ("224.0.0.0/4", "ff00::/8")),
     ("reserved", ("240.0.0.0/4",)),
-    # A translator stands in for everyone behind it, so one abuser there must not cut off all of them.
     ("translated", ("64:ff9b::/96", "2002::/16")),
 )
 
@@ -59,7 +57,6 @@ _CDN_FILE = Path(__file__).parent / "data" / "cdn_ranges.json"
 
 
 class _NetIndex:
-    """Sorted, merged integer ranges per IP version, so a lookup is one bisect instead of a scan."""
 
     def __init__(self, items=()):
         by_ver = {4: [], 6: []}  # type: Dict[int, list]
@@ -142,9 +139,7 @@ class Protector:
         self.set_allowlist(allowlist)
         self._active_ssh = set()  # type: set
         self._ssh_ok = {}  # type: Dict[str, float]
-        # ip -> [window_start, ok_count, login_until, probe_until]; counters, not per-request lists.
         self._trust = OrderedDict()  # type: OrderedDict
-        # ip -> [window_start, ok_count, user agents]. Separate from trust: one forwarded probe must not reset it.
         self._shared = OrderedDict()  # type: OrderedDict
         self._bots = {}  # type: Dict[str, tuple]
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="nexus-dns")
@@ -170,7 +165,6 @@ class Protector:
             if len(self._ssh_ok) >= MAX_SSH_IPS:
                 self._ssh_ok = {k: v for k, v in self._ssh_ok.items() if v > now}
             if len(self._ssh_ok) >= MAX_SSH_IPS:
-                # The login that just succeeded is the one to keep: the admin is at the keyboard now.
                 del self._ssh_ok[min(self._ssh_ok, key=self._ssh_ok.get)]
             self._ssh_ok[ip] = now + SSH_OK_TTL
 
@@ -192,8 +186,6 @@ class Protector:
                 self._ssh_ok[ip] = float(exp)
 
     def update_network(self, central_ip=None, gateway=None, resolvers=None) -> None:
-        # An empty answer is a failed lookup, and forgetting the old address would make it blockable. A partial DNS
-        # answer looks like a full one, so central's addresses only grow until the agent restarts.
         if central_ip:
             self._central = self._central | _ip_set(central_ip)
         if gateway:
@@ -212,7 +204,6 @@ class Protector:
         why = _STATIC_INDEX.find(ip)
         if why:
             return why
-        # An IPv6 block covers the whole /64, so an address is protected when anything protected shares its /64.
         net = ipaddress.ip_network(ip + "/64", strict=False) if ":" in ip else None
         if self._allow.overlaps(net) if net else self._allow.find(ip):
             return "allowlist"
@@ -290,11 +281,6 @@ class Protector:
             e[0], e[1], e[2], e[3] = now, 0, 0.0, now + TRUST_WINDOW
 
     def is_shared(self, ip: str) -> bool:
-        """Many working requests from many browsers: a reverse proxy or large NAT, where a block hits everyone behind it.
-
-        An attacker can fake this with 200 good requests and 10 agents. It then gets alerts, not blocks, for up to an
-        hour: the top rule accepts that over cutting off every customer behind a proxy.
-        """
         ip = normalize_ip(ip)
         s = self._shared.get(ip) if ip else None
         return (s is not None and self._clock() - s[0] < TRUST_WINDOW
@@ -307,7 +293,7 @@ class Protector:
             return 1
         now = self._clock()
         if e[3] > now:
-            return 1  # a probe hit voids trust for an hour, whatever else the IP does meanwhile
+            return 1
         if e[2] > now:
             return TRUST_MULTIPLIER
         if e[3] <= now and now - e[0] < TRUST_WINDOW and e[1] >= TRUST_REQUESTS:
@@ -328,7 +314,6 @@ class Protector:
             ok = self._pool.submit(self._check_bot, ip).result(timeout=DNS_TIMEOUT)
             ttl = BOT_TTL
         except Exception:
-            # DNS gave no answer, so this could be the real bot. When in doubt Nexus does not block: ask again in a minute.
             ok, ttl = True, BOT_FAIL_TTL
         with self._lock:
             if len(self._bots) >= MAX_BOT_CACHE:

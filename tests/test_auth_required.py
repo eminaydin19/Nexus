@@ -48,7 +48,6 @@ def test_admin_routes_require_auth(client, method, path):
 
 def test_exempt_paths_stay_open(client):
     assert client.get("/healthz").status_code == 200
-    # Reaches require_agent (JSON 401), not the Basic auth challenge.
     r = client.post("/api/ingest")
     assert r.status_code == 401 and "WWW-Authenticate" not in r.headers
     assert r.json() == {"detail": "invalid or missing API key"}

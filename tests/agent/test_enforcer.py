@@ -319,7 +319,7 @@ def test_remove_absent_is_true_and_failure_false():
     enf, _, _ = make(runner=FakeRunner({"-j list table": (0, out), "delete element": (1, "Error: boom")}))
     enf.apply(dec("block_all", ports=()))
     assert enf.remove("203.0.113.9") is False
-    assert enf._live  # memory is cleared only after the kernel confirmed
+    assert enf._live
     out_missing = FakeRunner({"-j list table": (0, out), "delete element": (1, "Error: No such file or directory")})
     assert make(runner=out_missing)[0].remove("203.0.113.9") is True
 
@@ -623,7 +623,6 @@ def test_new_connections_reads_counters_and_tolerates_failure():
     assert enf.new_connections() == {"203.0.113.9": 42}
     enf.mode = "observe"
     assert enf.new_connections() == {}
-
 
 
 def test_active_survives_concat_element_without_timeout():

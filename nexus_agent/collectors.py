@@ -18,7 +18,6 @@ MAX_READ = 4 * 1024 * 1024
 RECHECK_SECONDS = 60
 SSH_SILENCE = 86400
 SSH_FRESH = 86400
-# Coarse filesystem clocks can date a brand new file slightly before the poll that preceded it.
 MTIME_SLACK = 2
 POLL_SECONDS = 1
 MAX_NET_KBPS = 1e9
@@ -26,7 +25,6 @@ MAX_NET_KBPS = 1e9
 SSH_LOGS = ("/var/log/auth.log", "/var/log/secure")
 WEB_LOGS = ("/var/log/nginx/access.log", "/var/log/apache2/access.log", "/var/log/httpd/access_log")
 KERN_LOG = "/var/log/kern.log"
-# short-iso, not cat: the ssh parser anchors on the "sshd[pid]:" header that -o cat removes.
 SSH_JOURNAL = ("-u", "ssh", "-u", "sshd", "-n", "0", "-f", "-o", "short-iso")
 KERNEL_JOURNAL = ("-k", "-n", "0", "-f", "-o", "short-iso")
 SSH_JOURNAL_LAST = ("-u", "ssh", "-u", "sshd", "-n", "1", "-o", "short-unix", "--no-pager", "-q")
@@ -42,11 +40,10 @@ class FileTail:
         self._skip = False
         self._next = 0.0
         self._noted = False
-        self._seen = time.time()  # wall clock, to compare with file mtimes
+        self._seen = time.time()
         self._open()
 
     def _open(self, at_end: bool = True) -> None:
-        """Only a rotation seen by a live tail reads from 0: anything else at the path may be history, not news."""
         try:
             f = open(self.path, "rb", buffering=0)
         except OSError as exc:
@@ -77,7 +74,7 @@ class FileTail:
         rotated = st is not None and (st.st_dev, st.st_ino) != self._id
         if st is not None and not rotated:
             self._seen = time.time()
-        if st is not None and not rotated and st.st_size < self._f.tell():  # copytruncate
+        if st is not None and not rotated and st.st_size < self._f.tell():
             self._f.seek(0)
             self._buf, self._skip = b"", False
         chunk = self._f.read(MAX_READ) or b""
@@ -93,7 +90,6 @@ class FileTail:
         return lines
 
     def _is_new_file(self, st: os.stat_result) -> bool:
-        # A swapped symlink or an older file moved into place is existing content, whatever its inode says.
         return not os.path.islink(self.path) and st.st_mtime >= self._seen - MTIME_SLACK
 
     def _split(self, chunk: bytes) -> List[str]:
@@ -101,7 +97,6 @@ class FileTail:
         self._buf = parts.pop()
         out = []
         for raw in parts:
-            # The end of an over-long line is attacker-shaped text that must not parse as a line of its own.
             if self._skip:
                 self._skip = False
             elif len(raw) <= MAX_LINE:
@@ -208,7 +203,6 @@ def _journal_last_line(binary: Optional[str]) -> Optional[float]:
 
 
 class LogCollectors:
-    """Per source, exactly one reader: a file and a journal for the same source would double count failed logins."""
 
     def __init__(self, lines: LineQueue, ssh_logs: Iterable = SSH_LOGS, web_logs: Iterable = WEB_LOGS,
                  kern_log=KERN_LOG, journalctl: Optional[str] = None, clock: Callable[[], float] = time.monotonic,
@@ -381,11 +375,10 @@ def sample_connections(ssh_ports: Iterable[int] = (22,), conns: Optional[list] =
             continue
         if c.status == psutil.CONN_SYN_RECV:
             syn_recv += 1
-            continue  # the source of a half-open socket can be spoofed
+            continue
         ip = normalize_ip(c.raddr.ip)
         if ip is None:
             continue
-        # A local port we do not listen on means we dialled out; that peer is not flooding us.
         if c.laddr.port in listening:
             per_ip[ip] = per_ip.get(ip, 0) + 1
         if c.laddr.port in ssh_ports:

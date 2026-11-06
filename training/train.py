@@ -64,9 +64,6 @@ def load_csv(path: Path) -> NodeData:
     return {node: _split_columns(np.array(values)) for node, values in rows.items()}
 
 
-
-
-
 def _split_columns(array: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     order = np.argsort(array[:, 0], kind="stable")
     array = array[order]
@@ -105,9 +102,6 @@ def ordinary_mask(
     median = np.median(values)
     mad = np.median(np.abs(values - median))
     limit = median + spread * 1.4826 * max(mad, 1e-9)
-    # A state seen in over 2% of older history recurs, whatever its distance: a cron job takes 13% of a batch server's
-    # time, and leaving it out of calibration makes the job alarm every time it runs. Only older history can vouch for
-    # a state, because an incident in the newest rows can be a large share of them.
     return values <= max(limit, np.percentile(values if older is None else older, frequent))
 
 
@@ -144,7 +138,6 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     train_by_node, val_by_node, holdout_by_node = map(scaled_parts, (train_parts, val_parts, holdout_parts))
     train_scaled_parts = [p for parts in train_by_node.values() for p in parts]
 
-    # At a 5 second interval history reaches hundreds of thousands of rows, and training repeats every day.
     train_scaled = cap(np.concatenate(train_scaled_parts), 40000, rng)
     train_windows = cap(windows_from(train_scaled_parts, window), 40000, rng)
     if len(train_windows) < 200:
@@ -170,9 +163,6 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
             "vae": vae.error(last),
         }
 
-    # The newest history can hold an incident. Calibrating on it would make the next attack look normal, so calibrate
-    # on train and validation together and leave out windows no model finds ordinary. Each node keeps its own share:
-    # what is ordinary for a batch server is not ordinary for a web server.
     node_calibration: dict[str, np.ndarray] = {}
     limit = max(1000, 20000 // len(data))
     for node in data:
@@ -228,8 +218,6 @@ def train(data: NodeData, window: int, epochs: int, min_rows: int, seed: int, so
     }
     bundle["thresholds"] = thresholds
 
-    # Measured on the newest tenth of history, which neither training nor any threshold saw. An incident there counts
-    # against the rate: the number errs toward looking worse, never better.
     alarms, seen = 0, 0
     for node, parts in holdout_by_node.items():
         node_windows = cap(windows_from(parts, window), 10000, rng)

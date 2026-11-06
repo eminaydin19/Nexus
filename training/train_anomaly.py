@@ -1,7 +1,3 @@
-"""Fit the per-IP Isolation Forests on legitimate behavior and export them for the agent. Needs scikit-learn.
-
-python -m training.train_anomaly --output nexus_agent/data/anomaly_model.json
-"""
 from __future__ import annotations
 
 import argparse
@@ -28,7 +24,6 @@ MIN_EVIDENCE = RuleConfig().anomaly_min_evidence
 
 
 def rows_by_address(records) -> dict:
-    """channel -> address -> (label, feature rows after each of its events, evidence count at each)."""
     clock = SimClock()
     engine = RuleEngine(RuleConfig(), Protector(clock=clock), clock)
     out = {"web": {}, "ssh": {}}
@@ -65,7 +60,6 @@ def fit(rows: np.ndarray, seed: int) -> IsolationForest:
 
 
 def pick_threshold(scored: list, target: float = TARGET_PRECISION) -> float:
-    """The lowest score that keeps precision at the target, over (score, is_attack) per address that passed the gate."""
     if not any(not attack for _, attack in scored):
         raise ValueError("no legitimate address reached the gate, so a threshold cannot be set")
     ordered = sorted(scored, reverse=True)
@@ -80,8 +74,6 @@ def pick_threshold(scored: list, target: float = TARGET_PRECISION) -> float:
 
 
 def legit_rows(by_address: dict, channel: str, legit_label) -> np.ndarray:
-    """Only rows past the gate, the one place the model is ever asked. The question it answers is "does this address with
-    evidence behave like a customer who also had evidence", and comparing against ordinary browsing missed every scanner."""
     rows = [row for label, rows, evidence in by_address[channel].values() if legit_label(label)
             for row, count in zip(rows, evidence) if count >= MIN_EVIDENCE]
     return np.array(rows, dtype=float)
