@@ -32,7 +32,7 @@ Each cell gives the range or mean across the 3 seeds.
 | CPU per sample | 23 ms | under 0.1 ms |
 | Peak memory while scoring | 350 MB | 61 MB |
 
-ECOD's high web rate comes from the harmless deploy.
+ECOD's high web rate most likely comes from the harmless deploy, the one change only that server has. We did not rerun without it.
 
 Share of incidents caught, at each model's own threshold:
 
